@@ -70,7 +70,7 @@ impl WebhookProvider for InstagramProvider {
                 let mut matched_channel_ids: Vec<Uuid> = Vec::new();
 
                 for ig_user_id in [sender_id, recipient_id].into_iter().flatten() {
-                    if let Some(ch) = db::find_instagram_channels_by_user_id(db, ig_user_id).await?
+                    if let Some(ch) = db::find_instagram_channel_by_user_id(db, ig_user_id).await?
                         && !matched_channel_ids.contains(&ch.id)
                     {
                         matched_channel_ids.push(ch.id);
@@ -113,14 +113,14 @@ fn classify_event(event: &MessagingEvent) -> (EventKind, Option<&String>) {
     if let Some(ref edit) = event.message_edit {
         return (EventKind::Edit, Some(&edit.mid));
     }
-    if event.read.is_some() {
-        return (EventKind::Read, None);
+    if let Some(ref read) = event.read {
+        return (EventKind::Read, Some(&read.mid));
     }
-    if event.reaction.is_some() {
-        return (EventKind::Reaction, None);
+    if let Some(ref reaction) = event.reaction {
+        return (EventKind::Reaction, Some(&reaction.mid));
     }
     // Default to Message for unknown event types
-    (EventKind::Message, None)
+    (EventKind::Unknown, None)
 }
 
 // --- Meta webhook payload types ---
@@ -145,8 +145,8 @@ pub struct MessagingEvent {
     pub timestamp: Option<i64>,
     pub message: Option<Message>,
     pub message_edit: Option<MessageEdit>,
-    pub read: Option<serde_json::Value>,
-    pub reaction: Option<serde_json::Value>,
+    pub read: Option<ReadReceipt>,
+    pub reaction: Option<Reaction>,
 }
 
 #[derive(Debug, Deserialize, serde::Serialize)]
@@ -166,6 +166,19 @@ pub struct MessageEdit {
     pub mid: String,
     pub text: Option<String>,
     pub num_edit: Option<i32>,
+}
+
+#[derive(Debug, Deserialize, serde::Serialize)]
+pub struct ReadReceipt {
+    pub mid: String,
+}
+
+#[derive(Debug, Deserialize, serde::Serialize)]
+pub struct Reaction {
+    pub mid: String,
+    pub action: String,
+    pub reaction: Option<String>,
+    pub emoji: Option<String>,
 }
 
 #[cfg(test)]
@@ -285,12 +298,14 @@ mod tests {
             timestamp: Some(123),
             message: None,
             message_edit: None,
-            read: Some(serde_json::json!({"watermark": 123})),
+            read: Some(ReadReceipt {
+                mid: "mid_005".into(),
+            }),
             reaction: None,
         };
         let (kind, mid) = classify_event(&event);
         assert!(matches!(kind, EventKind::Read));
-        assert!(mid.is_none());
+        assert_eq!(mid.unwrap(), "mid_005");
     }
 
     #[test]
@@ -302,11 +317,37 @@ mod tests {
             message: None,
             message_edit: None,
             read: None,
-            reaction: Some(serde_json::json!({"reaction": "love", "mid": "mid_003"})),
+            reaction: Some(Reaction {
+                mid: "mid_003".into(),
+                action: "react".into(),
+                reaction: Some("love".into()),
+                emoji: Some("\u{2764}".into()),
+            }),
         };
         let (kind, mid) = classify_event(&event);
         assert!(matches!(kind, EventKind::Reaction));
-        assert!(mid.is_none());
+        assert_eq!(mid.unwrap(), "mid_003");
+    }
+
+    #[test]
+    fn classify_unreact_event() {
+        let event = MessagingEvent {
+            sender: None,
+            recipient: None,
+            timestamp: Some(123),
+            message: None,
+            message_edit: None,
+            read: None,
+            reaction: Some(Reaction {
+                mid: "mid_004".into(),
+                action: "unreact".into(),
+                reaction: None,
+                emoji: None,
+            }),
+        };
+        let (kind, mid) = classify_event(&event);
+        assert!(matches!(kind, EventKind::Reaction));
+        assert_eq!(mid.unwrap(), "mid_004");
     }
 
     #[test]

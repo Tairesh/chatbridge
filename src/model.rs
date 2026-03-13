@@ -13,6 +13,7 @@ pub enum EventKind {
     Edit,
     Read,
     Reaction,
+    Unknown,
 }
 
 #[derive(Debug, Clone, Serialize)]
