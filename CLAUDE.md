@@ -9,7 +9,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **Lint:** `cargo clippy`
 - **Format:** `cargo fmt`
 - **Unit tests (no DB):** `cargo test --lib`
-- **All tests (needs Postgres):** `DATABASE_URL=postgres://webhook:webhook@localhost:5432/webhook cargo test`
+- **All tests (needs Postgres + Redis):** `DATABASE_URL=postgres://webhook:webhook@localhost:5432/webhook REDIS_URL=redis://localhost:6379 cargo test`
 - **Run single test:** `cargo test <test_name>`
 - **Docker (full stack):** `docker compose up --build`
 
@@ -26,14 +26,14 @@ Optional:
 
 ## Project Overview
 
-Multi-provider webhook microservice for Instagram and Telegram, built with Axum, Tokio, and sqlx. Lib crate (`src/lib.rs`) + binary entrypoint (`src/main.rs`). Postgres stores channel configuration; migrations run automatically on startup.
+Multi-provider webhook microservice for Instagram, Telegram, and WebSocket chat widgets, built with Axum, Tokio, sqlx, and Redis. Lib crate (`src/lib.rs`) + binary entrypoint (`src/main.rs`). Postgres stores channel configuration; Redis handles cross-replica pub/sub for message routing. Migrations run automatically on startup.
 
 ### Module Structure
 
 - `config.rs` — `AppConfig` (from env vars) and `AppState` (config + PgPool + Redis)
 - `db.rs` — Pool init, migrations, channel lookup queries
 - `error.rs` — `WebhookError` enum with `IntoResponse`
-- `model.rs` — `InternalMessage`, `ProviderKind`, `EventKind`
+- `model.rs` — `InternalMessage`, `ProviderKind`, `EventKind`, `WsInbound`, `WsAck`, `WsError`
 - `provider/mod.rs` — `WebhookProvider` trait (verify + parse)
 - `provider/instagram.rs` — HMAC-SHA256 verification, Meta webhook payload parsing
 - `provider/telegram.rs` — Secret token verification, Telegram Update parsing
@@ -49,12 +49,19 @@ Multi-provider webhook microservice for Instagram and Telegram, built with Axum,
 | POST | `/webhook/telegram/{channel_id}` | `telegram_ingest` | Secret token from DB by channel UUID |
 | GET | `/ws/{widget_id}` | `widget_ws` | WebSocket upgrade, validates widget_id against DB, publishes to Redis |
 
-### Handler Flow
+### Handler Flow (HTTP webhooks)
 
 1. Extract headers + raw body
 2. `provider.verify(headers, body)` → 403 if invalid
 3. Return 200 OK immediately
-4. `tokio::spawn` → parse payload, lookup channel in DB, log `InternalMessage` to stdout
+4. `tokio::spawn` → parse payload, lookup channel in DB, log `InternalMessage` to stdout, publish to Redis (`instagram:{channel_id}` / `telegram:{channel_id}`)
+
+### Handler Flow (WebSocket widget)
+
+1. Validate `widget_id` against `widget_channels` table → 404 if unknown
+2. Upgrade to WebSocket connection
+3. Message loop: receive JSON `{"text": "...", "attachments": ["uuid", ...]}` → parse → log → publish to Redis (`widget:{channel_id}`) → send ACK `{"status": "ok", "message_id": "uuid"}`
+4. Malformed messages get error response; connection stays alive
 
 ### Database
 
