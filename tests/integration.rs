@@ -543,7 +543,7 @@ async fn ws_missing_message_id_returns_error() {
     // Valid JSON with "text" field but without "mid" field
     ws.send(tungstenite::Message::Text(r#"{"text": "Hello"}"#.into()))
         .await
-    .unwrap();
+        .unwrap();
 
     let resp = ws.next().await.unwrap().unwrap();
     let err: serde_json::Value = serde_json::from_str(resp.to_text().unwrap()).unwrap();
@@ -884,8 +884,7 @@ async fn ws_edit_publishes_edit_event_to_redis() {
 
     // Send original message
     ws.send(tungstenite::Message::Text(
-        r#"{"action": "send", "mid": "msg-redis-edit", "text": "Helo", "attachments": []}"#
-            .into(),
+        r#"{"action": "send", "mid": "msg-redis-edit", "text": "Helo", "attachments": []}"#.into(),
     ))
     .await
     .unwrap();
