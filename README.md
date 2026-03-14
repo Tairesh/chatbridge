@@ -1,5 +1,7 @@
 # Webhook Microservice
 
+[![CI](https://github.com/Tairesh/webhook/actions/workflows/ci.yml/badge.svg)](https://github.com/Tairesh/webhook/actions/workflows/ci.yml)
+
 Multi-provider webhook receiver for **Instagram**, **Telegram**, and **WebSocket chat widgets**, built with Rust, Axum, PostgreSQL, and Redis.
 
 ## Event Flow
