@@ -1,7 +1,7 @@
 set dotenv-load
 
-default_db := "postgres://webhook:webhook@localhost:5432/webhook"
-db := env("DATABASE_URL", default_db)
+db := "postgres://webhook:webhook@localhost:5432/webhook"
+redis := "redis://localhost:6379"
 
 # List available recipes
 default:
@@ -31,13 +31,13 @@ lint:
 test-unit:
     cargo test --lib
 
-# Run all tests (unit + integration, requires Postgres)
-test: db-up
-    DATABASE_URL={{ db }} cargo test
+# Run all tests (unit + integration, requires Postgres and Redis)
+test: db-up redis-up
+    DATABASE_URL={{ db }} REDIS_URL={{ redis }} cargo test
 
 # Run a single test by name
-test-one name: db-up
-    DATABASE_URL={{ db }} cargo test {{ name }}
+test-one name: db-up redis-up
+    DATABASE_URL={{ db }} REDIS_URL={{ redis }} cargo test {{ name }}
 
 # Start Postgres container
 db-up:
@@ -46,6 +46,14 @@ db-up:
 # Stop Postgres container
 db-down:
     docker compose down postgres
+
+# Start Redis container
+redis-up:
+    docker compose up -d redis
+
+# Stop Redis container
+redis-down:
+    docker compose down redis
 
 # Start full stack (webhook + postgres)
 up:

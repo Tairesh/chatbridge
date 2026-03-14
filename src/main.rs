@@ -14,7 +14,13 @@ async fn main() {
     let db = db::init_pool(&database_url).await;
     db::run_migrations(&db).await;
 
-    let state = Arc::new(AppState { config, db });
+    let redis_client = redis::Client::open(config.redis_url.as_str()).expect("invalid REDIS_URL");
+    let redis = redis::aio::ConnectionManager::new(redis_client)
+        .await
+        .expect("failed to connect to Redis");
+    tracing::info!("connected to Redis");
+
+    let state = Arc::new(AppState { config, db, redis });
     let app = routes::build(state);
 
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}"))

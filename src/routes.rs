@@ -14,5 +14,6 @@ pub fn build(state: Arc<AppState>) -> Router {
             "/webhook/telegram/{channel_id}",
             post(handler::telegram_ingest),
         )
+        .route("/ws/{widget_id}", get(handler::widget_ws))
         .with_state(state)
 }

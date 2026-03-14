@@ -54,3 +54,21 @@ pub async fn find_telegram_channel_by_id(
     .fetch_optional(pool)
     .await
 }
+
+#[derive(Debug, FromRow)]
+pub struct WidgetChannel {
+    pub id: Uuid,
+    pub widget_id: String,
+}
+
+pub async fn find_widget_channel_by_widget_id(
+    pool: &PgPool,
+    widget_id: &str,
+) -> Result<Option<WidgetChannel>, sqlx::Error> {
+    sqlx::query_as::<_, WidgetChannel>(
+        "SELECT id, widget_id FROM widget_channels WHERE widget_id = $1",
+    )
+    .bind(widget_id)
+    .fetch_optional(pool)
+    .await
+}

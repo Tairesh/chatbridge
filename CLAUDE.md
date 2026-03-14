@@ -19,6 +19,7 @@ Required at runtime:
 - `META_VERIFY_TOKEN` — token for Meta/Instagram webhook subscription handshake
 - `INSTAGRAM_APP_SECRET` — HMAC-SHA256 secret for Instagram payload signature validation
 - `DATABASE_URL` — Postgres connection string (e.g. `postgres://webhook:webhook@localhost:5432/webhook`)
+- `REDIS_URL` — Redis connection string (e.g. `redis://localhost:6379`)
 
 Optional:
 - `PORT` — server listen port (default: 3000)
@@ -29,14 +30,14 @@ Multi-provider webhook microservice for Instagram and Telegram, built with Axum,
 
 ### Module Structure
 
-- `config.rs` — `AppConfig` (from env vars) and `AppState` (config + PgPool)
+- `config.rs` — `AppConfig` (from env vars) and `AppState` (config + PgPool + Redis)
 - `db.rs` — Pool init, migrations, channel lookup queries
 - `error.rs` — `WebhookError` enum with `IntoResponse`
 - `model.rs` — `InternalMessage`, `ProviderKind`, `EventKind`
 - `provider/mod.rs` — `WebhookProvider` trait (verify + parse)
 - `provider/instagram.rs` — HMAC-SHA256 verification, Meta webhook payload parsing
 - `provider/telegram.rs` — Secret token verification, Telegram Update parsing
-- `handler.rs` — Axum handlers (`meta_verify`, `instagram_ingest`, `telegram_ingest`)
+- `handler.rs` — Axum handlers (`meta_verify`, `instagram_ingest`, `telegram_ingest`, `widget_ws`)
 - `routes.rs` — Router assembly
 
 ### Routes
@@ -46,6 +47,7 @@ Multi-provider webhook microservice for Instagram and Telegram, built with Axum,
 | GET | `/webhook/instagram` | `meta_verify` | hub.challenge handshake |
 | POST | `/webhook/instagram` | `instagram_ingest` | HMAC via `INSTAGRAM_APP_SECRET`, channel lookup by sender/recipient ID |
 | POST | `/webhook/telegram/{channel_id}` | `telegram_ingest` | Secret token from DB by channel UUID |
+| GET | `/ws/{widget_id}` | `widget_ws` | WebSocket upgrade, validates widget_id against DB, publishes to Redis |
 
 ### Handler Flow
 
@@ -56,8 +58,8 @@ Multi-provider webhook microservice for Instagram and Telegram, built with Axum,
 
 ### Database
 
-Tables: `instagram_channels`, `telegram_channels`. Migrations in `migrations/`. Schema managed by sqlx with auto-run on startup.
+Tables: `instagram_channels`, `telegram_channels`, `widget_channels`. Migrations in `migrations/`. Schema managed by sqlx with auto-run on startup.
 
 ### Docker
 
-`compose.yaml` runs `nginx` + `webhook` + `postgres:16-alpine`. Dockerfile and nginx.conf live in `docker/`. Config via `.env` file (see `.env.example`).
+`compose.yaml` runs `nginx` + `webhook` + `postgres:16-alpine` + `redis:7-alpine`. Dockerfile and nginx.conf live in `docker/`. Config via `.env` file (see `.env.example`).
