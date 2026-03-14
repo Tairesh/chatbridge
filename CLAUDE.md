@@ -60,8 +60,8 @@ Multi-provider webhook microservice for Instagram, Telegram, and WebSocket chat 
 
 1. Validate `widget_id` against `widget_channels` table → 404 if unknown
 2. Upgrade to WebSocket connection
-3. Message loop: receive JSON `{"text": "...", "attachments": ["uuid", ...]}` → parse → log → publish to Redis (`widget:{channel_id}`) → send ACK `{"status": "ok", "message_id": "uuid"}`
-4. Malformed messages get error response; connection stays alive
+3. Message loop: receive JSON `{"action": "send"|"edit", "mid": "uuid", "text": "...", "attachments": ["uuid", ...]}` → parse → map action to `EventKind` → log → publish to Redis (`widget:{channel_id}`) → send ACK `{"status": "ok", "message_id": "uuid"}`
+4. Unknown actions and malformed messages get error response; connection stays alive
 
 ### Database
 

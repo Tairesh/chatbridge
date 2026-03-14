@@ -42,7 +42,8 @@ Multi-provider webhook receiver for **Instagram**, **Telegram**, and **WebSocket
                          │   ├─ Upgrade to WebSocket           │
                          │   │                                 │
                          │   └─ Message loop:                  │
-                         │      ├─ Parse JSON message          │
+                         │      ├─ Parse JSON action message    │
+                         │      │  (send / edit)                │
                          │      ├─ Emit InternalMessage ──▶ stdout
                          │      ├─ Publish ──▶ Redis widget:{id}
                          │      └─ Send ACK ──▶ client         │
@@ -99,6 +100,9 @@ src/
 docker/
 ├── Dockerfile           # Multi-stage build
 └── nginx.conf           # Nginx reverse proxy config
+
+widget/
+└── index.html           # Chat widget test page (WebSocket client)
 
 migrations/              # SQL migrations (auto-run on startup)
 tests/integration.rs     # Integration tests (require Postgres + Redis)
@@ -169,6 +173,7 @@ Integration tests cover:
 - Instagram POST ingestion (valid/invalid/missing signature, channel lookup)
 - Telegram POST ingestion (valid/invalid secret, unknown channel → 404)
 - WebSocket widget (connect, ACK, multiple messages, error recovery, unknown widget)
+- WebSocket edit action (edit ACK, Redis edit event, unknown action error)
 - Redis pub/sub verification for all three providers
 
 ### Linting
