@@ -32,10 +32,10 @@ Multi-provider webhook microservice for Instagram, Telegram, and WebSocket chat 
 
 - `config.rs` — `AppConfig` (from env vars) and `AppState` (config + PgPool + Redis)
 - `db.rs` — Pool init, migrations, channel lookup queries
-- `error.rs` — `WebhookError` enum with `IntoResponse`
+- `error.rs` — `WebhookError` enum with `IntoResponse` (database errors are logged but not leaked to clients)
 - `model.rs` — `InternalMessage`, `ProviderKind`, `EventKind`, `WsInbound`, `WsAck`, `WsError`
 - `provider/mod.rs` — `WebhookProvider` trait (verify + parse)
-- `provider/instagram.rs` — HMAC-SHA256 verification, Meta webhook payload parsing
+- `provider/instagram.rs` — Constant-time HMAC-SHA256 verification, Meta webhook payload parsing
 - `provider/telegram.rs` — Secret token verification, Telegram Update parsing
 - `handler.rs` — Axum handlers (`meta_verify`, `instagram_ingest`, `telegram_ingest`, `widget_ws`)
 - `routes.rs` — Router assembly
@@ -52,16 +52,16 @@ Multi-provider webhook microservice for Instagram, Telegram, and WebSocket chat 
 ### Handler Flow (HTTP webhooks)
 
 1. Extract headers + raw body
-2. `provider.verify(headers, body)` → 403 if invalid
+2. `provider.verify(headers, body)` → 403 if invalid (Instagram uses constant-time HMAC via `verify_slice`)
 3. Return 200 OK immediately
-4. `tokio::spawn` → parse payload, lookup channel in DB, log `InternalMessage` to stdout, publish to Redis (`instagram:{channel_id}` / `telegram:{channel_id}`)
+4. `tokio::spawn` (instrumented with tracing spans) → parse payload, lookup channel in DB, log `InternalMessage` to stdout, publish to Redis (`instagram:{channel_id}` / `telegram:{channel_id}`)
 
 ### Handler Flow (WebSocket widget)
 
 1. Validate `widget_id` against `widget_channels` table → 404 if unknown
 2. Upgrade to WebSocket connection
-3. Message loop: receive JSON `{"action": "send"|"edit", "mid": "uuid", "text": "...", "attachments": ["uuid", ...]}` → parse → map action to `EventKind` → log → publish to Redis (`widget:{channel_id}`) → send ACK `{"status": "ok", "message_id": "uuid"}`
-4. Unknown actions and malformed messages get error response; connection stays alive
+3. Message loop: receive JSON `{"action": "send"|"edit", "mid": "uuid", "text": "...", "attachments": ["uuid", ...]}` → validate `mid` as UUID → map action to `EventKind` → log → publish to Redis (`widget:{channel_id}`) → send ACK `{"status": "ok", "message_id": "uuid"}`
+4. Unknown actions, malformed messages, and invalid `mid` values get error response; connection stays alive
 
 ### Database
 

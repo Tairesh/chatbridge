@@ -76,7 +76,7 @@ Every successfully parsed webhook event becomes an `InternalMessage`:
 │ message_id   "instagram:aWdf..." / "telegram:42" / "widget:uuid" │
 │ channel_id   UUID (from DB)                  │
 │ provider     Instagram | Telegram | Widget   │
-│ event        Message | Edit | Read | Reaction│
+│ event        Message | Edit | Read | Reaction | Unknown │
 │ timestamp    Unix ms                         │
 │ raw          Full original JSON              │
 └──────────────────────────────────────────────┘
@@ -86,7 +86,7 @@ Every successfully parsed webhook event becomes an `InternalMessage`:
 
 ```
 src/
-├── main.rs              # Entrypoint: load config, connect DB, start server
+├── main.rs              # Entrypoint: load config, connect DB, start server, graceful shutdown
 ├── lib.rs               # Public module re-exports
 ├── config.rs            # AppConfig (env vars) + AppState (config + DB pool + Redis)
 ├── db.rs                # Postgres pool, migrations, channel queries
@@ -96,7 +96,7 @@ src/
 ├── routes.rs            # Router assembly
 └── provider/
     ├── mod.rs           # WebhookProvider trait (verify + parse)
-    ├── instagram.rs     # HMAC-SHA256 verification, Meta payload parsing
+    ├── instagram.rs     # Constant-time HMAC-SHA256 verification, Meta payload parsing
     └── telegram.rs      # Secret token verification, Telegram Update parsing
 
 docker/
@@ -160,7 +160,7 @@ Migrations run automatically on startup.
 cargo test --lib
 ```
 
-Covers HMAC verification, secret token validation, event classification, payload deserialization, and WebSocket message types.
+Covers HMAC verification, secret token validation, event classification, payload deserialization, WebSocket message types, and UUID mid validation.
 
 ### All tests (unit + integration)
 
@@ -172,11 +172,13 @@ DATABASE_URL=postgres://webhook:webhook@localhost:5432/webhook REDIS_URL=redis:/
 
 Integration tests cover:
 - Meta webhook subscription verification (valid/invalid token, wrong mode)
-- Instagram POST ingestion (valid/invalid/missing signature, channel lookup)
+- Instagram POST ingestion (valid/invalid/missing signature, channel lookup, non-instagram object rejection)
 - Telegram POST ingestion (valid/invalid secret, unknown channel → 404)
-- WebSocket widget (connect, ACK, multiple messages, error recovery, unknown widget)
+- WebSocket widget (connect, ACK, multiple messages, error recovery, unknown widget, invalid mid rejection)
 - WebSocket edit action (edit ACK, Redis edit event, unknown action error)
 - Redis pub/sub verification for all three providers
+
+Test data cleanup uses RAII drop guards (`TestChannel`) to ensure rows are deleted even if a test panics.
 
 ### Linting
 
