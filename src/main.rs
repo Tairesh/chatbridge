@@ -27,5 +27,27 @@ async fn main() {
         .await
         .unwrap();
     tracing::info!("listening on {}", listener.local_addr().unwrap());
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .unwrap();
+    tracing::info!("shutdown complete");
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = tokio::signal::ctrl_c();
+    #[cfg(unix)]
+    {
+        let mut sigterm =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
+        tokio::select! {
+            _ = ctrl_c => tracing::info!("received SIGINT, shutting down"),
+            _ = sigterm.recv() => tracing::info!("received SIGTERM, shutting down"),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        ctrl_c.await.ok();
+        tracing::info!("received SIGINT, shutting down");
+    }
 }

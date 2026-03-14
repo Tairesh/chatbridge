@@ -33,11 +33,12 @@ impl WebhookProvider for InstagramProvider {
         let mut mac = Hmac::<Sha256>::new_from_slice(self.app_secret.as_bytes())
             .map_err(|e| WebhookError::Internal(e.to_string()))?;
         mac.update(body);
-        let computed = hex::encode(mac.finalize().into_bytes());
 
-        if computed != signature {
-            return Err(WebhookError::Forbidden("signature mismatch".into()));
-        }
+        let sig_bytes = hex::decode(signature)
+            .map_err(|_| WebhookError::Forbidden("invalid signature hex".into()))?;
+
+        mac.verify_slice(&sig_bytes)
+            .map_err(|_| WebhookError::Forbidden("signature mismatch".into()))?;
 
         Ok(())
     }

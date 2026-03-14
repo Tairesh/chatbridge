@@ -57,8 +57,7 @@ impl WebhookProvider for TelegramProvider {
         } else if let Some(ref msg) = update.edited_message {
             (EventKind::Edit, msg.message_id, msg.date)
         } else {
-            // Unknown update type — still emit as Message
-            (EventKind::Message, update.update_id, 0)
+            (EventKind::Unknown, update.update_id, 0)
         };
 
         let raw = serde_json::from_slice(body).unwrap_or(serde_json::Value::Null);

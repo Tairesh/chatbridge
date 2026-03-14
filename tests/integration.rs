@@ -15,6 +15,81 @@ use webhook::routes;
 const TEST_VERIFY_TOKEN: &str = "test_verify_token";
 const TEST_APP_SECRET: &str = "test_app_secret";
 
+// --- Drop guard for test data cleanup ---
+
+/// RAII guard that deletes a test row on drop, even if the test panics.
+struct TestChannel {
+    table: &'static str,
+    id: Uuid,
+}
+
+impl Drop for TestChannel {
+    fn drop(&mut self) {
+        let db_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+        let query = format!("DELETE FROM {} WHERE id = $1", self.table);
+        let id = self.id;
+        // Fresh pool on a fresh runtime — the original pool's connections are
+        // pinned to the test runtime's I/O driver and can't be reused here.
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                tokio::runtime::Runtime::new().unwrap().block_on(async {
+                    let pool = PgPool::connect(&db_url).await.unwrap();
+                    let _ = sqlx::query(&query).bind(id).execute(&pool).await;
+                });
+            });
+        });
+    }
+}
+
+async fn insert_test_instagram_channel(pool: &PgPool) -> (TestChannel, String) {
+    let channel_id = Uuid::new_v4();
+    let user_id = format!("test_{channel_id}");
+    sqlx::query("INSERT INTO instagram_channels (id, user_id, access_token) VALUES ($1, $2, $3)")
+        .bind(channel_id)
+        .bind(&user_id)
+        .bind("test_token")
+        .execute(pool)
+        .await
+        .unwrap();
+    let guard = TestChannel {
+        table: "instagram_channels",
+        id: channel_id,
+    };
+    (guard, user_id)
+}
+
+async fn insert_test_telegram_channel(pool: &PgPool, bot_secret: &str) -> TestChannel {
+    let channel_id = Uuid::new_v4();
+    let bot_token = format!("test:{channel_id}");
+    sqlx::query("INSERT INTO telegram_channels (id, bot_token, bot_secret) VALUES ($1, $2, $3)")
+        .bind(channel_id)
+        .bind(&bot_token)
+        .bind(bot_secret)
+        .execute(pool)
+        .await
+        .unwrap();
+    TestChannel {
+        table: "telegram_channels",
+        id: channel_id,
+    }
+}
+
+async fn insert_test_widget_channel(pool: &PgPool, widget_id: &str) -> TestChannel {
+    let channel_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO widget_channels (id, widget_id) VALUES ($1, $2)")
+        .bind(channel_id)
+        .bind(widget_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    TestChannel {
+        table: "widget_channels",
+        id: channel_id,
+    }
+}
+
+// --- Test helpers ---
+
 fn sign_body(secret: &str, body: &[u8]) -> String {
     let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("valid key");
     mac.update(body);
@@ -221,17 +296,7 @@ async fn instagram_ingest_missing_signature() {
 #[tokio::test]
 async fn instagram_ingest_with_channel_lookup() {
     let pool = setup_pool().await;
-
-    // Insert a test channel with unique user_id
-    let channel_id = Uuid::new_v4();
-    let user_id = format!("test_{channel_id}");
-    sqlx::query("INSERT INTO instagram_channels (id, user_id, access_token) VALUES ($1, $2, $3)")
-        .bind(channel_id)
-        .bind(&user_id)
-        .bind("test_token")
-        .execute(&pool)
-        .await
-        .unwrap();
+    let (_guard, user_id) = insert_test_instagram_channel(&pool).await;
 
     let app = routes::build(build_state(pool.clone()).await);
 
@@ -268,13 +333,6 @@ async fn instagram_ingest_with_channel_lookup() {
 
     // Give the background task a moment to process
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-    // Cleanup
-    sqlx::query("DELETE FROM instagram_channels WHERE id = $1")
-        .bind(channel_id)
-        .execute(&pool)
-        .await
-        .unwrap();
 }
 
 // --- Telegram ingest (POST) ---
@@ -282,17 +340,8 @@ async fn instagram_ingest_with_channel_lookup() {
 #[tokio::test]
 async fn telegram_ingest_valid() {
     let pool = setup_pool().await;
-
-    let channel_id = Uuid::new_v4();
     let bot_secret = "test_bot_secret";
-    let bot_token = format!("test:{channel_id}");
-    sqlx::query("INSERT INTO telegram_channels (id, bot_token, bot_secret) VALUES ($1, $2, $3)")
-        .bind(channel_id)
-        .bind(&bot_token)
-        .bind(bot_secret)
-        .execute(&pool)
-        .await
-        .unwrap();
+    let guard = insert_test_telegram_channel(&pool, bot_secret).await;
 
     let app = routes::build(build_state(pool.clone()).await);
 
@@ -311,7 +360,7 @@ async fn telegram_ingest_valid() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri(format!("/webhook/telegram/{channel_id}"))
+                .uri(format!("/webhook/telegram/{}", guard.id))
                 .header("content-type", "application/json")
                 .header("X-Telegram-Bot-Api-Secret-Token", bot_secret)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
@@ -323,28 +372,12 @@ async fn telegram_ingest_valid() {
     assert_eq!(resp.status(), StatusCode::OK);
 
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-    // Cleanup
-    sqlx::query("DELETE FROM telegram_channels WHERE id = $1")
-        .bind(channel_id)
-        .execute(&pool)
-        .await
-        .unwrap();
 }
 
 #[tokio::test]
 async fn telegram_ingest_invalid_secret() {
     let pool = setup_pool().await;
-
-    let channel_id = Uuid::new_v4();
-    let bot_token = format!("test:{channel_id}");
-    sqlx::query("INSERT INTO telegram_channels (id, bot_token, bot_secret) VALUES ($1, $2, $3)")
-        .bind(channel_id)
-        .bind(&bot_token)
-        .bind("correct_secret")
-        .execute(&pool)
-        .await
-        .unwrap();
+    let guard = insert_test_telegram_channel(&pool, "correct_secret").await;
 
     let app = routes::build(build_state(pool.clone()).await);
 
@@ -352,7 +385,7 @@ async fn telegram_ingest_invalid_secret() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri(format!("/webhook/telegram/{channel_id}"))
+                .uri(format!("/webhook/telegram/{}", guard.id))
                 .header("content-type", "application/json")
                 .header("X-Telegram-Bot-Api-Secret-Token", "wrong_secret")
                 .body(Body::from(r#"{"update_id":1}"#))
@@ -362,13 +395,6 @@ async fn telegram_ingest_invalid_secret() {
         .unwrap();
 
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-
-    // Cleanup
-    sqlx::query("DELETE FROM telegram_channels WHERE id = $1")
-        .bind(channel_id)
-        .execute(&pool)
-        .await
-        .unwrap();
 }
 
 #[tokio::test]
@@ -397,30 +423,11 @@ async fn telegram_ingest_unknown_channel() {
 
 use futures_util::{SinkExt, StreamExt};
 
-async fn insert_widget_channel(pool: &PgPool, widget_id: &str) -> Uuid {
-    let channel_id = Uuid::new_v4();
-    sqlx::query("INSERT INTO widget_channels (id, widget_id) VALUES ($1, $2)")
-        .bind(channel_id)
-        .bind(widget_id)
-        .execute(pool)
-        .await
-        .unwrap();
-    channel_id
-}
-
-async fn delete_widget_channel(pool: &PgPool, channel_id: Uuid) {
-    sqlx::query("DELETE FROM widget_channels WHERE id = $1")
-        .bind(channel_id)
-        .execute(pool)
-        .await
-        .unwrap();
-}
-
 #[tokio::test]
 async fn ws_connect_and_receive_ack() {
     let pool = setup_pool().await;
     let widget_id = format!("test_widget_{}", Uuid::new_v4());
-    let channel_id = insert_widget_channel(&pool, &widget_id).await;
+    let _guard = insert_test_widget_channel(&pool, &widget_id).await;
 
     let state = build_state(pool.clone()).await;
     let addr = spawn_app(state).await;
@@ -430,7 +437,7 @@ async fn ws_connect_and_receive_ack() {
 
     // Send a valid message
     ws.send(tungstenite::Message::Text(
-        r#"{"action": "send", "mid": "msg-123456", "text": "Hello", "attachments": []}"#.into(),
+        r#"{"action": "send", "mid": "550e8400-e29b-41d4-a716-446655440000", "text": "Hello", "attachments": []}"#.into(),
     ))
     .await
     .unwrap();
@@ -439,17 +446,16 @@ async fn ws_connect_and_receive_ack() {
     let resp = ws.next().await.unwrap().unwrap();
     let ack: serde_json::Value = serde_json::from_str(resp.to_text().unwrap()).unwrap();
     assert_eq!(ack["status"], "ok");
-    assert_eq!(ack["message_id"], "msg-123456");
+    assert_eq!(ack["message_id"], "550e8400-e29b-41d4-a716-446655440000");
 
     ws.close(None).await.unwrap();
-    delete_widget_channel(&pool, channel_id).await;
 }
 
 #[tokio::test]
 async fn ws_message_with_attachments() {
     let pool = setup_pool().await;
     let widget_id = format!("test_widget_{}", Uuid::new_v4());
-    let channel_id = insert_widget_channel(&pool, &widget_id).await;
+    let _guard = insert_test_widget_channel(&pool, &widget_id).await;
 
     let state = build_state(pool.clone()).await;
     let addr = spawn_app(state).await;
@@ -460,7 +466,7 @@ async fn ws_message_with_attachments() {
     let attachment_id = Uuid::new_v4();
     let msg = serde_json::json!({
         "action": "send",
-        "mid": "msg-123456",
+        "mid": "550e8400-e29b-41d4-a716-446655440000",
         "text": "See attached",
         "attachments": [attachment_id.to_string()]
     });
@@ -471,17 +477,16 @@ async fn ws_message_with_attachments() {
     let resp = ws.next().await.unwrap().unwrap();
     let ack: serde_json::Value = serde_json::from_str(resp.to_text().unwrap()).unwrap();
     assert_eq!(ack["status"], "ok");
-    assert_eq!(ack["message_id"], "msg-123456");
+    assert_eq!(ack["message_id"], "550e8400-e29b-41d4-a716-446655440000");
 
     ws.close(None).await.unwrap();
-    delete_widget_channel(&pool, channel_id).await;
 }
 
 #[tokio::test]
 async fn ws_invalid_json_returns_error() {
     let pool = setup_pool().await;
     let widget_id = format!("test_widget_{}", Uuid::new_v4());
-    let channel_id = insert_widget_channel(&pool, &widget_id).await;
+    let _guard = insert_test_widget_channel(&pool, &widget_id).await;
 
     let state = build_state(pool.clone()).await;
     let addr = spawn_app(state).await;
@@ -500,14 +505,13 @@ async fn ws_invalid_json_returns_error() {
     assert!(err["reason"].as_str().unwrap().contains("invalid message"));
 
     ws.close(None).await.unwrap();
-    delete_widget_channel(&pool, channel_id).await;
 }
 
 #[tokio::test]
 async fn ws_missing_text_field_returns_error() {
     let pool = setup_pool().await;
     let widget_id = format!("test_widget_{}", Uuid::new_v4());
-    let channel_id = insert_widget_channel(&pool, &widget_id).await;
+    let _guard = insert_test_widget_channel(&pool, &widget_id).await;
 
     let state = build_state(pool.clone()).await;
     let addr = spawn_app(state).await;
@@ -525,14 +529,13 @@ async fn ws_missing_text_field_returns_error() {
     assert_eq!(err["status"], "error");
 
     ws.close(None).await.unwrap();
-    delete_widget_channel(&pool, channel_id).await;
 }
 
 #[tokio::test]
 async fn ws_missing_message_id_returns_error() {
     let pool = setup_pool().await;
     let widget_id = format!("test_widget_{}", Uuid::new_v4());
-    let channel_id = insert_widget_channel(&pool, &widget_id).await;
+    let _guard = insert_test_widget_channel(&pool, &widget_id).await;
 
     let state = build_state(pool.clone()).await;
     let addr = spawn_app(state).await;
@@ -550,7 +553,6 @@ async fn ws_missing_message_id_returns_error() {
     assert_eq!(err["status"], "error");
 
     ws.close(None).await.unwrap();
-    delete_widget_channel(&pool, channel_id).await;
 }
 
 #[tokio::test]
@@ -570,7 +572,7 @@ async fn ws_unknown_widget_id_rejects() {
 async fn ws_multiple_messages_get_individual_acks() {
     let pool = setup_pool().await;
     let widget_id = format!("test_widget_{}", Uuid::new_v4());
-    let channel_id = insert_widget_channel(&pool, &widget_id).await;
+    let _guard = insert_test_widget_channel(&pool, &widget_id).await;
 
     let state = build_state(pool.clone()).await;
     let addr = spawn_app(state).await;
@@ -581,7 +583,8 @@ async fn ws_multiple_messages_get_individual_acks() {
     let mut seen_ids = std::collections::HashSet::new();
 
     for i in 0..3 {
-        let msg = serde_json::json!({"action": "send", "text": format!("msg {i}"), "mid": format!("msg-{i}")});
+        let mid = Uuid::new_v4();
+        let msg = serde_json::json!({"action": "send", "text": format!("msg {i}"), "mid": mid.to_string()});
         ws.send(tungstenite::Message::Text(msg.to_string().into()))
             .await
             .unwrap();
@@ -597,14 +600,13 @@ async fn ws_multiple_messages_get_individual_acks() {
     assert_eq!(seen_ids.len(), 3);
 
     ws.close(None).await.unwrap();
-    delete_widget_channel(&pool, channel_id).await;
 }
 
 #[tokio::test]
 async fn ws_continues_after_bad_message() {
     let pool = setup_pool().await;
     let widget_id = format!("test_widget_{}", Uuid::new_v4());
-    let channel_id = insert_widget_channel(&pool, &widget_id).await;
+    let _guard = insert_test_widget_channel(&pool, &widget_id).await;
 
     let state = build_state(pool.clone()).await;
     let addr = spawn_app(state).await;
@@ -622,7 +624,7 @@ async fn ws_continues_after_bad_message() {
 
     // Connection should still be alive — send valid message
     ws.send(tungstenite::Message::Text(
-        r#"{"action": "send", "text": "still here", "mid": "msg-123456"}"#.into(),
+        r#"{"action": "send", "text": "still here", "mid": "550e8400-e29b-41d4-a716-446655440000"}"#.into(),
     ))
     .await
     .unwrap();
@@ -631,21 +633,20 @@ async fn ws_continues_after_bad_message() {
     assert_eq!(ack["status"], "ok");
 
     ws.close(None).await.unwrap();
-    delete_widget_channel(&pool, channel_id).await;
 }
 
 #[tokio::test]
 async fn ws_publishes_to_redis() {
     let pool = setup_pool().await;
     let widget_id = format!("test_widget_{}", Uuid::new_v4());
-    let channel_id = insert_widget_channel(&pool, &widget_id).await;
+    let guard = insert_test_widget_channel(&pool, &widget_id).await;
 
     // Subscribe to Redis channel before sending
     let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".into());
     let sub_client = redis::Client::open(redis_url.as_str()).unwrap();
     let mut pubsub = sub_client.get_async_pubsub().await.unwrap();
     pubsub
-        .subscribe(format!("widget:{channel_id}"))
+        .subscribe(format!("widget:{}", guard.id))
         .await
         .unwrap();
     let mut pubsub_stream = pubsub.on_message();
@@ -657,7 +658,7 @@ async fn ws_publishes_to_redis() {
     let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
 
     ws.send(tungstenite::Message::Text(
-        r#"{"action": "send", "text": "redis test", "mid": "msg-123456"}"#.into(),
+        r#"{"action": "send", "text": "redis test", "mid": "550e8400-e29b-41d4-a716-446655440000"}"#.into(),
     ))
     .await
     .unwrap();
@@ -674,34 +675,27 @@ async fn ws_publishes_to_redis() {
     let payload: String = redis_msg.get_payload().unwrap();
     let internal: serde_json::Value = serde_json::from_str(&payload).unwrap();
     assert_eq!(internal["provider"], "Widget");
-    assert_eq!(internal["channel_id"], channel_id.to_string());
-    assert_eq!(internal["raw"]["mid"], "msg-123456");
+    assert_eq!(internal["channel_id"], guard.id.to_string());
+    assert_eq!(
+        internal["raw"]["mid"],
+        "550e8400-e29b-41d4-a716-446655440000"
+    );
     assert_eq!(internal["raw"]["text"], "redis test");
 
     ws.close(None).await.unwrap();
-    delete_widget_channel(&pool, channel_id).await;
 }
 
 #[tokio::test]
 async fn instagram_publishes_to_redis() {
     let pool = setup_pool().await;
-
-    let channel_id = Uuid::new_v4();
-    let user_id = format!("test_{channel_id}");
-    sqlx::query("INSERT INTO instagram_channels (id, user_id, access_token) VALUES ($1, $2, $3)")
-        .bind(channel_id)
-        .bind(&user_id)
-        .bind("test_token")
-        .execute(&pool)
-        .await
-        .unwrap();
+    let (guard, user_id) = insert_test_instagram_channel(&pool).await;
 
     // Subscribe to Redis channel before sending
     let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".into());
     let sub_client = redis::Client::open(redis_url.as_str()).unwrap();
     let mut pubsub = sub_client.get_async_pubsub().await.unwrap();
     pubsub
-        .subscribe(format!("instagram:{channel_id}"))
+        .subscribe(format!("instagram:{}", guard.id))
         .await
         .unwrap();
     let mut pubsub_stream = pubsub.on_message();
@@ -744,36 +738,21 @@ async fn instagram_publishes_to_redis() {
     let payload: String = redis_msg.get_payload().unwrap();
     let internal: serde_json::Value = serde_json::from_str(&payload).unwrap();
     assert_eq!(internal["provider"], "Instagram");
-    assert_eq!(internal["channel_id"], channel_id.to_string());
-
-    sqlx::query("DELETE FROM instagram_channels WHERE id = $1")
-        .bind(channel_id)
-        .execute(&pool)
-        .await
-        .unwrap();
+    assert_eq!(internal["channel_id"], guard.id.to_string());
 }
 
 #[tokio::test]
 async fn telegram_publishes_to_redis() {
     let pool = setup_pool().await;
-
-    let channel_id = Uuid::new_v4();
     let bot_secret = "test_bot_secret_redis";
-    let bot_token = format!("test_redis:{channel_id}");
-    sqlx::query("INSERT INTO telegram_channels (id, bot_token, bot_secret) VALUES ($1, $2, $3)")
-        .bind(channel_id)
-        .bind(&bot_token)
-        .bind(bot_secret)
-        .execute(&pool)
-        .await
-        .unwrap();
+    let guard = insert_test_telegram_channel(&pool, bot_secret).await;
 
     // Subscribe to Redis channel before sending
     let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".into());
     let sub_client = redis::Client::open(redis_url.as_str()).unwrap();
     let mut pubsub = sub_client.get_async_pubsub().await.unwrap();
     pubsub
-        .subscribe(format!("telegram:{channel_id}"))
+        .subscribe(format!("telegram:{}", guard.id))
         .await
         .unwrap();
     let mut pubsub_stream = pubsub.on_message();
@@ -794,7 +773,7 @@ async fn telegram_publishes_to_redis() {
 
     let client = reqwest::Client::new();
     let resp = client
-        .post(format!("http://{addr}/webhook/telegram/{channel_id}"))
+        .post(format!("http://{addr}/webhook/telegram/{}", guard.id))
         .header("content-type", "application/json")
         .header("X-Telegram-Bot-Api-Secret-Token", bot_secret)
         .body(serde_json::to_vec(&body).unwrap())
@@ -811,13 +790,7 @@ async fn telegram_publishes_to_redis() {
     let payload: String = redis_msg.get_payload().unwrap();
     let internal: serde_json::Value = serde_json::from_str(&payload).unwrap();
     assert_eq!(internal["provider"], "Telegram");
-    assert_eq!(internal["channel_id"], channel_id.to_string());
-
-    sqlx::query("DELETE FROM telegram_channels WHERE id = $1")
-        .bind(channel_id)
-        .execute(&pool)
-        .await
-        .unwrap();
+    assert_eq!(internal["channel_id"], guard.id.to_string());
 }
 
 // --- WebSocket edit action tests ---
@@ -826,7 +799,7 @@ async fn telegram_publishes_to_redis() {
 async fn ws_edit_message_returns_ack() {
     let pool = setup_pool().await;
     let widget_id = format!("test_widget_{}", Uuid::new_v4());
-    let channel_id = insert_widget_channel(&pool, &widget_id).await;
+    let _guard = insert_test_widget_channel(&pool, &widget_id).await;
 
     let state = build_state(pool.clone()).await;
     let addr = spawn_app(state).await;
@@ -836,42 +809,42 @@ async fn ws_edit_message_returns_ack() {
 
     // Send original message
     ws.send(tungstenite::Message::Text(
-        r#"{"action": "send", "mid": "msg-edit-1", "text": "Helo", "attachments": []}"#.into(),
+        r#"{"action": "send", "mid": "660e8400-e29b-41d4-a716-446655440001", "text": "Helo", "attachments": []}"#.into(),
     ))
     .await
     .unwrap();
     let resp = ws.next().await.unwrap().unwrap();
     let ack: serde_json::Value = serde_json::from_str(resp.to_text().unwrap()).unwrap();
     assert_eq!(ack["status"], "ok");
-    assert_eq!(ack["message_id"], "msg-edit-1");
+    assert_eq!(ack["message_id"], "660e8400-e29b-41d4-a716-446655440001");
 
     // Edit the message
     ws.send(tungstenite::Message::Text(
-        r#"{"action": "edit", "mid": "msg-edit-1", "text": "Hello"}"#.into(),
+        r#"{"action": "edit", "mid": "660e8400-e29b-41d4-a716-446655440001", "text": "Hello"}"#
+            .into(),
     ))
     .await
     .unwrap();
     let resp = ws.next().await.unwrap().unwrap();
     let ack: serde_json::Value = serde_json::from_str(resp.to_text().unwrap()).unwrap();
     assert_eq!(ack["status"], "ok");
-    assert_eq!(ack["message_id"], "msg-edit-1");
+    assert_eq!(ack["message_id"], "660e8400-e29b-41d4-a716-446655440001");
 
     ws.close(None).await.unwrap();
-    delete_widget_channel(&pool, channel_id).await;
 }
 
 #[tokio::test]
 async fn ws_edit_publishes_edit_event_to_redis() {
     let pool = setup_pool().await;
     let widget_id = format!("test_widget_{}", Uuid::new_v4());
-    let channel_id = insert_widget_channel(&pool, &widget_id).await;
+    let guard = insert_test_widget_channel(&pool, &widget_id).await;
 
     // Subscribe to Redis channel before sending
     let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".into());
     let sub_client = redis::Client::open(redis_url.as_str()).unwrap();
     let mut pubsub = sub_client.get_async_pubsub().await.unwrap();
     pubsub
-        .subscribe(format!("widget:{channel_id}"))
+        .subscribe(format!("widget:{}", guard.id))
         .await
         .unwrap();
     let mut pubsub_stream = pubsub.on_message();
@@ -884,7 +857,7 @@ async fn ws_edit_publishes_edit_event_to_redis() {
 
     // Send original message
     ws.send(tungstenite::Message::Text(
-        r#"{"action": "send", "mid": "msg-redis-edit", "text": "Helo", "attachments": []}"#.into(),
+        r#"{"action": "send", "mid": "770e8400-e29b-41d4-a716-446655440002", "text": "Helo", "attachments": []}"#.into(),
     ))
     .await
     .unwrap();
@@ -897,7 +870,8 @@ async fn ws_edit_publishes_edit_event_to_redis() {
 
     // Edit the message
     ws.send(tungstenite::Message::Text(
-        r#"{"action": "edit", "mid": "msg-redis-edit", "text": "Hello"}"#.into(),
+        r#"{"action": "edit", "mid": "770e8400-e29b-41d4-a716-446655440002", "text": "Hello"}"#
+            .into(),
     ))
     .await
     .unwrap();
@@ -912,19 +886,21 @@ async fn ws_edit_publishes_edit_event_to_redis() {
     let payload: String = redis_msg.get_payload().unwrap();
     let internal: serde_json::Value = serde_json::from_str(&payload).unwrap();
     assert_eq!(internal["event"], "Edit");
-    assert_eq!(internal["raw"]["mid"], "msg-redis-edit");
+    assert_eq!(
+        internal["raw"]["mid"],
+        "770e8400-e29b-41d4-a716-446655440002"
+    );
     assert_eq!(internal["raw"]["text"], "Hello");
     assert_eq!(internal["raw"]["action"], "edit");
 
     ws.close(None).await.unwrap();
-    delete_widget_channel(&pool, channel_id).await;
 }
 
 #[tokio::test]
 async fn ws_unknown_action_returns_error() {
     let pool = setup_pool().await;
     let widget_id = format!("test_widget_{}", Uuid::new_v4());
-    let channel_id = insert_widget_channel(&pool, &widget_id).await;
+    let _guard = insert_test_widget_channel(&pool, &widget_id).await;
 
     let state = build_state(pool.clone()).await;
     let addr = spawn_app(state).await;
@@ -934,7 +910,8 @@ async fn ws_unknown_action_returns_error() {
 
     // Send message with unknown action
     ws.send(tungstenite::Message::Text(
-        r#"{"action": "delete", "mid": "msg-1", "text": "x"}"#.into(),
+        r#"{"action": "delete", "mid": "880e8400-e29b-41d4-a716-446655440003", "text": "x"}"#
+            .into(),
     ))
     .await
     .unwrap();
@@ -946,7 +923,7 @@ async fn ws_unknown_action_returns_error() {
 
     // Connection should still be alive
     ws.send(tungstenite::Message::Text(
-        r#"{"action": "send", "mid": "msg-2", "text": "still alive"}"#.into(),
+        r#"{"action": "send", "mid": "990e8400-e29b-41d4-a716-446655440004", "text": "still alive"}"#.into(),
     ))
     .await
     .unwrap();
@@ -955,5 +932,63 @@ async fn ws_unknown_action_returns_error() {
     assert_eq!(ack["status"], "ok");
 
     ws.close(None).await.unwrap();
-    delete_widget_channel(&pool, channel_id).await;
+}
+
+#[tokio::test]
+async fn ws_invalid_mid_returns_error() {
+    let pool = setup_pool().await;
+    let widget_id = format!("test_widget_{}", Uuid::new_v4());
+    let _guard = insert_test_widget_channel(&pool, &widget_id).await;
+
+    let state = build_state(pool.clone()).await;
+    let addr = spawn_app(state).await;
+
+    let url = format!("ws://{addr}/ws/{widget_id}");
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+
+    // Send message with arbitrary string as mid — should be rejected
+    ws.send(tungstenite::Message::Text(
+        r#"{"action": "send", "mid": "arbitrary-string", "text": "Hello"}"#.into(),
+    ))
+    .await
+    .unwrap();
+
+    let resp = ws.next().await.unwrap().unwrap();
+    let err: serde_json::Value = serde_json::from_str(resp.to_text().unwrap()).unwrap();
+    assert_eq!(err["status"], "error");
+    assert!(err["reason"].as_str().unwrap().contains("invalid message"));
+
+    // Connection should still be alive after rejected mid
+    let valid_mid = Uuid::new_v4();
+    let msg = serde_json::json!({"action": "send", "mid": valid_mid.to_string(), "text": "ok"});
+    ws.send(tungstenite::Message::Text(msg.to_string().into()))
+        .await
+        .unwrap();
+    let resp = ws.next().await.unwrap().unwrap();
+    let ack: serde_json::Value = serde_json::from_str(resp.to_text().unwrap()).unwrap();
+    assert_eq!(ack["status"], "ok");
+
+    ws.close(None).await.unwrap();
+}
+
+#[tokio::test]
+async fn instagram_rejects_non_instagram_object() {
+    use webhook::provider::WebhookProvider;
+    use webhook::provider::instagram::InstagramProvider;
+
+    let pool = setup_pool().await;
+    let provider = InstagramProvider::new(TEST_APP_SECRET);
+
+    let body = serde_json::json!({
+        "object": "page",
+        "entry": [{
+            "time": 1773347860136_i64,
+            "id": "12345",
+            "messaging": []
+        }]
+    });
+    let body_bytes = serde_json::to_vec(&body).unwrap();
+
+    let err = provider.parse(&body_bytes, &pool).await.unwrap_err();
+    assert!(err.to_string().contains("unexpected object: page"));
 }

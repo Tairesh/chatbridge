@@ -21,7 +21,7 @@ pub async fn run_migrations(pool: &PgPool) {
 pub struct InstagramChannel {
     pub id: Uuid,
     pub user_id: String,
-    pub access_token: String,
+    // pub access_token: String,
 }
 
 pub async fn find_instagram_channel_by_user_id(
@@ -29,7 +29,7 @@ pub async fn find_instagram_channel_by_user_id(
     user_id: &str,
 ) -> Result<Option<InstagramChannel>, sqlx::Error> {
     sqlx::query_as::<_, InstagramChannel>(
-        "SELECT id, user_id, access_token FROM instagram_channels WHERE user_id = $1",
+        "SELECT id, user_id FROM instagram_channels WHERE user_id = $1",
     )
     .bind(user_id)
     .fetch_optional(pool)

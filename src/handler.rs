@@ -7,6 +7,7 @@ use axum::response::IntoResponse;
 use bytes::Bytes;
 use redis::AsyncCommands;
 use serde::Deserialize;
+use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::config::AppState;
@@ -57,28 +58,31 @@ pub async fn instagram_ingest(
     let db = state.db.clone();
     let mut redis = state.redis.clone();
     let body = body.to_vec();
-    tokio::spawn(async move {
-        match provider.parse(&body, &db).await {
-            Ok(messages) => {
-                for msg in &messages {
-                    tracing::info!(
-                        message_id = %msg.message_id,
-                        channel_id = %msg.channel_id,
-                        event = ?msg.event,
-                        raw_data = ?msg.raw,
-                        "processed instagram event"
-                    );
-                    if let Ok(payload) = serde_json::to_string(msg) {
+    tokio::spawn(
+        async move {
+            match provider.parse(&body, &db).await {
+                Ok(messages) => {
+                    for msg in &messages {
+                        tracing::info!(
+                            message_id = %msg.message_id,
+                            channel_id = %msg.channel_id,
+                            event = ?msg.event,
+                            raw_data = ?msg.raw,
+                            "processed instagram event"
+                        );
+                        let payload = serde_json::to_string(msg)
+                            .expect("InternalMessage serialization cannot fail");
                         let channel = format!("instagram:{}", msg.channel_id);
                         if let Err(e) = redis.publish::<_, _, ()>(&channel, &payload).await {
                             tracing::error!("redis publish failed: {e}");
                         }
                     }
                 }
+                Err(e) => tracing::error!("instagram parse failed: {e}"),
             }
-            Err(e) => tracing::error!("instagram parse failed: {e}"),
         }
-    });
+        .instrument(tracing::info_span!("instagram_bg")),
+    );
 
     StatusCode::OK
 }
@@ -97,28 +101,31 @@ pub async fn telegram_ingest(
     let db = state.db.clone();
     let mut redis = state.redis.clone();
     let body = body.to_vec();
-    tokio::spawn(async move {
-        match provider.parse(&body, &db).await {
-            Ok(messages) => {
-                for msg in &messages {
-                    tracing::info!(
-                        message_id = %msg.message_id,
-                        channel_id = %msg.channel_id,
-                        event = ?msg.event,
-                        raw_data = ?msg.raw,
-                        "processed telegram event"
-                    );
-                    if let Ok(payload) = serde_json::to_string(msg) {
+    tokio::spawn(
+        async move {
+            match provider.parse(&body, &db).await {
+                Ok(messages) => {
+                    for msg in &messages {
+                        tracing::info!(
+                            message_id = %msg.message_id,
+                            channel_id = %msg.channel_id,
+                            event = ?msg.event,
+                            raw_data = ?msg.raw,
+                            "processed telegram event"
+                        );
+                        let payload = serde_json::to_string(msg)
+                            .expect("InternalMessage serialization cannot fail");
                         let channel = format!("telegram:{}", msg.channel_id);
                         if let Err(e) = redis.publish::<_, _, ()>(&channel, &payload).await {
                             tracing::error!("redis publish failed: {e}");
                         }
                     }
                 }
+                Err(e) => tracing::error!("telegram parse failed: {e}"),
             }
-            Err(e) => tracing::error!("telegram parse failed: {e}"),
         }
-    });
+        .instrument(tracing::info_span!("telegram_bg")),
+    );
 
     Ok(StatusCode::OK)
 }
@@ -214,11 +221,11 @@ async fn handle_widget_socket(mut socket: WebSocket, channel_id: Uuid, state: Ar
 
         // Publish to Redis for cross-replica routing
         let redis_channel = format!("widget:{channel_id}");
-        if let Ok(payload) = serde_json::to_string(&internal) {
-            let mut redis = state.redis.clone();
-            if let Err(e) = redis.publish::<_, _, ()>(&redis_channel, &payload).await {
-                tracing::error!("redis publish failed: {e}");
-            }
+        let payload =
+            serde_json::to_string(&internal).expect("InternalMessage serialization cannot fail");
+        let mut redis = state.redis.clone();
+        if let Err(e) = redis.publish::<_, _, ()>(&redis_channel, &payload).await {
+            tracing::error!("redis publish failed: {e}");
         }
 
         let ack = WsAck {

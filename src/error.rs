@@ -30,6 +30,7 @@ impl IntoResponse for WebhookError {
 
 impl From<sqlx::Error> for WebhookError {
     fn from(e: sqlx::Error) -> Self {
-        WebhookError::Internal(e.to_string())
+        tracing::error!("database error: {e}");
+        WebhookError::Internal("internal server error".into())
     }
 }

@@ -40,7 +40,7 @@ impl std::fmt::Display for ProviderKind {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct WsInbound {
     pub action: String,
-    pub mid: String,
+    pub mid: Uuid,
     pub text: String,
     #[serde(default)]
     pub attachments: Vec<Uuid>,
@@ -49,7 +49,7 @@ pub struct WsInbound {
 #[derive(Debug, Serialize)]
 pub struct WsAck {
     pub status: &'static str,
-    pub message_id: String,
+    pub message_id: Uuid,
 }
 
 #[derive(Debug, Serialize)]
@@ -62,20 +62,24 @@ pub struct WsError {
 mod tests {
     use super::*;
 
+    const TEST_UUID: &str = "550e8400-e29b-41d4-a716-446655440000";
+
     #[test]
     fn ws_inbound_deserialize_send_with_attachments() {
-        let json = r#"{"action": "send", "mid": "msg-123456", "text": "Hello", "attachments": ["550e8400-e29b-41d4-a716-446655440000"]}"#;
-        let msg: WsInbound = serde_json::from_str(json).unwrap();
+        let json = format!(
+            r#"{{"action": "send", "mid": "{TEST_UUID}", "text": "Hello", "attachments": ["{TEST_UUID}"]}}"#
+        );
+        let msg: WsInbound = serde_json::from_str(&json).unwrap();
         assert_eq!(msg.action, "send");
-        assert_eq!(msg.mid, "msg-123456");
+        assert_eq!(msg.mid.to_string(), TEST_UUID);
         assert_eq!(msg.text, "Hello");
         assert_eq!(msg.attachments.len(), 1);
     }
 
     #[test]
     fn ws_inbound_deserialize_send_without_attachments() {
-        let json = r#"{"action": "send", "mid": "msg-123456", "text": "Hello"}"#;
-        let msg: WsInbound = serde_json::from_str(json).unwrap();
+        let json = format!(r#"{{"action": "send", "mid": "{TEST_UUID}", "text": "Hello"}}"#);
+        let msg: WsInbound = serde_json::from_str(&json).unwrap();
         assert_eq!(msg.action, "send");
         assert_eq!(msg.text, "Hello");
         assert!(msg.attachments.is_empty());
@@ -83,17 +87,17 @@ mod tests {
 
     #[test]
     fn ws_inbound_deserialize_edit() {
-        let json = r#"{"action": "edit", "mid": "msg-123456", "text": "Updated"}"#;
-        let msg: WsInbound = serde_json::from_str(json).unwrap();
+        let json = format!(r#"{{"action": "edit", "mid": "{TEST_UUID}", "text": "Updated"}}"#);
+        let msg: WsInbound = serde_json::from_str(&json).unwrap();
         assert_eq!(msg.action, "edit");
-        assert_eq!(msg.mid, "msg-123456");
+        assert_eq!(msg.mid.to_string(), TEST_UUID);
         assert_eq!(msg.text, "Updated");
     }
 
     #[test]
     fn ws_inbound_missing_action_fails() {
-        let json = r#"{"mid": "msg-123456", "text": "Hello"}"#;
-        assert!(serde_json::from_str::<WsInbound>(json).is_err());
+        let json = format!(r#"{{"mid": "{TEST_UUID}", "text": "Hello"}}"#);
+        assert!(serde_json::from_str::<WsInbound>(&json).is_err());
     }
 
     #[test]
@@ -103,20 +107,29 @@ mod tests {
     }
 
     #[test]
-    fn ws_inbound_invalid_uuid_attachment_fails() {
-        let json = r#"{"action": "send", "mid": "x", "text": "Hi", "attachments": ["not-a-uuid"]}"#;
+    fn ws_inbound_invalid_mid_fails() {
+        let json = r#"{"action": "send", "mid": "not-a-uuid", "text": "Hi"}"#;
         assert!(serde_json::from_str::<WsInbound>(json).is_err());
     }
 
     #[test]
+    fn ws_inbound_invalid_uuid_attachment_fails() {
+        let json = format!(
+            r#"{{"action": "send", "mid": "{TEST_UUID}", "text": "Hi", "attachments": ["not-a-uuid"]}}"#
+        );
+        assert!(serde_json::from_str::<WsInbound>(&json).is_err());
+    }
+
+    #[test]
     fn ws_ack_serializes_correctly() {
+        let mid: Uuid = TEST_UUID.parse().unwrap();
         let ack = WsAck {
             status: "ok",
-            message_id: "msg-123456".to_string(),
+            message_id: mid,
         };
         let json = serde_json::to_value(&ack).unwrap();
         assert_eq!(json["status"], "ok");
-        assert_eq!(json["message_id"], "msg-123456");
+        assert_eq!(json["message_id"], TEST_UUID);
     }
 
     #[test]
