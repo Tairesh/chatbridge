@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>WebSocket Chat</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: system-ui, sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; background: #f0f2f5; }
+    #chat-container { width: 480px; max-height: 90vh; background: #fff; border-radius: 12px; box-shadow: 0 2px 12px rgba(0,0,0,0.1); display: flex; flex-direction: column; overflow: hidden; }
+    #header { padding: 16px; background: #2563eb; color: #fff; font-weight: 600; font-size: 18px; display: flex; justify-content: space-between; align-items: center; }
+    #status { font-size: 12px; font-weight: 400; opacity: 0.85; }
+    #messages { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 8px; min-height: 400px; }
+    .message { padding: 8px 12px; border-radius: 8px; max-width: 80%; word-wrap: break-word; font-size: 14px; line-height: 1.4; position: relative; }
+    .message.sent { background: #2563eb; color: #fff; align-self: flex-end; }
+    .message.received { background: #e5e7eb; color: #1f2937; align-self: flex-start; }
+    .message.system { background: transparent; color: #9ca3af; align-self: center; font-size: 12px; font-style: italic; }
+    .msg-text { display: inline; }
+    .msg-meta { display: flex; justify-content: flex-end; align-items: center; gap: 4px; margin-top: 4px; font-size: 11px; opacity: 0.7; }
+    .msg-time { font-size: 11px; }
+    .msg-edited { font-size: 10px; font-style: italic; }
+    .msg-status { display: inline-flex; align-items: center; font-size: 12px; }
+    .spinner { width: 12px; height: 12px; border: 2px solid rgba(255,255,255,0.3); border-top-color: #fff; border-radius: 50%; animation: spin 0.6s linear infinite; display: inline-block; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .checkmark { color: rgba(255,255,255,0.6); font-size: 13px; }
+    #input-area { display: flex; padding: 12px; border-top: 1px solid #e5e7eb; gap: 8px; }
+    #msg-input { flex: 1; padding: 10px 14px; border: 1px solid #d1d5db; border-radius: 8px; font-size: 14px; outline: none; }
+    #msg-input:focus { border-color: #2563eb; }
+    #send-btn { padding: 10px 20px; background: #2563eb; color: #fff; border: none; border-radius: 8px; font-size: 14px; cursor: pointer; }
+    #send-btn:hover { background: #1d4ed8; }
+    #send-btn:disabled { background: #93c5fd; cursor: not-allowed; }
+    .edit-input { width: 100%; padding: 4px 8px; border: 1px solid rgba(255,255,255,0.5); border-radius: 4px; background: rgba(255,255,255,0.15); color: #fff; font-size: 14px; font-family: inherit; outline: none; }
+    .edit-hint { font-size: 10px; opacity: 0.6; margin-top: 2px; }
+  </style>
+</head>
+<body>
+  <div id="chat-container">
+    <div id="header">
+      Chat
+      <span id="status">Connecting...</span>
+    </div>
+    <div id="messages"></div>
+    <div id="input-area">
+      <input type="text" id="msg-input" placeholder="Type a message..." disabled>
+      <button id="send-btn" disabled>Send</button>
+    </div>
+  </div>
+
+  <script>
+    const messagesEl = document.getElementById('messages');
+    const input = document.getElementById('msg-input');
+    const sendBtn = document.getElementById('send-btn');
+    const statusEl = document.getElementById('status');
+
+    // Track sent messages: mid -> { text, element, acknowledged }
+    const sentMessages = new Map();
+    let ws;
+    let editingMid = null;
+
+    function connect() {
+      ws = new WebSocket('ws://localhost/ws/test-widget');
+
+      ws.addEventListener('open', () => {
+        statusEl.textContent = 'Connected';
+        input.disabled = false;
+        sendBtn.disabled = false;
+        addSystemMessage('Connected to server');
+      });
+
+      ws.addEventListener('message', (event) => {
+        const msg = JSON.parse(event.data);
+        if (msg.status === 'ok' && msg.message_id) {
+          handleAck(msg.message_id);
+        } else if (msg.status === 'error') {
+          addSystemMessage('Error: ' + msg.reason);
+        }
+      });
+
+      ws.addEventListener('close', () => {
+        statusEl.textContent = 'Disconnected';
+        input.disabled = true;
+        sendBtn.disabled = true;
+        addSystemMessage('Disconnected. Reconnecting...');
+        setTimeout(connect, 3000);
+      });
+
+      ws.addEventListener('error', () => {
+        statusEl.textContent = 'Error';
+      });
+    }
+
+    function formatTime(date) {
+      return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    }
+
+    function addSystemMessage(text) {
+      const div = document.createElement('div');
+      div.className = 'message system';
+      div.textContent = text;
+      messagesEl.appendChild(div);
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+    }
+
+    function addSentMessage(mid, text) {
+      const div = document.createElement('div');
+      div.className = 'message sent';
+      div.id = 'msg-' + mid;
+      div.innerHTML = `
+        <span class="msg-text">${escapeHtml(text)}</span>
+        <div class="msg-meta">
+          <span class="msg-edited" style="display:none">edited</span>
+          <span class="msg-time">${formatTime(new Date())}</span>
+          <span class="msg-status"><span class="spinner"></span></span>
+        </div>
+      `;
+      div.addEventListener('dblclick', () => startEdit(mid));
+      messagesEl.appendChild(div);
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+
+      sentMessages.set(mid, { text, element: div, acknowledged: false });
+    }
+
+    function handleAck(messageId) {
+      const entry = sentMessages.get(messageId);
+      if (!entry) return;
+
+      entry.acknowledged = true;
+      const statusSpan = entry.element.querySelector('.msg-status');
+      if (statusSpan) {
+        statusSpan.innerHTML = '<span class="checkmark">✓</span>';
+      }
+
+      // If this was an edit ACK, show "edited" label
+      if (entry.edited) {
+        const editedSpan = entry.element.querySelector('.msg-edited');
+        if (editedSpan) editedSpan.style.display = '';
+      }
+    }
+
+    function startEdit(mid) {
+      const entry = sentMessages.get(mid);
+      if (!entry || !entry.acknowledged || editingMid) return;
+
+      editingMid = mid;
+      const textSpan = entry.element.querySelector('.msg-text');
+      const originalText = entry.text;
+
+      textSpan.innerHTML = `
+        <input class="edit-input" type="text" value="${escapeAttr(originalText)}">
+        <div class="edit-hint">Enter to save · Escape to cancel</div>
+      `;
+
+      const editInput = textSpan.querySelector('.edit-input');
+      editInput.focus();
+      editInput.setSelectionRange(editInput.value.length, editInput.value.length);
+
+      editInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+          const newText = editInput.value.trim();
+          if (newText && newText !== originalText) {
+            submitEdit(mid, newText);
+          } else {
+            cancelEdit(mid, originalText);
+          }
+        } else if (e.key === 'Escape') {
+          cancelEdit(mid, originalText);
+        }
+      });
+
+      editInput.addEventListener('blur', () => {
+        // Small delay to allow Enter handler to fire first
+        setTimeout(() => {
+          if (editingMid === mid) {
+            cancelEdit(mid, originalText);
+          }
+        }, 150);
+      });
+    }
+
+    function submitEdit(mid, newText) {
+      const entry = sentMessages.get(mid);
+      if (!entry) return;
+
+      entry.text = newText;
+      entry.edited = true;
+      editingMid = null;
+
+      const textSpan = entry.element.querySelector('.msg-text');
+      textSpan.textContent = newText;
+
+      // Show spinner while waiting for ACK
+      const statusSpan = entry.element.querySelector('.msg-status');
+      statusSpan.innerHTML = '<span class="spinner"></span>';
+      entry.acknowledged = false;
+
+      ws.send(JSON.stringify({ action: 'edit', mid: mid, text: newText }));
+    }
+
+    function cancelEdit(mid, originalText) {
+      const entry = sentMessages.get(mid);
+      if (!entry) return;
+
+      editingMid = null;
+      const textSpan = entry.element.querySelector('.msg-text');
+      textSpan.textContent = originalText;
+    }
+
+    function send() {
+      const text = input.value.trim();
+      if (!text || ws.readyState !== WebSocket.OPEN) return;
+
+      const mid = crypto.randomUUID();
+      addSentMessage(mid, text);
+      ws.send(JSON.stringify({ action: 'send', mid: mid, text: text, attachments: [] }));
+      input.value = '';
+    }
+
+    function escapeHtml(str) {
+      const div = document.createElement('div');
+      div.textContent = str;
+      return div.innerHTML;
+    }
+
+    function escapeAttr(str) {
+      return str.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    }
+
+    sendBtn.addEventListener('click', send);
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') send();
+    });
+
+    connect();
+  </script>
+</body>
+</html>

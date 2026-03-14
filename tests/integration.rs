@@ -430,7 +430,7 @@ async fn ws_connect_and_receive_ack() {
 
     // Send a valid message
     ws.send(tungstenite::Message::Text(
-        r#"{"text": "Hello", "attachments": []}"#.into(),
+        r#"{"action": "send", "mid": "msg-123456", "text": "Hello", "attachments": []}"#.into(),
     ))
     .await
     .unwrap();
@@ -439,10 +439,7 @@ async fn ws_connect_and_receive_ack() {
     let resp = ws.next().await.unwrap().unwrap();
     let ack: serde_json::Value = serde_json::from_str(resp.to_text().unwrap()).unwrap();
     assert_eq!(ack["status"], "ok");
-    assert!(ack["message_id"].is_string());
-    // Validate message_id is a valid UUID
-    let mid = ack["message_id"].as_str().unwrap();
-    assert!(mid.parse::<Uuid>().is_ok());
+    assert_eq!(ack["message_id"], "msg-123456");
 
     ws.close(None).await.unwrap();
     delete_widget_channel(&pool, channel_id).await;
@@ -462,6 +459,8 @@ async fn ws_message_with_attachments() {
 
     let attachment_id = Uuid::new_v4();
     let msg = serde_json::json!({
+        "action": "send",
+        "mid": "msg-123456",
         "text": "See attached",
         "attachments": [attachment_id.to_string()]
     });
@@ -472,6 +471,7 @@ async fn ws_message_with_attachments() {
     let resp = ws.next().await.unwrap().unwrap();
     let ack: serde_json::Value = serde_json::from_str(resp.to_text().unwrap()).unwrap();
     assert_eq!(ack["status"], "ok");
+    assert_eq!(ack["message_id"], "msg-123456");
 
     ws.close(None).await.unwrap();
     delete_widget_channel(&pool, channel_id).await;
@@ -529,6 +529,31 @@ async fn ws_missing_text_field_returns_error() {
 }
 
 #[tokio::test]
+async fn ws_missing_message_id_returns_error() {
+    let pool = setup_pool().await;
+    let widget_id = format!("test_widget_{}", Uuid::new_v4());
+    let channel_id = insert_widget_channel(&pool, &widget_id).await;
+
+    let state = build_state(pool.clone()).await;
+    let addr = spawn_app(state).await;
+
+    let url = format!("ws://{addr}/ws/{widget_id}");
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+
+    // Valid JSON with "text" field but without "mid" field
+    ws.send(tungstenite::Message::Text(r#"{"text": "Hello"}"#.into()))
+        .await
+    .unwrap();
+
+    let resp = ws.next().await.unwrap().unwrap();
+    let err: serde_json::Value = serde_json::from_str(resp.to_text().unwrap()).unwrap();
+    assert_eq!(err["status"], "error");
+
+    ws.close(None).await.unwrap();
+    delete_widget_channel(&pool, channel_id).await;
+}
+
+#[tokio::test]
 async fn ws_unknown_widget_id_rejects() {
     let pool = setup_pool().await;
     let state = build_state(pool).await;
@@ -556,7 +581,7 @@ async fn ws_multiple_messages_get_individual_acks() {
     let mut seen_ids = std::collections::HashSet::new();
 
     for i in 0..3 {
-        let msg = serde_json::json!({"text": format!("msg {i}")});
+        let msg = serde_json::json!({"action": "send", "text": format!("msg {i}"), "mid": format!("msg-{i}")});
         ws.send(tungstenite::Message::Text(msg.to_string().into()))
             .await
             .unwrap();
@@ -597,7 +622,7 @@ async fn ws_continues_after_bad_message() {
 
     // Connection should still be alive — send valid message
     ws.send(tungstenite::Message::Text(
-        r#"{"text": "still here"}"#.into(),
+        r#"{"action": "send", "text": "still here", "mid": "msg-123456"}"#.into(),
     ))
     .await
     .unwrap();
@@ -632,7 +657,7 @@ async fn ws_publishes_to_redis() {
     let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
 
     ws.send(tungstenite::Message::Text(
-        r#"{"text": "redis test"}"#.into(),
+        r#"{"action": "send", "text": "redis test", "mid": "msg-123456"}"#.into(),
     ))
     .await
     .unwrap();
@@ -650,6 +675,7 @@ async fn ws_publishes_to_redis() {
     let internal: serde_json::Value = serde_json::from_str(&payload).unwrap();
     assert_eq!(internal["provider"], "Widget");
     assert_eq!(internal["channel_id"], channel_id.to_string());
+    assert_eq!(internal["raw"]["mid"], "msg-123456");
     assert_eq!(internal["raw"]["text"], "redis test");
 
     ws.close(None).await.unwrap();
@@ -792,4 +818,143 @@ async fn telegram_publishes_to_redis() {
         .execute(&pool)
         .await
         .unwrap();
+}
+
+// --- WebSocket edit action tests ---
+
+#[tokio::test]
+async fn ws_edit_message_returns_ack() {
+    let pool = setup_pool().await;
+    let widget_id = format!("test_widget_{}", Uuid::new_v4());
+    let channel_id = insert_widget_channel(&pool, &widget_id).await;
+
+    let state = build_state(pool.clone()).await;
+    let addr = spawn_app(state).await;
+
+    let url = format!("ws://{addr}/ws/{widget_id}");
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+
+    // Send original message
+    ws.send(tungstenite::Message::Text(
+        r#"{"action": "send", "mid": "msg-edit-1", "text": "Helo", "attachments": []}"#.into(),
+    ))
+    .await
+    .unwrap();
+    let resp = ws.next().await.unwrap().unwrap();
+    let ack: serde_json::Value = serde_json::from_str(resp.to_text().unwrap()).unwrap();
+    assert_eq!(ack["status"], "ok");
+    assert_eq!(ack["message_id"], "msg-edit-1");
+
+    // Edit the message
+    ws.send(tungstenite::Message::Text(
+        r#"{"action": "edit", "mid": "msg-edit-1", "text": "Hello"}"#.into(),
+    ))
+    .await
+    .unwrap();
+    let resp = ws.next().await.unwrap().unwrap();
+    let ack: serde_json::Value = serde_json::from_str(resp.to_text().unwrap()).unwrap();
+    assert_eq!(ack["status"], "ok");
+    assert_eq!(ack["message_id"], "msg-edit-1");
+
+    ws.close(None).await.unwrap();
+    delete_widget_channel(&pool, channel_id).await;
+}
+
+#[tokio::test]
+async fn ws_edit_publishes_edit_event_to_redis() {
+    let pool = setup_pool().await;
+    let widget_id = format!("test_widget_{}", Uuid::new_v4());
+    let channel_id = insert_widget_channel(&pool, &widget_id).await;
+
+    // Subscribe to Redis channel before sending
+    let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".into());
+    let sub_client = redis::Client::open(redis_url.as_str()).unwrap();
+    let mut pubsub = sub_client.get_async_pubsub().await.unwrap();
+    pubsub
+        .subscribe(format!("widget:{channel_id}"))
+        .await
+        .unwrap();
+    let mut pubsub_stream = pubsub.on_message();
+
+    let state = build_state(pool.clone()).await;
+    let addr = spawn_app(state).await;
+
+    let url = format!("ws://{addr}/ws/{widget_id}");
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+
+    // Send original message
+    ws.send(tungstenite::Message::Text(
+        r#"{"action": "send", "mid": "msg-redis-edit", "text": "Helo", "attachments": []}"#
+            .into(),
+    ))
+    .await
+    .unwrap();
+    let _ = ws.next().await.unwrap().unwrap();
+
+    // Consume the send event from Redis
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), pubsub_stream.next())
+        .await
+        .expect("timed out waiting for send Redis message");
+
+    // Edit the message
+    ws.send(tungstenite::Message::Text(
+        r#"{"action": "edit", "mid": "msg-redis-edit", "text": "Hello"}"#.into(),
+    ))
+    .await
+    .unwrap();
+    let _ = ws.next().await.unwrap().unwrap();
+
+    // Check Redis received the edit event
+    let redis_msg = tokio::time::timeout(std::time::Duration::from_secs(2), pubsub_stream.next())
+        .await
+        .expect("timed out waiting for edit Redis message")
+        .unwrap();
+
+    let payload: String = redis_msg.get_payload().unwrap();
+    let internal: serde_json::Value = serde_json::from_str(&payload).unwrap();
+    assert_eq!(internal["event"], "Edit");
+    assert_eq!(internal["raw"]["mid"], "msg-redis-edit");
+    assert_eq!(internal["raw"]["text"], "Hello");
+    assert_eq!(internal["raw"]["action"], "edit");
+
+    ws.close(None).await.unwrap();
+    delete_widget_channel(&pool, channel_id).await;
+}
+
+#[tokio::test]
+async fn ws_unknown_action_returns_error() {
+    let pool = setup_pool().await;
+    let widget_id = format!("test_widget_{}", Uuid::new_v4());
+    let channel_id = insert_widget_channel(&pool, &widget_id).await;
+
+    let state = build_state(pool.clone()).await;
+    let addr = spawn_app(state).await;
+
+    let url = format!("ws://{addr}/ws/{widget_id}");
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+
+    // Send message with unknown action
+    ws.send(tungstenite::Message::Text(
+        r#"{"action": "delete", "mid": "msg-1", "text": "x"}"#.into(),
+    ))
+    .await
+    .unwrap();
+
+    let resp = ws.next().await.unwrap().unwrap();
+    let err: serde_json::Value = serde_json::from_str(resp.to_text().unwrap()).unwrap();
+    assert_eq!(err["status"], "error");
+    assert!(err["reason"].as_str().unwrap().contains("unknown action"));
+
+    // Connection should still be alive
+    ws.send(tungstenite::Message::Text(
+        r#"{"action": "send", "mid": "msg-2", "text": "still alive"}"#.into(),
+    ))
+    .await
+    .unwrap();
+    let resp = ws.next().await.unwrap().unwrap();
+    let ack: serde_json::Value = serde_json::from_str(resp.to_text().unwrap()).unwrap();
+    assert_eq!(ack["status"], "ok");
+
+    ws.close(None).await.unwrap();
+    delete_widget_channel(&pool, channel_id).await;
 }
