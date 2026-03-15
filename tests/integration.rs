@@ -11,6 +11,8 @@ use uuid::Uuid;
 
 use chatbridge::config::{AppConfig, AppState};
 use chatbridge::routes;
+use std::sync::atomic::AtomicUsize;
+use tokio_util::sync::CancellationToken;
 
 const TEST_VERIFY_TOKEN: &str = "test_verify_token";
 const TEST_APP_SECRET: &str = "test_app_secret";
@@ -129,6 +131,8 @@ async fn build_state(db: PgPool) -> Arc<AppState> {
         db,
         redis,
         cache: Arc::new(Default::default()),
+        ws_connections: AtomicUsize::new(0),
+        shutdown: CancellationToken::new(),
     })
 }
 

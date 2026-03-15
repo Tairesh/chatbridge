@@ -11,6 +11,10 @@ services:
       context: .
       dockerfile: docker/Dockerfile
     expose: ["3000"]
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
     env_file: .env
     depends_on:
       postgres: { condition: service_healthy }

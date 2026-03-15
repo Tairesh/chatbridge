@@ -1,16 +1,19 @@
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 
 use redis::aio::ConnectionManager;
 use sqlx::PgPool;
+use tokio_util::sync::CancellationToken;
 
 use crate::cache::ChannelCache;
 
-#[derive(Clone)]
 pub struct AppState {
     pub config: AppConfig,
     pub db: PgPool,
     pub redis: ConnectionManager,
     pub cache: Arc<ChannelCache>,
+    pub ws_connections: AtomicUsize,
+    pub shutdown: CancellationToken,
 }
 
 #[derive(Clone)]

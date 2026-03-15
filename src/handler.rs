@@ -7,6 +7,9 @@ use axum::response::IntoResponse;
 use bytes::Bytes;
 use redis::AsyncCommands;
 use serde::Deserialize;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
+use tokio::time::timeout;
 use tracing::Instrument;
 use uuid::Uuid;
 
@@ -16,6 +19,112 @@ use crate::model::{InternalMessage, ProviderKind, WsAck, WsError, WsInbound};
 use crate::provider::WebhookProvider;
 use crate::provider::instagram::InstagramProvider;
 use crate::provider::telegram::{self, TelegramProvider};
+
+struct ConnectionGuard<'a>(&'a std::sync::atomic::AtomicUsize);
+
+impl Drop for ConnectionGuard<'_> {
+    fn drop(&mut self) {
+        let prev = self.0.fetch_sub(1, Ordering::Relaxed);
+        tracing::info!(active_connections = prev - 1, "ws disconnected");
+    }
+}
+
+const SEND_TIMEOUT: Duration = Duration::from_secs(5);
+const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+const PING_TIMEOUT: Duration = Duration::from_secs(10);
+
+async fn process_text_message(
+    text: &str,
+    channel_id: Uuid,
+    socket: &mut WebSocket,
+    redis: &mut redis::aio::ConnectionManager,
+) -> bool {
+    let inbound: WsInbound = match serde_json::from_str(text) {
+        Ok(v) => v,
+        Err(e) => {
+            let err = WsError {
+                status: "error",
+                reason: format!("invalid message: {e}"),
+            };
+            let msg = Message::Text(serde_json::to_string(&err).unwrap().into());
+            match timeout(SEND_TIMEOUT, socket.send(msg)).await {
+                Ok(Ok(())) => {}
+                _ => {
+                    tracing::warn!(channel_id = %channel_id, "error send failed, disconnecting");
+                    return false;
+                }
+            }
+            tracing::warn!(
+                channel_id = %channel_id,
+                raw = %text,
+                "failed to parse inbound message: {e}"
+            );
+            return true; // keep connection alive
+        }
+    };
+
+    let now = chrono::Utc::now().timestamp();
+
+    let internal = InternalMessage {
+        message_id: format!("widget:{}", inbound.mid),
+        channel_id,
+        provider: ProviderKind::Widget,
+        event: inbound.action.into(),
+        timestamp: now,
+        raw: serde_json::to_value(&inbound).unwrap_or_default(),
+    };
+
+    tracing::info!(
+        message_id = %internal.message_id,
+        channel_id = %channel_id,
+        event = ?internal.event,
+        raw_data = ?internal.raw,
+        "processed widget event"
+    );
+
+    let redis_channel = format!("widget:{channel_id}");
+    let payload =
+        serde_json::to_string(&internal).expect("InternalMessage serialization cannot fail");
+    if let Err(e) = redis.publish::<_, _, ()>(&redis_channel, &payload).await {
+        tracing::error!("redis publish failed: {e}");
+    }
+
+    let ack = WsAck {
+        status: "ok",
+        message_id: inbound.mid,
+    };
+    let msg = Message::Text(serde_json::to_string(&ack).unwrap().into());
+    match timeout(SEND_TIMEOUT, socket.send(msg)).await {
+        Ok(Ok(())) => {}
+        _ => {
+            tracing::warn!(channel_id = %channel_id, "ack send failed, disconnecting");
+            return false;
+        }
+    }
+
+    true // keep connection alive
+}
+
+async fn await_pong(
+    socket: &mut WebSocket,
+    deadline: tokio::time::Instant,
+    channel_id: Uuid,
+    redis: &mut redis::aio::ConnectionManager,
+) -> bool {
+    loop {
+        match tokio::time::timeout_at(deadline, socket.recv()).await {
+            Ok(Some(Ok(Message::Pong(_)))) => return true,
+            Ok(Some(Ok(Message::Text(text)))) => {
+                if !process_text_message(&text, channel_id, socket, redis).await {
+                    return false;
+                }
+            }
+            Ok(Some(Ok(Message::Close(_)))) => return false,
+            Ok(Some(Ok(_))) => continue,
+            Ok(Some(Err(_))) | Ok(None) | Err(_) => return false,
+        }
+    }
+}
 
 #[derive(Deserialize)]
 pub struct VerifyParams {
@@ -152,77 +261,53 @@ pub async fn widget_ws(
 }
 
 async fn handle_widget_socket(mut socket: WebSocket, channel_id: Uuid, state: Arc<AppState>) {
-    while let Some(msg) = socket.recv().await {
-        let msg = match msg {
-            Ok(Message::Text(text)) => text,
-            Ok(Message::Close(_)) => {
-                tracing::info!(channel_id = %channel_id, "client disconnected");
+    let prev = state.ws_connections.fetch_add(1, Ordering::Relaxed);
+    tracing::info!(active_connections = prev + 1, channel_id = %channel_id, "ws connected");
+    let _guard = ConnectionGuard(&state.ws_connections);
+
+    let mut redis = state.redis.clone();
+
+    loop {
+        tokio::select! {
+            result = timeout(IDLE_TIMEOUT, socket.recv()) => {
+                match result {
+                    Ok(Some(Ok(Message::Text(text)))) => {
+                        if !process_text_message(&text, channel_id, &mut socket, &mut redis).await {
+                            break;
+                        }
+                    }
+                    Ok(Some(Ok(Message::Close(_)))) => {
+                        tracing::info!(channel_id = %channel_id, "client disconnected");
+                        break;
+                    }
+                    Ok(Some(Ok(Message::Pong(_)))) => continue,
+                    Ok(Some(Err(e))) => {
+                        tracing::warn!(channel_id = %channel_id, "ws recv error: {e}");
+                        break;
+                    }
+                    Ok(None) => break,
+                    Ok(Some(Ok(_))) => continue,
+                    Err(_) => {
+                        // Idle timeout — ping to check if client is alive
+                        if timeout(SEND_TIMEOUT, socket.send(Message::Ping(vec![1].into())))
+                            .await
+                            .is_err()
+                        {
+                            tracing::info!(channel_id = %channel_id, "idle client unreachable, disconnecting");
+                            break;
+                        }
+                        let deadline = tokio::time::Instant::now() + PING_TIMEOUT;
+                        if !await_pong(&mut socket, deadline, channel_id, &mut redis).await {
+                            tracing::info!(channel_id = %channel_id, "idle timeout, disconnecting");
+                            break;
+                        }
+                    }
+                }
+            }
+            _ = state.shutdown.cancelled() => {
+                let _ = timeout(SEND_TIMEOUT, socket.send(Message::Close(None))).await;
                 break;
             }
-            Ok(_) => continue,
-            Err(e) => {
-                tracing::warn!(channel_id = %channel_id, "ws recv error: {e}");
-                break;
-            }
-        };
-
-        let inbound: WsInbound = match serde_json::from_str(&msg) {
-            Ok(v) => v,
-            Err(e) => {
-                let err = WsError {
-                    status: "error",
-                    reason: format!("invalid message: {e}"),
-                };
-                let _ = socket
-                    .send(Message::Text(serde_json::to_string(&err).unwrap().into()))
-                    .await;
-                tracing::warn!(
-                    channel_id = %channel_id,
-                    raw = %msg,
-                    "failed to parse inbound message: {e}"
-                );
-                continue;
-            }
-        };
-
-        let now = chrono::Utc::now().timestamp();
-
-        let internal = InternalMessage {
-            message_id: format!("widget:{}", inbound.mid),
-            channel_id,
-            provider: ProviderKind::Widget,
-            event: inbound.action.into(),
-            timestamp: now,
-            raw: serde_json::to_value(&inbound).unwrap_or_default(),
-        };
-
-        tracing::info!(
-            message_id = %internal.message_id,
-            channel_id = %channel_id,
-            event = ?internal.event,
-            raw_data = ?internal.raw,
-            "processed widget event"
-        );
-
-        // Publish to Redis for cross-replica routing
-        let redis_channel = format!("widget:{channel_id}");
-        let payload =
-            serde_json::to_string(&internal).expect("InternalMessage serialization cannot fail");
-        let mut redis = state.redis.clone();
-        if let Err(e) = redis.publish::<_, _, ()>(&redis_channel, &payload).await {
-            tracing::error!("redis publish failed: {e}");
-        }
-
-        let ack = WsAck {
-            status: "ok",
-            message_id: inbound.mid,
-        };
-        if socket
-            .send(Message::Text(serde_json::to_string(&ack).unwrap().into()))
-            .await
-            .is_err()
-        {
-            break;
         }
     }
 }
