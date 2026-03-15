@@ -30,7 +30,8 @@ Multi-provider webhook microservice for Instagram, Telegram, and WebSocket chat 
 
 ### Module Structure
 
-- `config.rs` — `AppConfig` (from env vars) and `AppState` (config + PgPool + Redis)
+- `cache.rs` — `ChannelCache` (in-memory read-through cache for channel lookups, invalidated via Redis Pub/Sub)
+- `config.rs` — `AppConfig` (from env vars) and `AppState` (config + PgPool + Redis + ChannelCache)
 - `db.rs` — Pool init, migrations, channel lookup queries
 - `error.rs` — `WebhookError` enum with `IntoResponse` (database errors are logged but not leaked to clients)
 - `model.rs` — `InternalMessage`, `ProviderKind`, `EventKind`, `WsInbound`, `WsAck`, `WsError`
@@ -54,14 +55,26 @@ Multi-provider webhook microservice for Instagram, Telegram, and WebSocket chat 
 1. Extract headers + raw body
 2. `provider.verify(headers, body)` → 403 if invalid (Instagram uses constant-time HMAC via `verify_slice`)
 3. Return 200 OK immediately
-4. `tokio::spawn` (instrumented with tracing spans) → parse payload, lookup channel in DB, log `InternalMessage` to stdout, publish to Redis (`instagram:{channel_id}` / `telegram:{channel_id}`)
+4. `tokio::spawn` (instrumented with tracing spans) → parse payload, lookup channel via in-memory cache (read-through to DB on miss), log `InternalMessage` to stdout, publish to Redis (`instagram:{channel_id}` / `telegram:{channel_id}`)
 
 ### Handler Flow (WebSocket widget)
 
-1. Validate `widget_id` against `widget_channels` table → 404 if unknown
+1. Validate `widget_id` via in-memory cache (read-through to `widget_channels` table) → 404 if unknown
 2. Upgrade to WebSocket connection
 3. Message loop: receive JSON `{"action": "send"|"edit", "mid": "uuid", "text": "...", "attachments": ["uuid", ...]}` → validate `mid` as UUID → map action to `EventKind` → log → publish to Redis (`widget:{channel_id}`) → send ACK `{"status": "ok", "message_id": "uuid"}`
 4. Unknown actions, malformed messages, and invalid `mid` values get error response; connection stays alive
+
+### Channel Cache
+
+Channel data is cached in-memory (`ChannelCache` in `cache.rs`) to avoid hitting Postgres on every incoming webhook. Cache uses read-through: on miss, queries DB and stores the result. Invalidation is per-channel via Redis Pub/Sub:
+
+```
+PUBLISH channel_invalidation "instagram:<channel_uuid>"
+PUBLISH channel_invalidation "telegram:<channel_uuid>"
+PUBLISH channel_invalidation "widget:<channel_uuid>"
+```
+
+A background task (`spawn_invalidation_listener`) subscribes to the `channel_invalidation` topic and evicts the matching entry. All replicas receive the event and update their local cache.
 
 ### Database
 

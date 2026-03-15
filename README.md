@@ -20,14 +20,14 @@ Multi-provider webhook receiver for **Instagram**, **Telegram**, and **WebSocket
                          │   │                                 │
                          │   └─ Background: parse payload      │
                          │      ├─ Match sender/recipient ID   │
-                         │      │  against instagram_channels  │
+                         │      │  (in-memory cache → DB)      │
                          │      ├─ Emit InternalMessage ──▶ stdout
                          │      └─ Publish ──▶ Redis instagram:{id}
                          │                                     │
     Telegram ────POST────▶ /webhook/telegram/{channel_id}      │
                          │   │                                 │
                          │   ├─ Lookup bot_secret by UUID      │
-                         │   │  from telegram_channels         │
+                         │   │  (in-memory cache → DB fallback)│
                          │   │                                 │
                          │   ├─ Verify secret token header     │
                          │   │  (X-Telegram-Bot-Api-Secret-Token)
@@ -40,7 +40,8 @@ Multi-provider webhook receiver for **Instagram**, **Telegram**, and **WebSocket
                          │                                     │
   Widget Client ───WS────▶ /ws/{widget_id}                     │
                          │   │                                 │
-                         │   ├─ Lookup widget_id in DB         │
+                         │   ├─ Lookup widget_id               │
+                         │   │  (in-memory cache → DB)         │
                          │   ├─ Upgrade to WebSocket           │
                          │   │                                 │
                          │   └─ Message loop:                  │
@@ -63,6 +64,7 @@ Multi-provider webhook receiver for **Instagram**, **Telegram**, and **WebSocket
                          telegram_channels    instagram:{uuid}
                          widget_channels      telegram:{uuid}
                                               widget:{uuid}
+                                              channel_invalidation
 ```
 
 ### InternalMessage
@@ -82,13 +84,29 @@ Every successfully parsed webhook event becomes an `InternalMessage`:
 └──────────────────────────────────────────────┘
 ```
 
+### Channel Cache
+
+Channel configuration (tokens, secrets, IDs) is cached in-memory to avoid a Postgres round-trip on every incoming webhook. The cache uses a read-through strategy: on a miss it queries the database and stores the result locally.
+
+When a channel is updated or deleted, publish an invalidation event to Redis so all replicas evict the stale entry:
+
+```bash
+# Invalidate a specific channel
+redis-cli PUBLISH channel_invalidation "instagram:<channel_uuid>"
+redis-cli PUBLISH channel_invalidation "telegram:<channel_uuid>"
+redis-cli PUBLISH channel_invalidation "widget:<channel_uuid>"
+```
+
+Each replica runs a background listener on the `channel_invalidation` topic that parses the `"provider:uuid"` message and evicts only the matching cache entry.
+
 ## Project Structure
 
 ```
 src/
 ├── main.rs              # Entrypoint: load config, connect DB, start server, graceful shutdown
 ├── lib.rs               # Public module re-exports
-├── config.rs            # AppConfig (env vars) + AppState (config + DB pool + Redis)
+├── cache.rs             # In-memory channel cache with Redis Pub/Sub invalidation
+├── config.rs            # AppConfig (env vars) + AppState (config + DB pool + Redis + cache)
 ├── db.rs                # Postgres pool, migrations, channel queries
 ├── error.rs             # WebhookError → HTTP status mapping
 ├── model.rs             # InternalMessage, ProviderKind, EventKind, WsInbound/WsAck
@@ -177,6 +195,7 @@ Integration tests cover:
 - WebSocket widget (connect, ACK, multiple messages, error recovery, unknown widget, invalid mid rejection)
 - WebSocket edit action (edit ACK, Redis edit event, unknown action error)
 - Redis pub/sub verification for all three providers
+- Channel cache (read-through, per-channel invalidation, Redis Pub/Sub eviction, cross-channel isolation)
 
 Test data cleanup uses RAII drop guards (`TestChannel`) to ensure rows are deleted even if a test panics.
 
