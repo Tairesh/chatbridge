@@ -1,6 +1,9 @@
+use chrono::{DateTime, Utc};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{FromRow, PgPool};
 use uuid::Uuid;
+
+use crate::model::ProviderKind;
 
 pub async fn init_pool(database_url: &str) -> PgPool {
     PgPoolOptions::new()
@@ -22,7 +25,7 @@ pub async fn run_migrations(pool: &PgPool) {
 pub struct InstagramChannel {
     pub id: Uuid,
     pub user_id: String,
-    // pub access_token: String,
+    pub access_token: String,
 }
 
 pub async fn find_instagram_channel_by_user_id(
@@ -30,7 +33,7 @@ pub async fn find_instagram_channel_by_user_id(
     user_id: &str,
 ) -> Result<Option<InstagramChannel>, sqlx::Error> {
     sqlx::query_as::<_, InstagramChannel>(
-        "SELECT id, user_id FROM instagram_channels WHERE user_id = $1",
+        "SELECT id, user_id, access_token FROM instagram_channels WHERE user_id = $1",
     )
     .bind(user_id)
     .fetch_optional(pool)
@@ -87,4 +90,55 @@ pub async fn find_client_by_id(pool: &PgPool, client_id: Uuid) -> Result<bool, s
         .fetch_optional(pool)
         .await?;
     Ok(row.is_some())
+}
+
+#[derive(Debug, Clone, FromRow)]
+pub struct Client {
+    pub id: Uuid,
+    pub provider: String,
+    pub external_id: Option<String>,
+    pub name: Option<String>,
+    pub username: Option<String>,
+    pub updated_at: DateTime<Utc>,
+}
+
+pub async fn upsert_client(
+    pool: &PgPool,
+    id: Uuid,
+    provider: ProviderKind,
+    external_id: &str,
+    name: Option<&str>,
+    username: Option<&str>,
+) -> Result<Uuid, sqlx::Error> {
+    let row: (Uuid,) = sqlx::query_as(
+        "INSERT INTO clients (id, provider, external_id, name, username, updated_at)
+         VALUES ($1, $2, $3, $4, $5, now())
+         ON CONFLICT (provider, external_id) WHERE external_id IS NOT NULL
+         DO UPDATE SET name = $4, username = $5, updated_at = now()
+         RETURNING id",
+    )
+    .bind(id)
+    .bind(provider.to_string())
+    .bind(external_id)
+    .bind(name)
+    .bind(username)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.0)
+}
+
+pub async fn find_client_by_external_id(
+    pool: &PgPool,
+    provider: ProviderKind,
+    external_id: &str,
+) -> Result<Option<Client>, sqlx::Error> {
+    sqlx::query_as::<_, Client>(
+        "SELECT id, provider, external_id, name, username, updated_at
+         FROM clients
+         WHERE provider = $1 AND external_id = $2",
+    )
+    .bind(provider.to_string())
+    .bind(external_id)
+    .fetch_optional(pool)
+    .await
 }

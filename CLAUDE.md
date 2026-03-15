@@ -13,6 +13,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **Run single test:** `cargo test <test_name>`
 - **Docker (full stack):** `docker compose up --build`
 
+## Gotchas
+
+- reqwest 0.13+ TLS feature is `rustls` (not `rustls-tls`)
+- DB client functions (`upsert_client`, `find_client_by_external_id`) accept `ProviderKind` enum, not `&str`
+- `reqwest::Client` is a `LazyLock` static in `provider/instagram.rs` — don't create new clients per-request
+
 ## Environment Variables
 
 Required at runtime:
@@ -33,12 +39,12 @@ Multi-provider chat bridge for Instagram, Telegram, and WebSocket chat widgets, 
 - `jwt.rs` — HS256 JWT sign/verify for WebSocket widget client identity (`Claims { sub, iat }`)
 - `registry.rs` — `ClientRegistry` (tracks active WS connections per client UUID via `RwLock<HashMap<Uuid, HashSet<u64>>>`)
 - `config.rs` — `AppConfig` (from env vars) and `AppState` (config + PgPool + Redis + ChannelCache + ClientRegistry + shutdown token). `AppState` does NOT derive `Clone` — it's always behind `Arc<AppState>`
-- `db.rs` — Pool init, migrations, channel lookup queries
+- `db.rs` — Pool init, migrations, channel lookup queries, `Client` struct, `upsert_client`, `find_client_by_external_id`. `InstagramChannel` includes `access_token`
 - `error.rs` — `WebhookError` enum with `IntoResponse` (database errors are logged but not leaked to clients)
 - `model.rs` — `InternalMessage` (now with optional `client_id`), `ProviderKind`, `EventKind`, `WsInbound`, `WsActionKind` (`send`/`edit`/`read`), `WsOutbound` (`Auth`/`Ack`/`Error`)
 - `provider/mod.rs` — `WebhookProvider` trait (verify + parse)
-- `provider/instagram.rs` — Constant-time HMAC-SHA256 verification, Meta webhook payload parsing
-- `provider/telegram.rs` — Secret token verification, Telegram Update parsing
+- `provider/instagram.rs` — Constant-time HMAC-SHA256 verification, Meta webhook payload parsing, client resolution via Instagram Graph API (background `tokio::spawn` with 24h staleness check)
+- `provider/telegram.rs` — Secret token verification, Telegram Update parsing, `TelegramUser` struct, background client upsert from `from` field (updated on every message)
 - `handler.rs` — Axum handlers (`meta_verify`, `instagram_ingest`, `telegram_ingest`, `widget_ws`)
 - `routes.rs` — Router assembly
 
@@ -87,3 +93,8 @@ Tables: `instagram_channels`, `telegram_channels`, `widget_channels`, `clients`.
 ### Docker
 
 `compose.yaml` runs `nginx` + `chatbridge` + `postgres:16-alpine` + `redis:7-alpine`. Dockerfile and nginx.conf live in `docker/`. Config via `.env` file (see `.env.example`).
+
+### Specs & Plans
+
+- Design specs: `docs/superpowers/specs/`
+- Implementation plans: `docs/superpowers/plans/`

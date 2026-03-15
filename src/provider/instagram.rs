@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use axum::http::HeaderMap;
 use hmac::{Hmac, Mac};
@@ -11,6 +11,19 @@ use crate::cache::ChannelCache;
 use crate::error::WebhookError;
 use crate::model::{EventKind, InternalMessage, ProviderKind};
 use crate::provider::WebhookProvider;
+
+static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .expect("failed to build reqwest client")
+});
+
+#[derive(Debug, Deserialize)]
+struct InstagramProfile {
+    name: Option<String>,
+    username: Option<String>,
+}
 
 pub struct InstagramProvider {
     app_secret: String,
@@ -68,43 +81,32 @@ impl WebhookProvider for InstagramProvider {
             for event in messaging {
                 let (event_kind, mid) = classify_event(event);
 
-                let sender_id = event.sender.as_ref().map(|s| s.id.as_str());
-                let recipient_id = event.recipient.as_ref().map(|r| r.id.as_str());
-
-                // Check both sender and recipient against instagram_channels
-                let mut matched_channel_ids: Vec<Uuid> = Vec::new();
-
-                for ig_user_id in [sender_id, recipient_id].into_iter().flatten() {
-                    if let Some(ch) = self.cache.get_instagram_channel(db, ig_user_id).await?
-                        && !matched_channel_ids.contains(&ch.id)
-                    {
-                        matched_channel_ids.push(ch.id);
-                    }
-                }
-
-                if matched_channel_ids.is_empty() {
-                    tracing::warn!(
-                        sender = sender_id,
-                        recipient = recipient_id,
-                        "no channel found for instagram event"
-                    );
+                let Some(recipient_id) = event.recipient.as_ref().map(|r| r.id.as_str()) else {
+                    tracing::warn!("no recipient in instagram event");
                     continue;
-                }
+                };
+
+                let Some(channel) =
+                    self.cache.get_instagram_channel(db, recipient_id).await?
+                else {
+                    tracing::warn!(?recipient_id, "no channel found for instagram event");
+                    continue;
+                };
+
+                let client_id =
+                    resolve_instagram_client(db, event.sender.as_ref(), &channel).await;
 
                 let raw = serde_json::to_value(event).unwrap_or(serde_json::Value::Null);
-
-                for channel_id in matched_channel_ids {
-                    let message_id = format!("instagram:{}", mid.unwrap_or(&entry.id));
-                    messages.push(InternalMessage {
-                        message_id,
-                        channel_id,
-                        client_id: None,
-                        provider: ProviderKind::Instagram,
-                        event: event_kind.clone(),
-                        timestamp: event.timestamp.unwrap_or(entry.time),
-                        raw: raw.clone(),
-                    });
-                }
+                let message_id = format!("instagram:{}", mid.unwrap_or(&entry.id));
+                messages.push(InternalMessage {
+                    message_id,
+                    channel_id: channel.id,
+                    client_id,
+                    provider: ProviderKind::Instagram,
+                    event: event_kind,
+                    timestamp: event.timestamp.unwrap_or(entry.time),
+                    raw,
+                });
             }
         }
 
@@ -127,6 +129,88 @@ fn classify_event(event: &MessagingEvent) -> (EventKind, Option<&String>) {
     }
     // Default to Message for unknown event types
     (EventKind::Unknown, None)
+}
+
+use crate::db::InstagramChannel;
+
+/// Look up or create a client from the sender field, spawning a background
+/// task to fetch the Instagram profile and upsert the client row.
+async fn resolve_instagram_client(
+    db: &PgPool,
+    sender: Option<&Participant>,
+    channel: &InstagramChannel,
+) -> Option<Uuid> {
+    let sid = sender?.id.as_str();
+    match crate::db::find_client_by_external_id(db, ProviderKind::Instagram, sid).await {
+        Ok(Some(client)) => {
+            let age = chrono::Utc::now() - client.updated_at;
+            if age > chrono::TimeDelta::hours(24) {
+                spawn_instagram_upsert(db.clone(), client.id, sid, channel);
+            }
+            Some(client.id)
+        }
+        Ok(None) => {
+            let client_id = Uuid::new_v4();
+            spawn_instagram_upsert(db.clone(), client_id, sid, channel);
+            Some(client_id)
+        }
+        Err(e) => {
+            tracing::error!("instagram client lookup failed: {e}");
+            None
+        }
+    }
+}
+
+fn spawn_instagram_upsert(db: PgPool, client_id: Uuid, sid: &str, channel: &InstagramChannel) {
+    let sid = sid.to_owned();
+    let token = channel.access_token.clone();
+    tokio::spawn(fetch_and_upsert_instagram_client(db, client_id, sid, token));
+}
+
+/// Fetch Instagram profile and upsert client. Always creates the client row,
+/// even if the API call fails (with name/username as NULL).
+async fn fetch_and_upsert_instagram_client(
+    db: PgPool,
+    client_id: Uuid,
+    sender_id: String,
+    access_token: String,
+) {
+    let url = format!(
+        "https://graph.instagram.com/v25.0/{sender_id}?fields=username,name&access_token={access_token}"
+    );
+
+    let (name, username) = match HTTP_CLIENT.get(&url).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            match resp.json::<InstagramProfile>().await {
+                Ok(profile) => (profile.name, profile.username),
+                Err(e) => {
+                    tracing::warn!(%sender_id, "failed to parse instagram profile: {e}");
+                    (None, None)
+                }
+            }
+        }
+        Ok(resp) => {
+            tracing::warn!(%sender_id, status = %resp.status(), "instagram profile API error");
+            (None, None)
+        }
+        Err(e) => {
+            tracing::warn!(%sender_id, "instagram profile API request failed: {e}");
+            (None, None)
+        }
+    };
+
+    if let Err(e) = crate::db::upsert_client(
+        &db,
+        client_id,
+        ProviderKind::Instagram,
+        &sender_id,
+        name.as_deref(),
+        username.as_deref(),
+    )
+    .await
+    {
+        tracing::error!(%sender_id, "instagram client upsert failed: {e}");
+    }
 }
 
 // --- Meta webhook payload types ---

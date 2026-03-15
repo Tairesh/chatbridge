@@ -8,7 +8,7 @@ pub enum ProviderKind {
     Widget,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum EventKind {
     Message,
     Edit,

@@ -21,6 +21,8 @@ Multi-provider chat bridge for **Instagram**, **Telegram**, and **WebSocket chat
                          │   └─ Background: parse payload      │
                          │      ├─ Match sender/recipient ID   │
                          │      │  (in-memory cache → DB)      │
+                         │      ├─ Resolve client identity     │
+                         │      │  (DB lookup + Graph API bg)  │
                          │      ├─ Emit InternalMessage ──▶ stdout
                          │      └─ Publish ──▶ Redis instagram:{id}
                          │                                     │
@@ -35,6 +37,8 @@ Multi-provider chat bridge for **Instagram**, **Telegram**, and **WebSocket chat
                          │   ├─ Return 200 OK ◀── immediate    │
                          │   │                                 │
                          │   └─ Background: parse Update       │
+                         │      ├─ Resolve client from `from`  │
+                         │      │  (inline upsert, no API)     │
                          │      ├─ Emit InternalMessage ──▶ stdout
                          │      └─ Publish ──▶ Redis telegram:{id}
                          │                                     │
@@ -67,7 +71,7 @@ Multi-provider chat bridge for **Instagram**, **Telegram**, and **WebSocket chat
                          instagram_channels   pub/sub channels:
                          telegram_channels    instagram:{uuid}
                          widget_channels      telegram:{uuid}
-                                              widget:{uuid}
+                         clients              widget:{uuid}
                                               channel_invalidation
 ```
 
@@ -81,6 +85,7 @@ Every successfully parsed webhook event becomes an `InternalMessage`:
 ├──────────────────────────────────────────────┤
 │ message_id   "instagram:aWdf..." / "telegram:42" / "widget:uuid" │
 │ channel_id   UUID (from DB)                  │
+│ client_id    UUID (auto-resolved per sender) │
 │ provider     Instagram | Telegram | Widget   │
 │ event        Message | Edit | Read | Reaction | Unknown │
 │ timestamp    Unix ms                         │
@@ -111,15 +116,15 @@ src/
 ├── lib.rs               # Public module re-exports
 ├── cache.rs             # In-memory channel cache with Redis Pub/Sub invalidation
 ├── config.rs            # AppConfig (env vars) + AppState (config + DB pool + Redis + cache + connection counter + shutdown token)
-├── db.rs                # Postgres pool, migrations, channel queries
+├── db.rs                # Postgres pool, migrations, channel queries, client identity upsert
 ├── error.rs             # WebhookError → HTTP status mapping
 ├── model.rs             # InternalMessage, ProviderKind, EventKind, WsInbound/WsAck
 ├── handler.rs           # Axum request handlers + WebSocket handler
 ├── routes.rs            # Router assembly
 └── provider/
     ├── mod.rs           # WebhookProvider trait (verify + parse)
-    ├── instagram.rs     # Constant-time HMAC-SHA256 verification, Meta payload parsing
-    └── telegram.rs      # Secret token verification, Telegram Update parsing
+    ├── instagram.rs     # HMAC-SHA256 verification, Meta payload parsing, client identity via Graph API
+    └── telegram.rs      # Secret token verification, Telegram Update parsing, client identity from `from` field
 
 docker/
 ├── Dockerfile           # Multi-stage build
@@ -181,7 +186,7 @@ Migrations run automatically on startup.
 cargo test --lib
 ```
 
-Covers HMAC verification, secret token validation, event classification, payload deserialization, WebSocket message types, and UUID mid validation.
+Covers HMAC verification, secret token validation, event classification, payload deserialization, WebSocket message types, UUID mid validation, and TelegramUser/display name building.
 
 ### All tests (unit + integration)
 
@@ -198,6 +203,7 @@ Integration tests cover:
 - WebSocket widget (connect, ACK, multiple messages, error recovery, unknown widget, invalid mid rejection)
 - WebSocket edit action (edit ACK, Redis edit event, unknown action error)
 - Redis pub/sub verification for all three providers
+- Client identity upsert (create, update, conflict handling)
 - Channel cache (read-through, per-channel invalidation, Redis Pub/Sub eviction, cross-channel isolation)
 
 Test data cleanup uses RAII drop guards (`TestChannel`) to ensure rows are deleted even if a test panics.

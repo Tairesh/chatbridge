@@ -55,16 +55,47 @@ impl WebhookProvider for TelegramProvider {
         Ok(())
     }
 
-    async fn parse(&self, body: &[u8], _db: &PgPool) -> Result<Vec<InternalMessage>, WebhookError> {
+    async fn parse(&self, body: &[u8], db: &PgPool) -> Result<Vec<InternalMessage>, WebhookError> {
         let update: TelegramUpdate =
             serde_json::from_slice(body).map_err(|e| WebhookError::BadRequest(e.to_string()))?;
 
-        let (event_kind, message_id, timestamp) = if let Some(ref msg) = update.message {
-            (EventKind::Message, msg.message_id, msg.date)
+        let (event_kind, msg_ref) = if let Some(ref msg) = update.message {
+            (EventKind::Message, Some(msg))
         } else if let Some(ref msg) = update.edited_message {
-            (EventKind::Edit, msg.message_id, msg.date)
+            (EventKind::Edit, Some(msg))
         } else {
-            (EventKind::Unknown, update.update_id, 0)
+            (EventKind::Unknown, None)
+        };
+
+        let (message_id, timestamp) = match msg_ref {
+            Some(msg) => (msg.message_id, msg.date),
+            None => (update.update_id, 0),
+        };
+
+        // Upsert client from the `from` field if present (non-blocking)
+        let client_id = if let Some(from) = msg_ref.and_then(|m| m.from.as_ref()) {
+            let client_id = Uuid::new_v4();
+            let name = build_display_name(from);
+            let db = db.clone();
+            let external_id = from.id.to_string();
+            let username = from.username.clone();
+            tokio::spawn(async move {
+                if let Err(e) = crate::db::upsert_client(
+                    &db,
+                    client_id,
+                    ProviderKind::Telegram,
+                    &external_id,
+                    Some(name.as_str()),
+                    username.as_deref(),
+                )
+                .await
+                {
+                    tracing::error!("telegram client upsert failed: {e}");
+                }
+            });
+            Some(client_id)
+        } else {
+            None
         };
 
         let raw = serde_json::from_slice(body).unwrap_or(serde_json::Value::Null);
@@ -72,7 +103,7 @@ impl WebhookProvider for TelegramProvider {
         Ok(vec![InternalMessage {
             message_id: format!("telegram:{message_id}"),
             channel_id: self.channel_id,
-            client_id: None,
+            client_id,
             provider: ProviderKind::Telegram,
             event: event_kind,
             timestamp,
@@ -94,9 +125,24 @@ pub struct TelegramUpdate {
 pub struct TelegramMessage {
     pub message_id: i64,
     pub date: i64,
-    pub from: Option<serde_json::Value>,
+    pub from: Option<TelegramUser>,
     pub chat: Option<serde_json::Value>,
     pub text: Option<String>,
+}
+
+#[derive(Debug, Deserialize, serde::Serialize)]
+pub struct TelegramUser {
+    pub id: i64,
+    pub first_name: String,
+    pub last_name: Option<String>,
+    pub username: Option<String>,
+}
+
+fn build_display_name(user: &TelegramUser) -> String {
+    match &user.last_name {
+        Some(last) => format!("{} {}", user.first_name, last),
+        None => user.first_name.clone(),
+    }
 }
 
 #[cfg(test)]
@@ -187,5 +233,55 @@ mod tests {
         let msg = update.edited_message.unwrap();
         assert_eq!(msg.message_id, 42);
         assert_eq!(msg.text.as_deref(), Some("edited text"));
+    }
+
+    #[test]
+    fn deserialize_telegram_user() {
+        let json = serde_json::json!({
+            "id": 123456,
+            "first_name": "John",
+            "last_name": "Doe",
+            "username": "johndoe"
+        });
+        let user: TelegramUser = serde_json::from_value(json).unwrap();
+        assert_eq!(user.id, 123456);
+        assert_eq!(user.first_name, "John");
+        assert_eq!(user.last_name.as_deref(), Some("Doe"));
+        assert_eq!(user.username.as_deref(), Some("johndoe"));
+    }
+
+    #[test]
+    fn deserialize_telegram_user_minimal() {
+        let json = serde_json::json!({
+            "id": 789,
+            "first_name": "Alice"
+        });
+        let user: TelegramUser = serde_json::from_value(json).unwrap();
+        assert_eq!(user.id, 789);
+        assert_eq!(user.first_name, "Alice");
+        assert!(user.last_name.is_none());
+        assert!(user.username.is_none());
+    }
+
+    #[test]
+    fn build_display_name_full() {
+        let user = TelegramUser {
+            id: 1,
+            first_name: "John".into(),
+            last_name: Some("Doe".into()),
+            username: Some("johndoe".into()),
+        };
+        assert_eq!(build_display_name(&user), "John Doe");
+    }
+
+    #[test]
+    fn build_display_name_first_only() {
+        let user = TelegramUser {
+            id: 1,
+            first_name: "Alice".into(),
+            last_name: None,
+            username: None,
+        };
+        assert_eq!(build_display_name(&user), "Alice");
     }
 }
