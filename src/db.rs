@@ -17,7 +17,7 @@ pub async fn run_migrations(pool: &PgPool) {
         .expect("failed to run migrations");
 }
 
-#[derive(Debug, FromRow)]
+#[derive(Debug, Clone, FromRow)]
 pub struct InstagramChannel {
     pub id: Uuid,
     pub user_id: String,
@@ -36,7 +36,7 @@ pub async fn find_instagram_channel_by_user_id(
     .await
 }
 
-#[derive(Debug, FromRow)]
+#[derive(Debug, Clone, FromRow)]
 pub struct TelegramChannel {
     pub id: Uuid,
     pub bot_token: String,
@@ -55,7 +55,7 @@ pub async fn find_telegram_channel_by_id(
     .await
 }
 
-#[derive(Debug, FromRow)]
+#[derive(Debug, Clone, FromRow)]
 pub struct WidgetChannel {
     pub id: Uuid,
     pub widget_id: String,

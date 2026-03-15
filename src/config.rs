@@ -1,11 +1,16 @@
+use std::sync::Arc;
+
 use redis::aio::ConnectionManager;
 use sqlx::PgPool;
+
+use crate::cache::ChannelCache;
 
 #[derive(Clone)]
 pub struct AppState {
     pub config: AppConfig,
     pub db: PgPool,
     pub redis: ConnectionManager,
+    pub cache: Arc<ChannelCache>,
 }
 
 #[derive(Clone)]

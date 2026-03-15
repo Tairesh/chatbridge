@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use webhook::cache::{self, ChannelCache};
 use webhook::config::{AppConfig, AppState};
 use webhook::{db, routes};
 
@@ -20,7 +21,15 @@ async fn main() {
         .expect("failed to connect to Redis");
     tracing::info!("connected to Redis");
 
-    let state = Arc::new(AppState { config, db, redis });
+    let cache = Arc::new(ChannelCache::new());
+    cache::spawn_invalidation_listener(&config.redis_url, cache.clone()).await;
+
+    let state = Arc::new(AppState {
+        config,
+        db,
+        redis,
+        cache,
+    });
     let app = routes::build(state);
 
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}"))

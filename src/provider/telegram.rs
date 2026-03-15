@@ -1,9 +1,11 @@
+use std::sync::Arc;
+
 use axum::http::HeaderMap;
 use serde::Deserialize;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::db;
+use crate::cache::ChannelCache;
 use crate::error::WebhookError;
 use crate::model::{EventKind, InternalMessage, ProviderKind};
 use crate::provider::WebhookProvider;
@@ -17,10 +19,15 @@ impl TelegramProvider {
         Self { channel_id }
     }
 
-    /// Load the channel's bot_secret from the database and return the provider
-    /// along with the expected secret for verification.
-    pub async fn load(channel_id: Uuid, db: &PgPool) -> Result<(Self, String), WebhookError> {
-        let channel = db::find_telegram_channel_by_id(db, channel_id)
+    /// Load the channel's bot_secret from the cache (or database on miss) and return
+    /// the provider along with the expected secret for verification.
+    pub async fn load(
+        channel_id: Uuid,
+        db: &PgPool,
+        cache: &Arc<ChannelCache>,
+    ) -> Result<(Self, String), WebhookError> {
+        let channel = cache
+            .get_telegram_channel(db, channel_id)
             .await?
             .ok_or_else(|| WebhookError::NotFound(format!("channel {channel_id} not found")))?;
         Ok((Self::new(channel_id), channel.bot_secret))

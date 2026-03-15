@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use axum::http::HeaderMap;
 use hmac::{Hmac, Mac};
 use serde::Deserialize;
@@ -5,19 +7,21 @@ use sha2::Sha256;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::db;
+use crate::cache::ChannelCache;
 use crate::error::WebhookError;
 use crate::model::{EventKind, InternalMessage, ProviderKind};
 use crate::provider::WebhookProvider;
 
 pub struct InstagramProvider {
     app_secret: String,
+    cache: Arc<ChannelCache>,
 }
 
 impl InstagramProvider {
-    pub fn new(app_secret: &str) -> Self {
+    pub fn new(app_secret: &str, cache: Arc<ChannelCache>) -> Self {
         Self {
             app_secret: app_secret.to_owned(),
+            cache,
         }
     }
 }
@@ -71,7 +75,8 @@ impl WebhookProvider for InstagramProvider {
                 let mut matched_channel_ids: Vec<Uuid> = Vec::new();
 
                 for ig_user_id in [sender_id, recipient_id].into_iter().flatten() {
-                    if let Some(ch) = db::find_instagram_channel_by_user_id(db, ig_user_id).await?
+                    if let Some(ch) =
+                        self.cache.get_instagram_channel(db, ig_user_id).await?
                         && !matched_channel_ids.contains(&ch.id)
                     {
                         matched_channel_ids.push(ch.id);
@@ -185,11 +190,16 @@ pub struct Reaction {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cache::ChannelCache;
     use crate::provider::WebhookProvider;
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
 
     const TEST_SECRET: &str = "test_secret_key";
+
+    fn test_provider() -> InstagramProvider {
+        InstagramProvider::new(TEST_SECRET, Arc::new(ChannelCache::new()))
+    }
 
     fn sign(secret: &str, body: &[u8]) -> String {
         let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("valid key length");
@@ -199,7 +209,7 @@ mod tests {
 
     #[test]
     fn verify_valid_signature() {
-        let provider = InstagramProvider::new(TEST_SECRET);
+        let provider = test_provider();
         let body = b"test body";
         let sig = sign(TEST_SECRET, body);
 
@@ -214,7 +224,7 @@ mod tests {
 
     #[test]
     fn verify_invalid_signature() {
-        let provider = InstagramProvider::new(TEST_SECRET);
+        let provider = test_provider();
         let body = b"test body";
 
         let mut headers = HeaderMap::new();
@@ -231,7 +241,7 @@ mod tests {
 
     #[test]
     fn verify_missing_header() {
-        let provider = InstagramProvider::new(TEST_SECRET);
+        let provider = test_provider();
         let headers = HeaderMap::new();
 
         let err = provider.verify(&headers, b"body").unwrap_err();
@@ -240,7 +250,7 @@ mod tests {
 
     #[test]
     fn verify_missing_sha256_prefix() {
-        let provider = InstagramProvider::new(TEST_SECRET);
+        let provider = test_provider();
         let body = b"test body";
         let sig = sign(TEST_SECRET, body);
 

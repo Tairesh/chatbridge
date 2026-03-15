@@ -11,7 +11,6 @@ use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::config::AppState;
-use crate::db;
 use crate::error::WebhookError;
 use crate::model::{EventKind, InternalMessage, ProviderKind, WsAck, WsError, WsInbound};
 use crate::provider::WebhookProvider;
@@ -47,7 +46,7 @@ pub async fn instagram_ingest(
     headers: HeaderMap,
     body: Bytes,
 ) -> StatusCode {
-    let provider = InstagramProvider::new(&state.config.instagram_app_secret);
+    let provider = InstagramProvider::new(&state.config.instagram_app_secret, state.cache.clone());
 
     if let Err(e) = provider.verify(&headers, &body) {
         tracing::warn!("instagram verify failed: {e}");
@@ -93,7 +92,8 @@ pub async fn telegram_ingest(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<StatusCode, WebhookError> {
-    let (provider, bot_secret) = TelegramProvider::load(channel_id, &state.db).await?;
+    let (provider, bot_secret) =
+        TelegramProvider::load(channel_id, &state.db, &state.cache).await?;
 
     telegram::verify_secret_token(&headers, &bot_secret)?;
 
@@ -135,7 +135,7 @@ pub async fn widget_ws(
     Path(widget_id): Path<String>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    let channel = match db::find_widget_channel_by_widget_id(&state.db, &widget_id).await {
+    let channel = match state.cache.get_widget_channel(&state.db, &widget_id).await {
         Ok(Some(ch)) => ch,
         Ok(None) => {
             tracing::warn!(widget_id = %widget_id, "unknown widget_id");

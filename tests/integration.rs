@@ -128,6 +128,7 @@ async fn build_state(db: PgPool) -> Arc<AppState> {
         },
         db,
         redis,
+        cache: Arc::new(Default::default()),
     })
 }
 
@@ -422,6 +423,7 @@ async fn telegram_ingest_unknown_channel() {
 // --- WebSocket widget tests ---
 
 use futures_util::{SinkExt, StreamExt};
+use webhook::cache::ChannelCache;
 
 #[tokio::test]
 async fn ws_connect_and_receive_ack() {
@@ -971,13 +973,215 @@ async fn ws_invalid_mid_returns_error() {
     ws.close(None).await.unwrap();
 }
 
+// --- Cache + invalidation tests ---
+
+#[tokio::test]
+async fn cache_instagram_lookup_and_invalidation() {
+    let pool = setup_pool().await;
+    let (guard, user_id) = insert_test_instagram_channel(&pool).await;
+
+    let cache = Arc::new(ChannelCache::new());
+
+    // First lookup — cache miss, loads from DB
+    let ch = cache
+        .get_instagram_channel(&pool, &user_id)
+        .await
+        .unwrap()
+        .expect("channel should exist");
+    assert_eq!(ch.id, guard.id);
+
+    // Delete from DB — cache should still return the channel
+    sqlx::query("DELETE FROM instagram_channels WHERE id = $1")
+        .bind(guard.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let cached = cache
+        .get_instagram_channel(&pool, &user_id)
+        .await
+        .unwrap()
+        .expect("should be served from cache");
+    assert_eq!(cached.id, guard.id);
+
+    // Invalidate the specific channel
+    cache.invalidate("instagram", guard.id);
+
+    // Now cache is empty, lookup goes to DB — channel is gone
+    let after = cache
+        .get_instagram_channel(&pool, &user_id)
+        .await
+        .unwrap();
+    assert!(after.is_none(), "should be None after invalidation + DB delete");
+}
+
+#[tokio::test]
+async fn cache_telegram_lookup_and_invalidation() {
+    let pool = setup_pool().await;
+    let bot_secret = "cache_test_secret";
+    let guard = insert_test_telegram_channel(&pool, bot_secret).await;
+
+    let cache = Arc::new(ChannelCache::new());
+
+    // First lookup — cache miss, loads from DB
+    let ch = cache
+        .get_telegram_channel(&pool, guard.id)
+        .await
+        .unwrap()
+        .expect("channel should exist");
+    assert_eq!(ch.bot_secret, bot_secret);
+
+    // Delete from DB
+    sqlx::query("DELETE FROM telegram_channels WHERE id = $1")
+        .bind(guard.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let cached = cache
+        .get_telegram_channel(&pool, guard.id)
+        .await
+        .unwrap()
+        .expect("should be served from cache");
+    assert_eq!(cached.bot_secret, bot_secret);
+
+    // Invalidate
+    cache.invalidate("telegram", guard.id);
+
+    let after = cache.get_telegram_channel(&pool, guard.id).await.unwrap();
+    assert!(after.is_none(), "should be None after invalidation + DB delete");
+}
+
+#[tokio::test]
+async fn cache_widget_lookup_and_invalidation() {
+    let pool = setup_pool().await;
+    let widget_id = format!("cache_test_{}", Uuid::new_v4());
+    let guard = insert_test_widget_channel(&pool, &widget_id).await;
+
+    let cache = Arc::new(ChannelCache::new());
+
+    // First lookup — cache miss, loads from DB
+    let ch = cache
+        .get_widget_channel(&pool, &widget_id)
+        .await
+        .unwrap()
+        .expect("channel should exist");
+    assert_eq!(ch.id, guard.id);
+
+    // Delete from DB
+    sqlx::query("DELETE FROM widget_channels WHERE id = $1")
+        .bind(guard.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let cached = cache
+        .get_widget_channel(&pool, &widget_id)
+        .await
+        .unwrap()
+        .expect("should be served from cache");
+    assert_eq!(cached.id, guard.id);
+
+    // Invalidate
+    cache.invalidate("widget", guard.id);
+
+    let after = cache.get_widget_channel(&pool, &widget_id).await.unwrap();
+    assert!(after.is_none(), "should be None after invalidation + DB delete");
+}
+
+#[tokio::test]
+async fn cache_invalidation_via_redis_pubsub() {
+    let pool = setup_pool().await;
+    let bot_secret = "redis_inv_secret";
+    let guard = insert_test_telegram_channel(&pool, bot_secret).await;
+
+    let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".into());
+    let cache = Arc::new(ChannelCache::new());
+
+    // Populate cache
+    let ch = cache
+        .get_telegram_channel(&pool, guard.id)
+        .await
+        .unwrap()
+        .expect("channel should exist");
+    assert_eq!(ch.bot_secret, bot_secret);
+
+    // Start invalidation listener
+    webhook::cache::spawn_invalidation_listener(&redis_url, cache.clone()).await;
+
+    // Delete from DB so we can detect cache eviction
+    sqlx::query("DELETE FROM telegram_channels WHERE id = $1")
+        .bind(guard.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // Publish invalidation via Redis
+    let mut redis = setup_redis().await;
+    redis::AsyncCommands::publish::<_, _, ()>(
+        &mut redis,
+        webhook::cache::INVALIDATION_CHANNEL,
+        format!("telegram:{}", guard.id),
+    )
+    .await
+    .unwrap();
+
+    // Give the listener a moment to process
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // Cache should be evicted, DB is empty → None
+    let after = cache.get_telegram_channel(&pool, guard.id).await.unwrap();
+    assert!(
+        after.is_none(),
+        "should be None after Redis pubsub invalidation"
+    );
+}
+
+#[tokio::test]
+async fn cache_invalidation_does_not_affect_other_channels() {
+    let pool = setup_pool().await;
+    let guard_a = insert_test_telegram_channel(&pool, "secret_a").await;
+    let guard_b = insert_test_telegram_channel(&pool, "secret_b").await;
+
+    let cache = Arc::new(ChannelCache::new());
+
+    // Populate both
+    cache
+        .get_telegram_channel(&pool, guard_a.id)
+        .await
+        .unwrap()
+        .unwrap();
+    cache
+        .get_telegram_channel(&pool, guard_b.id)
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Invalidate only A
+    cache.invalidate("telegram", guard_a.id);
+
+    // B should still be cached even if we delete it from DB
+    sqlx::query("DELETE FROM telegram_channels WHERE id = $1")
+        .bind(guard_b.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let b = cache
+        .get_telegram_channel(&pool, guard_b.id)
+        .await
+        .unwrap()
+        .expect("channel B should still be cached");
+    assert_eq!(b.bot_secret, "secret_b");
+}
+
 #[tokio::test]
 async fn instagram_rejects_non_instagram_object() {
     use webhook::provider::WebhookProvider;
     use webhook::provider::instagram::InstagramProvider;
 
+    fn test_provider() -> InstagramProvider {
+        InstagramProvider::new(TEST_APP_SECRET, Arc::new(ChannelCache::new()))
+    }
+
     let pool = setup_pool().await;
-    let provider = InstagramProvider::new(TEST_APP_SECRET);
+    let provider = test_provider();
 
     let body = serde_json::json!({
         "object": "page",
