@@ -31,7 +31,7 @@ Multi-provider chat bridge for Instagram, Telegram, and WebSocket chat widgets, 
 ### Module Structure
 
 - `cache.rs` — `ChannelCache` (in-memory read-through cache for channel lookups, invalidated via Redis Pub/Sub)
-- `config.rs` — `AppConfig` (from env vars) and `AppState` (config + PgPool + Redis + ChannelCache)
+- `config.rs` — `AppConfig` (from env vars) and `AppState` (config + PgPool + Redis + ChannelCache + ws_connections counter + shutdown token). `AppState` does NOT derive `Clone` — it's always behind `Arc<AppState>`
 - `db.rs` — Pool init, migrations, channel lookup queries
 - `error.rs` — `WebhookError` enum with `IntoResponse` (database errors are logged but not leaked to clients)
 - `model.rs` — `InternalMessage`, `ProviderKind`, `EventKind`, `WsInbound`, `WsAck`, `WsError`
@@ -61,8 +61,11 @@ Multi-provider chat bridge for Instagram, Telegram, and WebSocket chat widgets, 
 
 1. Validate `widget_id` via in-memory cache (read-through to `widget_channels` table) → 404 if unknown
 2. Upgrade to WebSocket connection
-3. Message loop: receive JSON `{"action": "send"|"edit", "mid": "uuid", "text": "...", "attachments": ["uuid", ...]}` → validate `mid` as UUID → map action to `EventKind` → log → publish to Redis (`widget:{channel_id}`) → send ACK `{"status": "ok", "message_id": "uuid"}`
-4. Unknown actions, malformed messages, and invalid `mid` values get error response; connection stays alive
+3. Connection counter incremented (AtomicUsize + RAII drop guard for decrement)
+4. Message loop via `tokio::select!`: idle timeout (5 min) triggers ping/pong keepalive, shutdown cancellation sends close frame. All sends wrapped in 5s timeout for backpressure
+5. Receive JSON `{"action": "send"|"edit", "mid": "uuid", "text": "...", "attachments": ["uuid", ...]}` → validate → log → publish to Redis (`widget:{channel_id}`) → send ACK
+6. Unknown actions, malformed messages, and invalid `mid` values get error response; connection stays alive
+7. On shutdown signal: `CancellationToken` triggers close frame to all clients, main.rs drain loop waits up to 10s
 
 ### Channel Cache
 

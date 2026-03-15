@@ -44,12 +44,16 @@ Multi-provider chat bridge for **Instagram**, **Telegram**, and **WebSocket chat
                          │   │  (in-memory cache → DB)         │
                          │   ├─ Upgrade to WebSocket           │
                          │   │                                 │
-                         │   └─ Message loop:                  │
+                         │   ├─ Track connection (AtomicUsize) │
+                         │   │                                 │
+                         │   └─ Message loop (select!):        │
+                         │      ├─ 5min idle → ping/pong       │
+                         │      ├─ Shutdown → close frame      │
                          │      ├─ Parse JSON action message    │
                          │      │  (send / edit)                │
                          │      ├─ Emit InternalMessage ──▶ stdout
                          │      ├─ Publish ──▶ Redis widget:{id}
-                         │      └─ Send ACK ──▶ client         │
+                         │      └─ Send ACK ──▶ client (5s timeout)
                          │                                     │
   Instagram/Meta ──GET───▶ /webhook/instagram                  │
                          │   └─ Subscription verification      │
@@ -103,10 +107,10 @@ Each replica runs a background listener on the `channel_invalidation` topic that
 
 ```
 src/
-├── main.rs              # Entrypoint: load config, connect DB, start server, graceful shutdown
+├── main.rs              # Entrypoint: load config, connect DB, start server, graceful shutdown with WS drain
 ├── lib.rs               # Public module re-exports
 ├── cache.rs             # In-memory channel cache with Redis Pub/Sub invalidation
-├── config.rs            # AppConfig (env vars) + AppState (config + DB pool + Redis + cache)
+├── config.rs            # AppConfig (env vars) + AppState (config + DB pool + Redis + cache + connection counter + shutdown token)
 ├── db.rs                # Postgres pool, migrations, channel queries
 ├── error.rs             # WebhookError → HTTP status mapping
 ├── model.rs             # InternalMessage, ProviderKind, EventKind, WsInbound/WsAck
