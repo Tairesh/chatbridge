@@ -117,10 +117,7 @@ pub const INVALIDATION_CHANNEL: &str = "channel_invalidation";
 ///
 /// Expected message format: `"provider:channel_uuid"`
 /// e.g. `"instagram:550e8400-e29b-41d4-a716-446655440000"`
-pub async fn spawn_invalidation_listener(
-    redis_url: &str,
-    cache: std::sync::Arc<ChannelCache>,
-) {
+pub async fn spawn_invalidation_listener(redis_url: &str, cache: std::sync::Arc<ChannelCache>) {
     let client = redis::Client::open(redis_url).expect("invalid REDIS_URL for cache listener");
     let mut pubsub = client
         .get_async_pubsub()

@@ -1007,11 +1007,11 @@ async fn cache_instagram_lookup_and_invalidation() {
     cache.invalidate("instagram", guard.id);
 
     // Now cache is empty, lookup goes to DB — channel is gone
-    let after = cache
-        .get_instagram_channel(&pool, &user_id)
-        .await
-        .unwrap();
-    assert!(after.is_none(), "should be None after invalidation + DB delete");
+    let after = cache.get_instagram_channel(&pool, &user_id).await.unwrap();
+    assert!(
+        after.is_none(),
+        "should be None after invalidation + DB delete"
+    );
 }
 
 #[tokio::test]
@@ -1047,7 +1047,10 @@ async fn cache_telegram_lookup_and_invalidation() {
     cache.invalidate("telegram", guard.id);
 
     let after = cache.get_telegram_channel(&pool, guard.id).await.unwrap();
-    assert!(after.is_none(), "should be None after invalidation + DB delete");
+    assert!(
+        after.is_none(),
+        "should be None after invalidation + DB delete"
+    );
 }
 
 #[tokio::test]
@@ -1083,7 +1086,10 @@ async fn cache_widget_lookup_and_invalidation() {
     cache.invalidate("widget", guard.id);
 
     let after = cache.get_widget_channel(&pool, &widget_id).await.unwrap();
-    assert!(after.is_none(), "should be None after invalidation + DB delete");
+    assert!(
+        after.is_none(),
+        "should be None after invalidation + DB delete"
+    );
 }
 
 #[tokio::test]

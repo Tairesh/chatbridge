@@ -75,8 +75,7 @@ impl WebhookProvider for InstagramProvider {
                 let mut matched_channel_ids: Vec<Uuid> = Vec::new();
 
                 for ig_user_id in [sender_id, recipient_id].into_iter().flatten() {
-                    if let Some(ch) =
-                        self.cache.get_instagram_channel(db, ig_user_id).await?
+                    if let Some(ch) = self.cache.get_instagram_channel(db, ig_user_id).await?
                         && !matched_channel_ids.contains(&ch.id)
                     {
                         matched_channel_ids.push(ch.id);
