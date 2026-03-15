@@ -9,10 +9,11 @@ use crate::error::WebhookError;
 
 /// In-memory channel cache with read-through to Postgres.
 /// Invalidated via Redis Pub/Sub on the `channel_invalidation` topic.
+/// Only caches positive lookups — misses always hit the database.
 pub struct ChannelCache {
-    instagram: RwLock<HashMap<String, Option<InstagramChannel>>>,
-    telegram: RwLock<HashMap<Uuid, Option<TelegramChannel>>>,
-    widget: RwLock<HashMap<String, Option<WidgetChannel>>>,
+    instagram: RwLock<HashMap<String, InstagramChannel>>,
+    telegram: RwLock<HashMap<Uuid, TelegramChannel>>,
+    widget: RwLock<HashMap<String, WidgetChannel>>,
 }
 
 impl Default for ChannelCache {
@@ -36,14 +37,16 @@ impl ChannelCache {
         user_id: &str,
     ) -> Result<Option<InstagramChannel>, WebhookError> {
         if let Some(cached) = self.instagram.read().unwrap().get(user_id) {
-            return Ok(cached.clone());
+            return Ok(Some(cached.clone()));
         }
 
         let channel = db::find_instagram_channel_by_user_id(pool, user_id).await?;
-        self.instagram
-            .write()
-            .unwrap()
-            .insert(user_id.to_owned(), channel.clone());
+        if let Some(ref ch) = channel {
+            self.instagram
+                .write()
+                .unwrap()
+                .insert(user_id.to_owned(), ch.clone());
+        }
         Ok(channel)
     }
 
@@ -53,14 +56,16 @@ impl ChannelCache {
         channel_id: Uuid,
     ) -> Result<Option<TelegramChannel>, WebhookError> {
         if let Some(cached) = self.telegram.read().unwrap().get(&channel_id) {
-            return Ok(cached.clone());
+            return Ok(Some(cached.clone()));
         }
 
         let channel = db::find_telegram_channel_by_id(pool, channel_id).await?;
-        self.telegram
-            .write()
-            .unwrap()
-            .insert(channel_id, channel.clone());
+        if let Some(ref ch) = channel {
+            self.telegram
+                .write()
+                .unwrap()
+                .insert(channel_id, ch.clone());
+        }
         Ok(channel)
     }
 
@@ -70,14 +75,16 @@ impl ChannelCache {
         widget_id: &str,
     ) -> Result<Option<WidgetChannel>, WebhookError> {
         if let Some(cached) = self.widget.read().unwrap().get(widget_id) {
-            return Ok(cached.clone());
+            return Ok(Some(cached.clone()));
         }
 
         let channel = db::find_widget_channel_by_widget_id(pool, widget_id).await?;
-        self.widget
-            .write()
-            .unwrap()
-            .insert(widget_id.to_owned(), channel.clone());
+        if let Some(ref ch) = channel {
+            self.widget
+                .write()
+                .unwrap()
+                .insert(widget_id.to_owned(), ch.clone());
+        }
         Ok(channel)
     }
 
@@ -91,7 +98,7 @@ impl ChannelCache {
                 self.instagram
                     .write()
                     .unwrap()
-                    .retain(|_, v| v.as_ref().is_none_or(|ch| ch.id != channel_id));
+                    .retain(|_, v| v.id != channel_id);
             }
             "telegram" => {
                 self.telegram.write().unwrap().remove(&channel_id);
@@ -100,7 +107,7 @@ impl ChannelCache {
                 self.widget
                     .write()
                     .unwrap()
-                    .retain(|_, v| v.as_ref().is_none_or(|ch| ch.id != channel_id));
+                    .retain(|_, v| v.id != channel_id);
             }
             other => {
                 tracing::warn!(provider = other, "unknown provider in cache invalidation");
