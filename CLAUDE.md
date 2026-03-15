@@ -20,6 +20,7 @@ Required at runtime:
 - `INSTAGRAM_APP_SECRET` — HMAC-SHA256 secret for Instagram payload signature validation
 - `DATABASE_URL` — Postgres connection string (e.g. `postgres://chatbridge:chatbridge@localhost:5432/chatbridge`)
 - `REDIS_URL` — Redis connection string (e.g. `redis://localhost:6379`)
+- `WIDGET_JWT_SECRET` — HMAC-SHA256 secret for signing/verifying WebSocket widget JWTs
 
 
 ## Project Overview
@@ -29,10 +30,12 @@ Multi-provider chat bridge for Instagram, Telegram, and WebSocket chat widgets, 
 ### Module Structure
 
 - `cache.rs` — `ChannelCache` (in-memory read-through cache for channel lookups, invalidated via Redis Pub/Sub)
-- `config.rs` — `AppConfig` (from env vars) and `AppState` (config + PgPool + Redis + ChannelCache + ws_connections counter + shutdown token). `AppState` does NOT derive `Clone` — it's always behind `Arc<AppState>`
+- `jwt.rs` — HS256 JWT sign/verify for WebSocket widget client identity (`Claims { sub, iat }`)
+- `registry.rs` — `ClientRegistry` (tracks active WS connections per client UUID via `RwLock<HashMap<Uuid, HashSet<u64>>>`)
+- `config.rs` — `AppConfig` (from env vars) and `AppState` (config + PgPool + Redis + ChannelCache + ClientRegistry + shutdown token). `AppState` does NOT derive `Clone` — it's always behind `Arc<AppState>`
 - `db.rs` — Pool init, migrations, channel lookup queries
 - `error.rs` — `WebhookError` enum with `IntoResponse` (database errors are logged but not leaked to clients)
-- `model.rs` — `InternalMessage`, `ProviderKind`, `EventKind`, `WsInbound`, `WsAck`, `WsError`
+- `model.rs` — `InternalMessage` (now with optional `client_id`), `ProviderKind`, `EventKind`, `WsInbound`, `WsActionKind` (`send`/`edit`/`read`), `WsOutbound` (`Auth`/`Ack`/`Error`)
 - `provider/mod.rs` — `WebhookProvider` trait (verify + parse)
 - `provider/instagram.rs` — Constant-time HMAC-SHA256 verification, Meta webhook payload parsing
 - `provider/telegram.rs` — Secret token verification, Telegram Update parsing
@@ -59,7 +62,7 @@ Multi-provider chat bridge for Instagram, Telegram, and WebSocket chat widgets, 
 
 1. Validate `widget_id` via in-memory cache (read-through to `widget_channels` table) → 404 if unknown
 2. Upgrade to WebSocket connection
-3. Connection counter incremented (AtomicUsize + RAII drop guard for decrement)
+3. JWT issued on connect (`WsOutbound::Auth`), client registered in `ClientRegistry` (RAII drop guard for deregister)
 4. Message loop via `tokio::select!`: idle timeout (5 min) triggers ping/pong keepalive, shutdown cancellation sends close frame. All sends wrapped in 5s timeout for backpressure
 5. Receive JSON `{"action": "send"|"edit", "mid": "uuid", "text": "...", "attachments": ["uuid", ...]}` → validate → log → publish to Redis (`widget:{channel_id}`) → send ACK
 6. Unknown actions, malformed messages, and invalid `mid` values get error response; connection stays alive
@@ -79,7 +82,7 @@ A background task (`spawn_invalidation_listener`) subscribes to the `channel_inv
 
 ### Database
 
-Tables: `instagram_channels`, `telegram_channels`, `widget_channels`. Migrations in `migrations/`. Schema managed by sqlx with auto-run on startup.
+Tables: `instagram_channels`, `telegram_channels`, `widget_channels`, `clients`. Migrations in `migrations/`. Schema managed by sqlx with auto-run on startup.
 
 ### Docker
 
