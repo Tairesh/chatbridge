@@ -11,7 +11,6 @@ async fn main() {
     tracing_subscriber::fmt::init();
 
     let config = AppConfig::from_env();
-    let port = config.port;
 
     let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
     let db = db::init_pool(&database_url).await;
@@ -37,7 +36,7 @@ async fn main() {
     });
     let app = routes::build(state.clone());
 
-    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}"))
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3800")
         .await
         .unwrap();
     tracing::info!("listening on {}", listener.local_addr().unwrap());

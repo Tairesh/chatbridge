@@ -10,7 +10,7 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile
-    expose: ["3000"]
+    expose: ["3800"]
     ulimits:
       nofile:
         soft: 65535
@@ -20,7 +20,7 @@ services:
       postgres: { condition: service_healthy }
       redis: { condition: service_healthy }
     healthcheck:
-      test: ["CMD-SHELL", "curl -so /dev/null http://localhost:3000/"]
+      test: ["CMD-SHELL", "curl -so /dev/null http://localhost:3800/"]
       interval: 5s
       retries: 5
       start_period: 10s

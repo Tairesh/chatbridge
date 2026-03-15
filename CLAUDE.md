@@ -21,8 +21,6 @@ Required at runtime:
 - `DATABASE_URL` — Postgres connection string (e.g. `postgres://chatbridge:chatbridge@localhost:5432/chatbridge`)
 - `REDIS_URL` — Redis connection string (e.g. `redis://localhost:6379`)
 
-Optional:
-- `PORT` — server listen port (default: 3000)
 
 ## Project Overview
 

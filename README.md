@@ -9,7 +9,7 @@ Multi-provider chat bridge for **Instagram**, **Telegram**, and **WebSocket chat
 ```
                          ┌─────────────────────────────────────┐
                          │          Chatbridge Server           │
-                         │              :3000                  │
+                         │              :3800                  │
                          │                                     │
   Instagram/Meta ──POST──▶ /webhook/instagram                  │
                          │   │                                 │
@@ -172,7 +172,6 @@ Migrations run automatically on startup.
 | `INSTAGRAM_APP_SECRET` | yes | — | HMAC-SHA256 secret for Instagram signature validation |
 | `DATABASE_URL` | yes | — | Postgres connection string |
 | `REDIS_URL` | yes | — | Redis connection string |
-| `PORT` | no | `3000` | Server listen port |
 
 ## Testing
 

@@ -18,7 +18,6 @@ pub struct AppState {
 
 #[derive(Clone)]
 pub struct AppConfig {
-    pub port: u16,
     pub meta_verify_token: String,
     pub instagram_app_secret: String,
     pub redis_url: String,
@@ -28,10 +27,6 @@ pub struct AppConfig {
 impl AppConfig {
     pub fn from_env() -> Self {
         Self {
-            port: std::env::var("PORT")
-                .ok()
-                .and_then(|p| p.parse().ok())
-                .unwrap_or(3000),
             meta_verify_token: std::env::var("META_VERIFY_TOKEN")
                 .expect("META_VERIFY_TOKEN must be set"),
             instagram_app_secret: std::env::var("INSTAGRAM_APP_SECRET")
