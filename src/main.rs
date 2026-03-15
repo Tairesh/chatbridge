@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
-use webhook::cache::{self, ChannelCache};
-use webhook::config::{AppConfig, AppState};
-use webhook::{db, routes};
+use chatbridge::cache::{self, ChannelCache};
+use chatbridge::config::{AppConfig, AppState};
+use chatbridge::{db, routes};
 
 #[tokio::main]
 async fn main() {

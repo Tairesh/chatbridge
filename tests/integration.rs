@@ -9,8 +9,8 @@ use tokio_tungstenite::tungstenite;
 use tower::ServiceExt;
 use uuid::Uuid;
 
-use webhook::config::{AppConfig, AppState};
-use webhook::routes;
+use chatbridge::config::{AppConfig, AppState};
+use chatbridge::routes;
 
 const TEST_VERIFY_TOKEN: &str = "test_verify_token";
 const TEST_APP_SECRET: &str = "test_app_secret";
@@ -422,8 +422,8 @@ async fn telegram_ingest_unknown_channel() {
 
 // --- WebSocket widget tests ---
 
+use chatbridge::cache::ChannelCache;
 use futures_util::{SinkExt, StreamExt};
-use webhook::cache::ChannelCache;
 
 #[tokio::test]
 async fn ws_connect_and_receive_ack() {
@@ -1110,7 +1110,7 @@ async fn cache_invalidation_via_redis_pubsub() {
     assert_eq!(ch.bot_secret, bot_secret);
 
     // Start invalidation listener
-    webhook::cache::spawn_invalidation_listener(&redis_url, cache.clone()).await;
+    chatbridge::cache::spawn_invalidation_listener(&redis_url, cache.clone()).await;
 
     // Delete from DB so we can detect cache eviction
     sqlx::query("DELETE FROM telegram_channels WHERE id = $1")
@@ -1123,7 +1123,7 @@ async fn cache_invalidation_via_redis_pubsub() {
     let mut redis = setup_redis().await;
     redis::AsyncCommands::publish::<_, _, ()>(
         &mut redis,
-        webhook::cache::INVALIDATION_CHANNEL,
+        chatbridge::cache::INVALIDATION_CHANNEL,
         format!("telegram:{}", guard.id),
     )
     .await
@@ -1179,8 +1179,8 @@ async fn cache_invalidation_does_not_affect_other_channels() {
 
 #[tokio::test]
 async fn instagram_rejects_non_instagram_object() {
-    use webhook::provider::WebhookProvider;
-    use webhook::provider::instagram::InstagramProvider;
+    use chatbridge::provider::WebhookProvider;
+    use chatbridge::provider::instagram::InstagramProvider;
 
     fn test_provider() -> InstagramProvider {
         InstagramProvider::new(TEST_APP_SECRET, Arc::new(ChannelCache::new()))

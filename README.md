@@ -1,14 +1,14 @@
-# Webhook Microservice
+# Chatbridge
 
-[![CI](https://github.com/Tairesh/webhook/actions/workflows/ci.yml/badge.svg)](https://github.com/Tairesh/webhook/actions/workflows/ci.yml)
+[![CI](https://github.com/Tairesh/chatbridge/actions/workflows/ci.yml/badge.svg)](https://github.com/Tairesh/chatbridge/actions/workflows/ci.yml)
 
-Multi-provider webhook receiver for **Instagram**, **Telegram**, and **WebSocket chat widgets**, built with Rust, Axum, PostgreSQL, and Redis.
+Multi-provider chat bridge for **Instagram**, **Telegram**, and **WebSocket chat widgets**, built with Rust, Axum, PostgreSQL, and Redis.
 
 ## Event Flow
 
 ```
                          ┌─────────────────────────────────────┐
-                         │           Webhook Server            │
+                         │          Chatbridge Server           │
                          │              :3000                  │
                          │                                     │
   Instagram/Meta ──POST──▶ /webhook/instagram                  │
@@ -126,7 +126,7 @@ widget/
 
 migrations/              # SQL migrations (auto-run on startup)
 tests/integration.rs     # Integration tests (require Postgres + Redis)
-compose.yaml             # nginx + webhook + postgres + redis services
+compose.yaml             # nginx + chatbridge + postgres + redis services
 ```
 
 ## Quick Start
@@ -140,7 +140,7 @@ cp .env.example .env
 docker compose up --build
 ```
 
-Nginx listens on `http://localhost:80` and proxies to the webhook server (including WebSocket upgrade for `/ws/`), with Postgres and Redis provisioned automatically.
+Nginx listens on `http://localhost:80` and proxies to the chatbridge server (including WebSocket upgrade for `/ws/`), with Postgres and Redis provisioned automatically.
 
 ### Without Docker
 
@@ -150,7 +150,7 @@ Requires Rust 1.88+, a running PostgreSQL instance, and Redis.
 # Set environment variables
 export META_VERIFY_TOKEN=your_token
 export INSTAGRAM_APP_SECRET=your_secret
-export DATABASE_URL=postgres://webhook:webhook@localhost:5432/webhook
+export DATABASE_URL=postgres://chatbridge:chatbridge@localhost:5432/chatbridge
 export REDIS_URL=redis://localhost:6379
 
 # Build and run
@@ -185,7 +185,7 @@ Covers HMAC verification, secret token validation, event classification, payload
 Requires running Postgres and Redis (e.g. via `docker compose up -d postgres redis`):
 
 ```bash
-DATABASE_URL=postgres://webhook:webhook@localhost:5432/webhook REDIS_URL=redis://localhost:6379 cargo test
+DATABASE_URL=postgres://chatbridge:chatbridge@localhost:5432/chatbridge REDIS_URL=redis://localhost:6379 cargo test
 ```
 
 Integration tests cover:

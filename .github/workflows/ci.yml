@@ -62,13 +62,13 @@ jobs:
       postgres:
         image: postgres:16-alpine
         env:
-          POSTGRES_USER: webhook
-          POSTGRES_PASSWORD: webhook
-          POSTGRES_DB: webhook
+          POSTGRES_USER: chatbridge
+          POSTGRES_PASSWORD: chatbridge
+          POSTGRES_DB: chatbridge
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U webhook"
+          --health-cmd "pg_isready -U chatbridge"
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
@@ -82,7 +82,7 @@ jobs:
           --health-timeout 5s
           --health-retries 5
     env:
-      DATABASE_URL: postgres://webhook:webhook@localhost:5432/webhook
+      DATABASE_URL: postgres://chatbridge:chatbridge@localhost:5432/chatbridge
       REDIS_URL: redis://localhost:6379
     steps:
       - uses: actions/checkout@v6

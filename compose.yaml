@@ -4,9 +4,9 @@ services:
     ports: ["80:80"]
     volumes: ["./docker/nginx.conf:/etc/nginx/conf.d/default.conf:ro"]
     depends_on:
-      webhook: { condition: service_healthy }
+      chatbridge: { condition: service_healthy }
 
-  webhook:
+  chatbridge:
     build:
       context: .
       dockerfile: docker/Dockerfile
@@ -24,13 +24,13 @@ services:
   postgres:
     image: postgres:16-alpine
     environment:
-      POSTGRES_USER: webhook
-      POSTGRES_PASSWORD: webhook
-      POSTGRES_DB: webhook
+      POSTGRES_USER: chatbridge
+      POSTGRES_PASSWORD: chatbridge
+      POSTGRES_DB: chatbridge
     ports: ["5432:5432"]
     volumes: ["pgdata:/var/lib/postgresql/data"]
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U webhook"]
+      test: ["CMD-SHELL", "pg_isready -U chatbridge"]
       interval: 5s
       retries: 5
 

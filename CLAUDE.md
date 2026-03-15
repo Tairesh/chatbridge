@@ -9,7 +9,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **Lint:** `cargo clippy`
 - **Format:** `cargo fmt`
 - **Unit tests (no DB):** `cargo test --lib`
-- **All tests (needs Postgres + Redis):** `DATABASE_URL=postgres://webhook:webhook@localhost:5432/webhook REDIS_URL=redis://localhost:6379 cargo test`
+- **All tests (needs Postgres + Redis):** `DATABASE_URL=postgres://chatbridge:chatbridge@localhost:5432/chatbridge REDIS_URL=redis://localhost:6379 cargo test`
 - **Run single test:** `cargo test <test_name>`
 - **Docker (full stack):** `docker compose up --build`
 
@@ -18,7 +18,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Required at runtime:
 - `META_VERIFY_TOKEN` — token for Meta/Instagram webhook subscription handshake
 - `INSTAGRAM_APP_SECRET` — HMAC-SHA256 secret for Instagram payload signature validation
-- `DATABASE_URL` — Postgres connection string (e.g. `postgres://webhook:webhook@localhost:5432/webhook`)
+- `DATABASE_URL` — Postgres connection string (e.g. `postgres://chatbridge:chatbridge@localhost:5432/chatbridge`)
 - `REDIS_URL` — Redis connection string (e.g. `redis://localhost:6379`)
 
 Optional:
@@ -26,7 +26,7 @@ Optional:
 
 ## Project Overview
 
-Multi-provider webhook microservice for Instagram, Telegram, and WebSocket chat widgets, built with Axum, Tokio, sqlx, and Redis. Lib crate (`src/lib.rs`) + binary entrypoint (`src/main.rs`). Postgres stores channel configuration; Redis handles cross-replica pub/sub for message routing. Migrations run automatically on startup.
+Multi-provider chat bridge for Instagram, Telegram, and WebSocket chat widgets, built with Axum, Tokio, sqlx, and Redis. Lib crate (`src/lib.rs`) + binary entrypoint (`src/main.rs`). Postgres stores channel configuration; Redis handles cross-replica pub/sub for message routing. Migrations run automatically on startup.
 
 ### Module Structure
 
@@ -82,4 +82,4 @@ Tables: `instagram_channels`, `telegram_channels`, `widget_channels`. Migrations
 
 ### Docker
 
-`compose.yaml` runs `nginx` + `webhook` + `postgres:16-alpine` + `redis:7-alpine`. Dockerfile and nginx.conf live in `docker/`. Config via `.env` file (see `.env.example`).
+`compose.yaml` runs `nginx` + `chatbridge` + `postgres:16-alpine` + `redis:7-alpine`. Dockerfile and nginx.conf live in `docker/`. Config via `.env` file (see `.env.example`).

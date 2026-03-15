@@ -5,7 +5,7 @@ WORKDIR /app
 # Cache dependencies
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir src && echo 'fn main() {}' > src/main.rs
-RUN cargo build --release && rm -rf src target/release/deps/webhook*
+RUN cargo build --release && rm -rf src target/release/deps/chatbridge*
 
 # Build real app
 COPY src/ src/
@@ -15,6 +15,6 @@ RUN cargo build --release
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y ca-certificates curl && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /app/target/release/webhook /usr/local/bin/webhook
+COPY --from=builder /app/target/release/chatbridge /usr/local/bin/chatbridge
 
-ENTRYPOINT ["webhook"]
+ENTRYPOINT ["chatbridge"]

@@ -1,6 +1,6 @@
 set dotenv-load
 
-db := "postgres://webhook:webhook@localhost:5432/webhook"
+db := "postgres://chatbridge:chatbridge@localhost:5432/chatbridge"
 redis := "redis://localhost:6379"
 
 # List available recipes
@@ -55,7 +55,7 @@ redis-up:
 redis-down:
     docker compose down redis
 
-# Start full stack (webhook + postgres)
+# Start full stack (chatbridge + postgres)
 up:
     docker compose up --build
 
