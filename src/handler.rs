@@ -181,6 +181,7 @@ pub async fn instagram_ingest(
                         tracing::info!(
                             message_id = %msg.message_id,
                             channel_id = %msg.channel_id,
+                            client_id = ?msg.client_id,
                             event = ?msg.event,
                             raw_data = ?msg.raw,
                             "processed instagram event"
@@ -225,6 +226,7 @@ pub async fn telegram_ingest(
                         tracing::info!(
                             message_id = %msg.message_id,
                             channel_id = %msg.channel_id,
+                            client_id = ?msg.client_id,
                             event = ?msg.event,
                             raw_data = ?msg.raw,
                             "processed telegram event"

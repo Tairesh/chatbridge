@@ -9,7 +9,7 @@ bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }
 futures-util = "0.3"
 hex = "0.4"
-jsonwebtoken = "10.3"
+jsonwebtoken = { version = "10.3", features = ["rust_crypto"] }
 hmac = "0.12"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -1,3 +1,5 @@
+mod common;
+
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -10,54 +12,15 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 use chatbridge::config::{AppConfig, AppState};
+use chatbridge::model::ProviderKind;
 use chatbridge::registry::ClientRegistry;
 use chatbridge::routes;
+use common::{TestChannel, TestClient};
 use tokio_util::sync::CancellationToken;
 
 const TEST_VERIFY_TOKEN: &str = "test_verify_token";
 const TEST_APP_SECRET: &str = "test_app_secret";
 const TEST_JWT_SECRET: &str = "test-jwt-secret-at-least-32-bytes!!";
-
-// --- Drop guard for test data cleanup ---
-
-/// Run a DELETE query in a fresh runtime (safe to call from Drop).
-fn drop_delete(table: &str, id: Uuid) {
-    let db_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
-    let query = format!("DELETE FROM {} WHERE id = $1", table);
-    // Fresh pool on a fresh runtime — the original pool's connections are
-    // pinned to the test runtime's I/O driver and can't be reused here.
-    std::thread::scope(|s| {
-        s.spawn(|| {
-            tokio::runtime::Runtime::new().unwrap().block_on(async {
-                let pool = PgPool::connect(&db_url).await.unwrap();
-                let _ = sqlx::query(&query).bind(id).execute(&pool).await;
-            });
-        });
-    });
-}
-
-/// RAII guard that deletes a test row on drop, even if the test panics.
-struct TestChannel {
-    table: &'static str,
-    id: Uuid,
-}
-
-impl Drop for TestChannel {
-    fn drop(&mut self) {
-        drop_delete(self.table, self.id);
-    }
-}
-
-/// RAII guard that deletes a client row on drop.
-struct TestClient {
-    id: Uuid,
-}
-
-impl Drop for TestClient {
-    fn drop(&mut self) {
-        drop_delete("clients", self.id);
-    }
-}
 
 async fn insert_test_instagram_channel(pool: &PgPool) -> (TestChannel, String) {
     let channel_id = Uuid::new_v4();
@@ -115,16 +78,7 @@ fn sign_body(secret: &str, body: &[u8]) -> String {
 }
 
 async fn setup_pool() -> PgPool {
-    let url =
-        std::env::var("DATABASE_URL").expect("DATABASE_URL must be set for integration tests");
-    let pool = PgPool::connect(&url)
-        .await
-        .expect("failed to connect to test DB");
-    sqlx::migrate!()
-        .run(&pool)
-        .await
-        .expect("failed to run migrations");
-    pool
+    common::setup_pool().await
 }
 
 async fn setup_redis() -> redis::aio::ConnectionManager {
@@ -318,6 +272,7 @@ async fn instagram_ingest_missing_signature() {
 async fn instagram_ingest_with_channel_lookup() {
     let pool = setup_pool().await;
     let (_guard, user_id) = insert_test_instagram_channel(&pool).await;
+    let sender_id = Uuid::new_v4().simple().to_string();
 
     let app = routes::build(build_state(pool.clone()).await);
 
@@ -327,7 +282,7 @@ async fn instagram_ingest_with_channel_lookup() {
             "time": 1773347860136_i64,
             "id": &user_id,
             "messaging": [{
-                "sender": {"id": "836189122827510"},
+                "sender": {"id": &sender_id},
                 "recipient": {"id": &user_id},
                 "timestamp": 1773347859458_i64,
                 "message": {"mid": "aWdf_lookup", "text": "hello"}
@@ -354,6 +309,14 @@ async fn instagram_ingest_with_channel_lookup() {
 
     // Give the background task a moment to process
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // Clean up the client created by the background task
+    let _client_guard =
+        chatbridge::db::find_client_by_external_id(&pool, ProviderKind::Instagram, &sender_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|c| TestClient { id: c.id });
 }
 
 // --- Telegram ingest (POST) ---
@@ -363,6 +326,7 @@ async fn telegram_ingest_valid() {
     let pool = setup_pool().await;
     let bot_secret = "test_bot_secret";
     let guard = insert_test_telegram_channel(&pool, bot_secret).await;
+    let sender_id = Uuid::new_v4().as_u128() as i64;
 
     let app = routes::build(build_state(pool.clone()).await);
 
@@ -371,7 +335,7 @@ async fn telegram_ingest_valid() {
         "message": {
             "message_id": 42,
             "date": 1700000000,
-            "from": {"id": 123, "first_name": "Test"},
+            "from": {"id": sender_id, "first_name": "Test"},
             "chat": {"id": 123, "type": "private"},
             "text": "hello bot"
         }
@@ -392,7 +356,19 @@ async fn telegram_ingest_valid() {
 
     assert_eq!(resp.status(), StatusCode::OK);
 
+    // Wait for background client upsert to complete
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // Clean up the client created by the background task
+    let _client_guard = chatbridge::db::find_client_by_external_id(
+        &pool,
+        ProviderKind::Telegram,
+        &sender_id.to_string(),
+    )
+    .await
+    .ok()
+    .flatten()
+    .map(|c| TestClient { id: c.id });
 }
 
 #[tokio::test]
@@ -728,6 +704,7 @@ async fn ws_publishes_to_redis() {
 async fn instagram_publishes_to_redis() {
     let pool = setup_pool().await;
     let (guard, user_id) = insert_test_instagram_channel(&pool).await;
+    let sender_id = Uuid::new_v4().simple().to_string();
 
     // Subscribe to Redis channel before sending
     let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".into());
@@ -748,7 +725,7 @@ async fn instagram_publishes_to_redis() {
             "time": 1773347860136_i64,
             "id": &user_id,
             "messaging": [{
-                "sender": {"id": "836189122827510"},
+                "sender": {"id": &sender_id},
                 "recipient": {"id": &user_id},
                 "timestamp": 1773347859458_i64,
                 "message": {"mid": "aWdf_redis", "text": "redis ig test"}
@@ -778,6 +755,15 @@ async fn instagram_publishes_to_redis() {
     let internal: serde_json::Value = serde_json::from_str(&payload).unwrap();
     assert_eq!(internal["provider"], "Instagram");
     assert_eq!(internal["channel_id"], guard.id.to_string());
+
+    // Clean up the client created by the background task
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let _client_guard =
+        chatbridge::db::find_client_by_external_id(&pool, ProviderKind::Instagram, &sender_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|c| TestClient { id: c.id });
 }
 
 #[tokio::test]
@@ -785,6 +771,7 @@ async fn telegram_publishes_to_redis() {
     let pool = setup_pool().await;
     let bot_secret = "test_bot_secret_redis";
     let guard = insert_test_telegram_channel(&pool, bot_secret).await;
+    let sender_id = Uuid::new_v4().as_u128() as i64;
 
     // Subscribe to Redis channel before sending
     let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".into());
@@ -804,7 +791,7 @@ async fn telegram_publishes_to_redis() {
         "message": {
             "message_id": 42,
             "date": 1700000000,
-            "from": {"id": 123, "first_name": "Test"},
+            "from": {"id": sender_id, "first_name": "Test"},
             "chat": {"id": 123, "type": "private"},
             "text": "redis tg test"
         }
@@ -830,6 +817,17 @@ async fn telegram_publishes_to_redis() {
     let internal: serde_json::Value = serde_json::from_str(&payload).unwrap();
     assert_eq!(internal["provider"], "Telegram");
     assert_eq!(internal["channel_id"], guard.id.to_string());
+
+    // Clean up the client created by the background task
+    let _client_guard = chatbridge::db::find_client_by_external_id(
+        &pool,
+        ProviderKind::Telegram,
+        &sender_id.to_string(),
+    )
+    .await
+    .ok()
+    .flatten()
+    .map(|c| TestClient { id: c.id });
 }
 
 // --- WebSocket edit action tests ---

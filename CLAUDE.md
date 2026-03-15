@@ -10,7 +10,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **Format:** `cargo fmt`
 - **Unit tests (no DB):** `cargo test --lib`
 - **All tests (needs Postgres + Redis):** `DATABASE_URL=postgres://chatbridge:chatbridge@localhost:5432/chatbridge REDIS_URL=redis://localhost:6379 cargo test`
-- **Run single test:** `cargo test <test_name>`
+- **Run single test:** `cargo test <test_name>` or `cargo test --test <file_name>` for a specific test file
 - **Docker (full stack):** `docker compose up --build`
 
 ## Gotchas
@@ -18,6 +18,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - reqwest 0.13+ TLS feature is `rustls` (not `rustls-tls`)
 - DB client functions (`upsert_client`, `find_client_by_external_id`) accept `ProviderKind` enum, not `&str`
 - `reqwest::Client` is a `LazyLock` static in `provider/instagram.rs` — don't create new clients per-request
+- Integration tests use RAII drop guards (`TestChannel`, `TestClient`) in `tests/common/mod.rs` for DB cleanup — always use these instead of manual DELETE queries
 
 ## Environment Variables
 
@@ -41,7 +42,7 @@ Multi-provider chat bridge for Instagram, Telegram, and WebSocket chat widgets, 
 - `config.rs` — `AppConfig` (from env vars) and `AppState` (config + PgPool + Redis + ChannelCache + ClientRegistry + shutdown token). `AppState` does NOT derive `Clone` — it's always behind `Arc<AppState>`
 - `db.rs` — Pool init, migrations, channel lookup queries, `Client` struct, `upsert_client`, `find_client_by_external_id`. `InstagramChannel` includes `access_token`
 - `error.rs` — `WebhookError` enum with `IntoResponse` (database errors are logged but not leaked to clients)
-- `model.rs` — `InternalMessage` (now with optional `client_id`), `ProviderKind`, `EventKind`, `WsInbound`, `WsActionKind` (`send`/`edit`/`read`), `WsOutbound` (`Auth`/`Ack`/`Error`)
+- `model.rs` — `InternalMessage` (with optional `client_id`), `ProviderKind`, `EventKind`, `WsInbound`, `WsActionKind` (`send`/`edit`/`read`), `WsOutbound` (`Auth`/`Ack`/`Error`)
 - `provider/mod.rs` — `WebhookProvider` trait (verify + parse)
 - `provider/instagram.rs` — Constant-time HMAC-SHA256 verification, Meta webhook payload parsing, client resolution via Instagram Graph API (background `tokio::spawn` with 24h staleness check)
 - `provider/telegram.rs` — Secret token verification, Telegram Update parsing, `TelegramUser` struct, background client upsert from `from` field (updated on every message)

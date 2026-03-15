@@ -86,15 +86,13 @@ impl WebhookProvider for InstagramProvider {
                     continue;
                 };
 
-                let Some(channel) =
-                    self.cache.get_instagram_channel(db, recipient_id).await?
+                let Some(channel) = self.cache.get_instagram_channel(db, recipient_id).await?
                 else {
                     tracing::warn!(?recipient_id, "no channel found for instagram event");
                     continue;
                 };
 
-                let client_id =
-                    resolve_instagram_client(db, event.sender.as_ref(), &channel).await;
+                let client_id = resolve_instagram_client(db, event.sender.as_ref(), &channel).await;
 
                 let raw = serde_json::to_value(event).unwrap_or(serde_json::Value::Null);
                 let message_id = format!("instagram:{}", mid.unwrap_or(&entry.id));
@@ -180,15 +178,13 @@ async fn fetch_and_upsert_instagram_client(
     );
 
     let (name, username) = match HTTP_CLIENT.get(&url).send().await {
-        Ok(resp) if resp.status().is_success() => {
-            match resp.json::<InstagramProfile>().await {
-                Ok(profile) => (profile.name, profile.username),
-                Err(e) => {
-                    tracing::warn!(%sender_id, "failed to parse instagram profile: {e}");
-                    (None, None)
-                }
+        Ok(resp) if resp.status().is_success() => match resp.json::<InstagramProfile>().await {
+            Ok(profile) => (profile.name, profile.username),
+            Err(e) => {
+                tracing::warn!(%sender_id, "failed to parse instagram profile: {e}");
+                (None, None)
             }
-        }
+        },
         Ok(resp) => {
             tracing::warn!(%sender_id, status = %resp.status(), "instagram profile API error");
             (None, None)
