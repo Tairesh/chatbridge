@@ -115,10 +115,12 @@ src/
 ├── main.rs              # Entrypoint: load config, connect DB, start server, graceful shutdown with WS drain
 ├── lib.rs               # Public module re-exports
 ├── cache.rs             # In-memory channel cache with Redis Pub/Sub invalidation
-├── config.rs            # AppConfig (env vars) + AppState (config + DB pool + Redis + cache + connection counter + shutdown token)
+├── config.rs            # AppConfig (env vars) + AppState (config + DB pool + Redis + cache + registry + shutdown token)
 ├── db.rs                # Postgres pool, migrations, channel queries, client identity upsert
 ├── error.rs             # WebhookError → HTTP status mapping
-├── model.rs             # InternalMessage, ProviderKind, EventKind, WsInbound/WsAck
+├── jwt.rs               # HS256 JWT sign/verify for WebSocket widget client identity
+├── registry.rs          # ClientRegistry (tracks active WS connections per client UUID)
+├── model.rs             # InternalMessage, ProviderKind, EventKind, WsInbound/WsOutbound
 ├── handler.rs           # Axum request handlers + WebSocket handler
 ├── routes.rs            # Router assembly
 └── provider/
@@ -134,7 +136,10 @@ widget/
 └── index.html           # Chat widget test page (WebSocket client)
 
 migrations/              # SQL migrations (auto-run on startup)
-tests/integration.rs     # Integration tests (require Postgres + Redis)
+tests/
+├── common/mod.rs        # Shared test helpers (RAII cleanup guards, pool setup)
+├── integration.rs       # Integration tests (require Postgres + Redis)
+└── client_identity.rs   # Client identity upsert tests
 compose.yaml             # nginx + chatbridge + postgres + redis services
 ```
 
@@ -177,6 +182,7 @@ Migrations run automatically on startup.
 | `INSTAGRAM_APP_SECRET` | yes | — | HMAC-SHA256 secret for Instagram signature validation |
 | `DATABASE_URL` | yes | — | Postgres connection string |
 | `REDIS_URL` | yes | — | Redis connection string |
+| `WIDGET_JWT_SECRET` | yes | — | HMAC-SHA256 secret for WebSocket widget JWTs |
 
 ## Testing
 
@@ -206,7 +212,7 @@ Integration tests cover:
 - Client identity upsert (create, update, conflict handling)
 - Channel cache (read-through, per-channel invalidation, Redis Pub/Sub eviction, cross-channel isolation)
 
-Test data cleanup uses RAII drop guards (`TestChannel`) to ensure rows are deleted even if a test panics.
+Test data cleanup uses RAII drop guards (`TestChannel`, `TestClient`) in `tests/common/` to ensure rows are deleted even if a test panics.
 
 ### Linting
 
