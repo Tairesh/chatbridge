@@ -21,6 +21,7 @@ pub enum EventKind {
 pub struct InternalMessage {
     pub message_id: String,
     pub channel_id: Uuid,
+    pub client_id: Option<Uuid>,
     pub provider: ProviderKind,
     pub event: EventKind,
     pub timestamp: i64,
@@ -64,16 +65,12 @@ impl From<WsActionKind> for EventKind {
     }
 }
 
-#[derive(Debug, Serialize)]
-pub struct WsAck {
-    pub status: &'static str,
-    pub message_id: Uuid,
-}
-
-#[derive(Debug, Serialize)]
-pub struct WsError {
-    pub status: &'static str,
-    pub reason: String,
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum WsOutbound {
+    Auth { token: String },
+    Ack { message_id: Uuid },
+    Error { reason: String },
 }
 
 #[cfg(test)]
@@ -139,25 +136,31 @@ mod tests {
     }
 
     #[test]
-    fn ws_ack_serializes_correctly() {
-        let mid: Uuid = TEST_UUID.parse().unwrap();
-        let ack = WsAck {
-            status: "ok",
-            message_id: mid,
+    fn ws_outbound_auth_serializes_correctly() {
+        let msg = WsOutbound::Auth {
+            token: "eyJ.test.token".into(),
         };
-        let json = serde_json::to_value(&ack).unwrap();
-        assert_eq!(json["status"], "ok");
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json["action"], "auth");
+        assert_eq!(json["token"], "eyJ.test.token");
+    }
+
+    #[test]
+    fn ws_outbound_ack_serializes_correctly() {
+        let mid: Uuid = TEST_UUID.parse().unwrap();
+        let msg = WsOutbound::Ack { message_id: mid };
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json["action"], "ack");
         assert_eq!(json["message_id"], TEST_UUID);
     }
 
     #[test]
-    fn ws_error_serializes_correctly() {
-        let err = WsError {
-            status: "error",
+    fn ws_outbound_error_serializes_correctly() {
+        let msg = WsOutbound::Error {
             reason: "bad input".into(),
         };
-        let json = serde_json::to_value(&err).unwrap();
-        assert_eq!(json["status"], "error");
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json["action"], "error");
         assert_eq!(json["reason"], "bad input");
     }
 

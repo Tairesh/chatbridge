@@ -72,6 +72,7 @@ impl WebhookProvider for TelegramProvider {
         Ok(vec![InternalMessage {
             message_id: format!("telegram:{message_id}"),
             channel_id: self.channel_id,
+            client_id: None,
             provider: ProviderKind::Telegram,
             event: event_kind,
             timestamp,

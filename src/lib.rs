@@ -3,6 +3,8 @@ pub mod config;
 pub mod db;
 pub mod error;
 pub mod handler;
+pub mod jwt;
 pub mod model;
 pub mod provider;
+pub mod registry;
 pub mod routes;

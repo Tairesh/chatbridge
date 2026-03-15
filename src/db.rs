@@ -73,3 +73,18 @@ pub async fn find_widget_channel_by_widget_id(
     .fetch_optional(pool)
     .await
 }
+
+pub async fn create_client(pool: &PgPool) -> Result<Uuid, sqlx::Error> {
+    let row: (Uuid,) = sqlx::query_as("INSERT INTO clients DEFAULT VALUES RETURNING id")
+        .fetch_one(pool)
+        .await?;
+    Ok(row.0)
+}
+
+pub async fn find_client_by_id(pool: &PgPool, client_id: Uuid) -> Result<bool, sqlx::Error> {
+    let row: Option<(Uuid,)> = sqlx::query_as("SELECT id FROM clients WHERE id = $1")
+        .bind(client_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.is_some())
+}

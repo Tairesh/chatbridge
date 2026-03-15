@@ -52,13 +52,21 @@
     const sendBtn = document.getElementById('send-btn');
     const statusEl = document.getElementById('status');
 
+    const WIDGET_ID = 'test-widget';
+    const TOKEN_KEY = 'chatbridge_token';
+
     // Track sent messages: mid -> { text, element, acknowledged }
     const sentMessages = new Map();
     let ws;
     let editingMid = null;
 
     function connect() {
-      ws = new WebSocket('ws://localhost/ws/test-widget');
+      let url = `ws://localhost/ws/${WIDGET_ID}`;
+      const token = localStorage.getItem(TOKEN_KEY);
+      if (token) {
+        url += `?token=${encodeURIComponent(token)}`;
+      }
+      ws = new WebSocket(url);
 
       ws.addEventListener('open', () => {
         statusEl.textContent = 'Connected';
@@ -69,10 +77,16 @@
 
       ws.addEventListener('message', (event) => {
         const msg = JSON.parse(event.data);
-        if (msg.status === 'ok' && msg.message_id) {
-          handleAck(msg.message_id);
-        } else if (msg.status === 'error') {
-          addSystemMessage('Error: ' + msg.reason);
+        switch (msg.action) {
+          case 'auth':
+            localStorage.setItem(TOKEN_KEY, msg.token);
+            break;
+          case 'ack':
+            handleAck(msg.message_id);
+            break;
+          case 'error':
+            addSystemMessage('Error: ' + msg.reason);
+            break;
         }
       });
 

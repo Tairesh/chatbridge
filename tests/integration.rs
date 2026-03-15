@@ -10,14 +10,31 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 use chatbridge::config::{AppConfig, AppState};
+use chatbridge::registry::ClientRegistry;
 use chatbridge::routes;
-use std::sync::atomic::AtomicUsize;
 use tokio_util::sync::CancellationToken;
 
 const TEST_VERIFY_TOKEN: &str = "test_verify_token";
 const TEST_APP_SECRET: &str = "test_app_secret";
+const TEST_JWT_SECRET: &str = "test-jwt-secret-at-least-32-bytes!!";
 
 // --- Drop guard for test data cleanup ---
+
+/// Run a DELETE query in a fresh runtime (safe to call from Drop).
+fn drop_delete(table: &str, id: Uuid) {
+    let db_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+    let query = format!("DELETE FROM {} WHERE id = $1", table);
+    // Fresh pool on a fresh runtime — the original pool's connections are
+    // pinned to the test runtime's I/O driver and can't be reused here.
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            tokio::runtime::Runtime::new().unwrap().block_on(async {
+                let pool = PgPool::connect(&db_url).await.unwrap();
+                let _ = sqlx::query(&query).bind(id).execute(&pool).await;
+            });
+        });
+    });
+}
 
 /// RAII guard that deletes a test row on drop, even if the test panics.
 struct TestChannel {
@@ -27,19 +44,18 @@ struct TestChannel {
 
 impl Drop for TestChannel {
     fn drop(&mut self) {
-        let db_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
-        let query = format!("DELETE FROM {} WHERE id = $1", self.table);
-        let id = self.id;
-        // Fresh pool on a fresh runtime — the original pool's connections are
-        // pinned to the test runtime's I/O driver and can't be reused here.
-        std::thread::scope(|s| {
-            s.spawn(|| {
-                tokio::runtime::Runtime::new().unwrap().block_on(async {
-                    let pool = PgPool::connect(&db_url).await.unwrap();
-                    let _ = sqlx::query(&query).bind(id).execute(&pool).await;
-                });
-            });
-        });
+        drop_delete(self.table, self.id);
+    }
+}
+
+/// RAII guard that deletes a client row on drop.
+struct TestClient {
+    id: Uuid,
+}
+
+impl Drop for TestClient {
+    fn drop(&mut self) {
+        drop_delete("clients", self.id);
     }
 }
 
@@ -127,11 +143,12 @@ async fn build_state(db: PgPool) -> Arc<AppState> {
             meta_verify_token: TEST_VERIFY_TOKEN.into(),
             instagram_app_secret: TEST_APP_SECRET.into(),
             redis_url: "redis://localhost:6379".into(),
+            widget_jwt_secret: TEST_JWT_SECRET.into(),
         },
         db,
         redis,
         cache: Arc::new(Default::default()),
-        ws_connections: AtomicUsize::new(0),
+        registry: ClientRegistry::new(),
         shutdown: CancellationToken::new(),
     })
 }
@@ -429,6 +446,31 @@ async fn telegram_ingest_unknown_channel() {
 use chatbridge::cache::ChannelCache;
 use futures_util::{SinkExt, StreamExt};
 
+/// Connect to a WS endpoint and consume the initial auth message.
+/// Returns the websocket stream, the JWT token, and a cleanup guard for the client row.
+async fn ws_connect(
+    addr: std::net::SocketAddr,
+    widget_id: &str,
+) -> (
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    String,
+    TestClient,
+) {
+    let url = format!("ws://{addr}/ws/{widget_id}");
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+
+    // First message should be auth
+    let resp = ws.next().await.unwrap().unwrap();
+    let auth: serde_json::Value = serde_json::from_str(resp.to_text().unwrap()).unwrap();
+    assert_eq!(auth["action"], "auth");
+    let token = auth["token"].as_str().unwrap().to_string();
+    let client_id = chatbridge::jwt::verify(&token, TEST_JWT_SECRET.as_bytes())
+        .expect("auth token should be a valid JWT");
+    let client_guard = TestClient { id: client_id };
+
+    (ws, token, client_guard)
+}
+
 #[tokio::test]
 async fn ws_connect_and_receive_ack() {
     let pool = setup_pool().await;
@@ -438,8 +480,7 @@ async fn ws_connect_and_receive_ack() {
     let state = build_state(pool.clone()).await;
     let addr = spawn_app(state).await;
 
-    let url = format!("ws://{addr}/ws/{widget_id}");
-    let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    let (mut ws, _token, _client) = ws_connect(addr, &widget_id).await;
 
     // Send a valid message
     ws.send(tungstenite::Message::Text(
@@ -451,7 +492,7 @@ async fn ws_connect_and_receive_ack() {
     // Receive ACK
     let resp = ws.next().await.unwrap().unwrap();
     let ack: serde_json::Value = serde_json::from_str(resp.to_text().unwrap()).unwrap();
-    assert_eq!(ack["status"], "ok");
+    assert_eq!(ack["action"], "ack");
     assert_eq!(ack["message_id"], "550e8400-e29b-41d4-a716-446655440000");
 
     ws.close(None).await.unwrap();
@@ -466,8 +507,7 @@ async fn ws_message_with_attachments() {
     let state = build_state(pool.clone()).await;
     let addr = spawn_app(state).await;
 
-    let url = format!("ws://{addr}/ws/{widget_id}");
-    let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    let (mut ws, _token, _client) = ws_connect(addr, &widget_id).await;
 
     let attachment_id = Uuid::new_v4();
     let msg = serde_json::json!({
@@ -482,7 +522,7 @@ async fn ws_message_with_attachments() {
 
     let resp = ws.next().await.unwrap().unwrap();
     let ack: serde_json::Value = serde_json::from_str(resp.to_text().unwrap()).unwrap();
-    assert_eq!(ack["status"], "ok");
+    assert_eq!(ack["action"], "ack");
     assert_eq!(ack["message_id"], "550e8400-e29b-41d4-a716-446655440000");
 
     ws.close(None).await.unwrap();
@@ -497,8 +537,7 @@ async fn ws_invalid_json_returns_error() {
     let state = build_state(pool.clone()).await;
     let addr = spawn_app(state).await;
 
-    let url = format!("ws://{addr}/ws/{widget_id}");
-    let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    let (mut ws, _token, _client) = ws_connect(addr, &widget_id).await;
 
     // Send invalid JSON
     ws.send(tungstenite::Message::Text("not json".into()))
@@ -507,7 +546,7 @@ async fn ws_invalid_json_returns_error() {
 
     let resp = ws.next().await.unwrap().unwrap();
     let err: serde_json::Value = serde_json::from_str(resp.to_text().unwrap()).unwrap();
-    assert_eq!(err["status"], "error");
+    assert_eq!(err["action"], "error");
     assert!(err["reason"].as_str().unwrap().contains("invalid message"));
 
     ws.close(None).await.unwrap();
@@ -522,8 +561,7 @@ async fn ws_missing_text_field_returns_error() {
     let state = build_state(pool.clone()).await;
     let addr = spawn_app(state).await;
 
-    let url = format!("ws://{addr}/ws/{widget_id}");
-    let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    let (mut ws, _token, _client) = ws_connect(addr, &widget_id).await;
 
     // Valid JSON but missing required "text" field
     ws.send(tungstenite::Message::Text(r#"{"attachments": []}"#.into()))
@@ -532,7 +570,7 @@ async fn ws_missing_text_field_returns_error() {
 
     let resp = ws.next().await.unwrap().unwrap();
     let err: serde_json::Value = serde_json::from_str(resp.to_text().unwrap()).unwrap();
-    assert_eq!(err["status"], "error");
+    assert_eq!(err["action"], "error");
 
     ws.close(None).await.unwrap();
 }
@@ -546,8 +584,7 @@ async fn ws_missing_message_id_returns_error() {
     let state = build_state(pool.clone()).await;
     let addr = spawn_app(state).await;
 
-    let url = format!("ws://{addr}/ws/{widget_id}");
-    let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    let (mut ws, _token, _client) = ws_connect(addr, &widget_id).await;
 
     // Valid JSON with "text" field but without "mid" field
     ws.send(tungstenite::Message::Text(r#"{"text": "Hello"}"#.into()))
@@ -556,7 +593,7 @@ async fn ws_missing_message_id_returns_error() {
 
     let resp = ws.next().await.unwrap().unwrap();
     let err: serde_json::Value = serde_json::from_str(resp.to_text().unwrap()).unwrap();
-    assert_eq!(err["status"], "error");
+    assert_eq!(err["action"], "error");
 
     ws.close(None).await.unwrap();
 }
@@ -583,8 +620,7 @@ async fn ws_multiple_messages_get_individual_acks() {
     let state = build_state(pool.clone()).await;
     let addr = spawn_app(state).await;
 
-    let url = format!("ws://{addr}/ws/{widget_id}");
-    let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    let (mut ws, _token, _client) = ws_connect(addr, &widget_id).await;
 
     let mut seen_ids = std::collections::HashSet::new();
 
@@ -597,7 +633,7 @@ async fn ws_multiple_messages_get_individual_acks() {
 
         let resp = ws.next().await.unwrap().unwrap();
         let ack: serde_json::Value = serde_json::from_str(resp.to_text().unwrap()).unwrap();
-        assert_eq!(ack["status"], "ok");
+        assert_eq!(ack["action"], "ack");
         // Each ACK should have a unique message_id
         let mid = ack["message_id"].as_str().unwrap().to_string();
         assert!(seen_ids.insert(mid), "duplicate message_id");
@@ -617,8 +653,7 @@ async fn ws_continues_after_bad_message() {
     let state = build_state(pool.clone()).await;
     let addr = spawn_app(state).await;
 
-    let url = format!("ws://{addr}/ws/{widget_id}");
-    let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    let (mut ws, _token, _client) = ws_connect(addr, &widget_id).await;
 
     // Send bad message
     ws.send(tungstenite::Message::Text("bad".into()))
@@ -626,7 +661,7 @@ async fn ws_continues_after_bad_message() {
         .unwrap();
     let resp = ws.next().await.unwrap().unwrap();
     let err: serde_json::Value = serde_json::from_str(resp.to_text().unwrap()).unwrap();
-    assert_eq!(err["status"], "error");
+    assert_eq!(err["action"], "error");
 
     // Connection should still be alive — send valid message
     ws.send(tungstenite::Message::Text(
@@ -636,7 +671,7 @@ async fn ws_continues_after_bad_message() {
     .unwrap();
     let resp = ws.next().await.unwrap().unwrap();
     let ack: serde_json::Value = serde_json::from_str(resp.to_text().unwrap()).unwrap();
-    assert_eq!(ack["status"], "ok");
+    assert_eq!(ack["action"], "ack");
 
     ws.close(None).await.unwrap();
 }
@@ -660,8 +695,7 @@ async fn ws_publishes_to_redis() {
     let state = build_state(pool.clone()).await;
     let addr = spawn_app(state).await;
 
-    let url = format!("ws://{addr}/ws/{widget_id}");
-    let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    let (mut ws, _token, _client) = ws_connect(addr, &widget_id).await;
 
     ws.send(tungstenite::Message::Text(
         r#"{"action": "send", "text": "redis test", "mid": "550e8400-e29b-41d4-a716-446655440000"}"#.into(),
@@ -810,8 +844,7 @@ async fn ws_edit_message_returns_ack() {
     let state = build_state(pool.clone()).await;
     let addr = spawn_app(state).await;
 
-    let url = format!("ws://{addr}/ws/{widget_id}");
-    let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    let (mut ws, _token, _client) = ws_connect(addr, &widget_id).await;
 
     // Send original message
     ws.send(tungstenite::Message::Text(
@@ -821,7 +854,7 @@ async fn ws_edit_message_returns_ack() {
     .unwrap();
     let resp = ws.next().await.unwrap().unwrap();
     let ack: serde_json::Value = serde_json::from_str(resp.to_text().unwrap()).unwrap();
-    assert_eq!(ack["status"], "ok");
+    assert_eq!(ack["action"], "ack");
     assert_eq!(ack["message_id"], "660e8400-e29b-41d4-a716-446655440001");
 
     // Edit the message
@@ -833,7 +866,7 @@ async fn ws_edit_message_returns_ack() {
     .unwrap();
     let resp = ws.next().await.unwrap().unwrap();
     let ack: serde_json::Value = serde_json::from_str(resp.to_text().unwrap()).unwrap();
-    assert_eq!(ack["status"], "ok");
+    assert_eq!(ack["action"], "ack");
     assert_eq!(ack["message_id"], "660e8400-e29b-41d4-a716-446655440001");
 
     ws.close(None).await.unwrap();
@@ -858,8 +891,7 @@ async fn ws_edit_publishes_edit_event_to_redis() {
     let state = build_state(pool.clone()).await;
     let addr = spawn_app(state).await;
 
-    let url = format!("ws://{addr}/ws/{widget_id}");
-    let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    let (mut ws, _token, _client) = ws_connect(addr, &widget_id).await;
 
     // Send original message
     ws.send(tungstenite::Message::Text(
@@ -911,8 +943,7 @@ async fn ws_unknown_action_returns_error() {
     let state = build_state(pool.clone()).await;
     let addr = spawn_app(state).await;
 
-    let url = format!("ws://{addr}/ws/{widget_id}");
-    let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    let (mut ws, _token, _client) = ws_connect(addr, &widget_id).await;
 
     // Send message with unknown action
     ws.send(tungstenite::Message::Text(
@@ -924,7 +955,7 @@ async fn ws_unknown_action_returns_error() {
 
     let resp = ws.next().await.unwrap().unwrap();
     let err: serde_json::Value = serde_json::from_str(resp.to_text().unwrap()).unwrap();
-    assert_eq!(err["status"], "error");
+    assert_eq!(err["action"], "error");
     assert!(
         err["reason"]
             .as_str()
@@ -940,7 +971,7 @@ async fn ws_unknown_action_returns_error() {
     .unwrap();
     let resp = ws.next().await.unwrap().unwrap();
     let ack: serde_json::Value = serde_json::from_str(resp.to_text().unwrap()).unwrap();
-    assert_eq!(ack["status"], "ok");
+    assert_eq!(ack["action"], "ack");
 
     ws.close(None).await.unwrap();
 }
@@ -954,8 +985,7 @@ async fn ws_invalid_mid_returns_error() {
     let state = build_state(pool.clone()).await;
     let addr = spawn_app(state).await;
 
-    let url = format!("ws://{addr}/ws/{widget_id}");
-    let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    let (mut ws, _token, _client) = ws_connect(addr, &widget_id).await;
 
     // Send message with arbitrary string as mid — should be rejected
     ws.send(tungstenite::Message::Text(
@@ -966,7 +996,7 @@ async fn ws_invalid_mid_returns_error() {
 
     let resp = ws.next().await.unwrap().unwrap();
     let err: serde_json::Value = serde_json::from_str(resp.to_text().unwrap()).unwrap();
-    assert_eq!(err["status"], "error");
+    assert_eq!(err["action"], "error");
     assert!(err["reason"].as_str().unwrap().contains("invalid message"));
 
     // Connection should still be alive after rejected mid
@@ -977,7 +1007,7 @@ async fn ws_invalid_mid_returns_error() {
         .unwrap();
     let resp = ws.next().await.unwrap().unwrap();
     let ack: serde_json::Value = serde_json::from_str(resp.to_text().unwrap()).unwrap();
-    assert_eq!(ack["status"], "ok");
+    assert_eq!(ack["action"], "ack");
 
     ws.close(None).await.unwrap();
 }
@@ -1210,4 +1240,219 @@ async fn instagram_rejects_non_instagram_object() {
 
     let err = provider.parse(&body_bytes, &pool).await.unwrap_err();
     assert!(err.to_string().contains("unexpected object: page"));
+}
+
+// --- JWT client identity tests ---
+
+#[tokio::test]
+async fn ws_returns_auth_on_first_connect() {
+    let pool = setup_pool().await;
+    let widget_id = format!("test_widget_{}", Uuid::new_v4());
+    let _guard = insert_test_widget_channel(&pool, &widget_id).await;
+
+    let state = build_state(pool.clone()).await;
+    let addr = spawn_app(state).await;
+
+    let (_ws, token, _client) = ws_connect(addr, &widget_id).await;
+
+    // Token should be a valid JWT
+    let client_id = chatbridge::jwt::verify(&token, TEST_JWT_SECRET.as_bytes());
+    assert!(client_id.is_some(), "token should be a valid JWT");
+}
+
+#[tokio::test]
+async fn ws_reconnect_with_token_skips_auth() {
+    let pool = setup_pool().await;
+    let widget_id = format!("test_widget_{}", Uuid::new_v4());
+    let _guard = insert_test_widget_channel(&pool, &widget_id).await;
+
+    let state = build_state(pool.clone()).await;
+    let addr = spawn_app(state).await;
+
+    // First connect — get token
+    let (mut ws1, token, _client) = ws_connect(addr, &widget_id).await;
+    ws1.close(None).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Reconnect with token — should NOT get an auth message
+    let url = format!(
+        "ws://{addr}/ws/{widget_id}?token={}",
+        urlencoding::encode(&token)
+    );
+    let (mut ws2, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+
+    // Send a message — first response should be ack, not auth
+    ws2.send(tungstenite::Message::Text(
+        r#"{"action": "send", "mid": "550e8400-e29b-41d4-a716-446655440000", "text": "Hello"}"#
+            .into(),
+    ))
+    .await
+    .unwrap();
+
+    let resp = ws2.next().await.unwrap().unwrap();
+    let msg: serde_json::Value = serde_json::from_str(resp.to_text().unwrap()).unwrap();
+    assert_eq!(
+        msg["action"], "ack",
+        "returning client should not get auth message"
+    );
+
+    ws2.close(None).await.unwrap();
+}
+
+#[tokio::test]
+async fn ws_invalid_token_gets_new_auth() {
+    let pool = setup_pool().await;
+    let widget_id = format!("test_widget_{}", Uuid::new_v4());
+    let _guard = insert_test_widget_channel(&pool, &widget_id).await;
+
+    let state = build_state(pool.clone()).await;
+    let addr = spawn_app(state).await;
+
+    // Connect with garbage token
+    let url = format!("ws://{addr}/ws/{widget_id}?token=garbage.invalid.token");
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+
+    // Should get a fresh auth message
+    let resp = ws.next().await.unwrap().unwrap();
+    let auth: serde_json::Value = serde_json::from_str(resp.to_text().unwrap()).unwrap();
+    assert_eq!(auth["action"], "auth");
+    let token = auth["token"].as_str().unwrap();
+    assert!(token.contains('.'), "should be a JWT");
+    let _client = TestClient {
+        id: chatbridge::jwt::verify(token, TEST_JWT_SECRET.as_bytes()).unwrap(),
+    };
+
+    ws.close(None).await.unwrap();
+}
+
+#[tokio::test]
+async fn ws_redis_message_includes_client_id() {
+    let pool = setup_pool().await;
+    let widget_id = format!("test_widget_{}", Uuid::new_v4());
+    let guard = insert_test_widget_channel(&pool, &widget_id).await;
+
+    // Subscribe to Redis channel before connecting
+    let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".into());
+    let sub_client = redis::Client::open(redis_url.as_str()).unwrap();
+    let mut pubsub = sub_client.get_async_pubsub().await.unwrap();
+    pubsub
+        .subscribe(format!("widget:{}", guard.id))
+        .await
+        .unwrap();
+    let mut pubsub_stream = pubsub.on_message();
+
+    let state = build_state(pool.clone()).await;
+    let addr = spawn_app(state).await;
+
+    let (mut ws, token, _client) = ws_connect(addr, &widget_id).await;
+    let client_id = chatbridge::jwt::verify(&token, TEST_JWT_SECRET.as_bytes()).unwrap();
+
+    ws.send(tungstenite::Message::Text(
+        r#"{"action": "send", "text": "redis client test", "mid": "550e8400-e29b-41d4-a716-446655440000"}"#.into(),
+    ))
+    .await
+    .unwrap();
+
+    // Consume ACK
+    let _ = ws.next().await.unwrap().unwrap();
+
+    // Check Redis message has client_id
+    let redis_msg = tokio::time::timeout(std::time::Duration::from_secs(2), pubsub_stream.next())
+        .await
+        .expect("timed out waiting for Redis message")
+        .unwrap();
+
+    let payload: String = redis_msg.get_payload().unwrap();
+    let internal: serde_json::Value = serde_json::from_str(&payload).unwrap();
+    assert_eq!(internal["client_id"], client_id.to_string());
+
+    ws.close(None).await.unwrap();
+}
+
+#[tokio::test]
+async fn ws_multi_tab_same_token_both_work() {
+    let pool = setup_pool().await;
+    let widget_id = format!("test_widget_{}", Uuid::new_v4());
+    let _guard = insert_test_widget_channel(&pool, &widget_id).await;
+
+    let state = build_state(pool.clone()).await;
+    let addr = spawn_app(state).await;
+
+    // First tab — get token
+    let (mut ws1, token, _client) = ws_connect(addr, &widget_id).await;
+
+    // Second tab — connect with the same token
+    let url = format!(
+        "ws://{addr}/ws/{widget_id}?token={}",
+        urlencoding::encode(&token)
+    );
+    let (mut ws2, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+
+    // Both tabs should work independently
+    let mid1 = Uuid::new_v4();
+    let msg1 = serde_json::json!({"action": "send", "mid": mid1.to_string(), "text": "from tab 1"});
+    ws1.send(tungstenite::Message::Text(msg1.to_string().into()))
+        .await
+        .unwrap();
+    let resp1 = ws1.next().await.unwrap().unwrap();
+    let ack1: serde_json::Value = serde_json::from_str(resp1.to_text().unwrap()).unwrap();
+    assert_eq!(ack1["action"], "ack");
+
+    let mid2 = Uuid::new_v4();
+    let msg2 = serde_json::json!({"action": "send", "mid": mid2.to_string(), "text": "from tab 2"});
+    ws2.send(tungstenite::Message::Text(msg2.to_string().into()))
+        .await
+        .unwrap();
+    let resp2 = ws2.next().await.unwrap().unwrap();
+    let ack2: serde_json::Value = serde_json::from_str(resp2.to_text().unwrap()).unwrap();
+    assert_eq!(ack2["action"], "ack");
+
+    ws1.close(None).await.unwrap();
+    ws2.close(None).await.unwrap();
+}
+
+#[tokio::test]
+async fn ws_valid_token_deleted_client_gets_new_auth() {
+    let pool = setup_pool().await;
+    let widget_id = format!("test_widget_{}", Uuid::new_v4());
+    let _guard = insert_test_widget_channel(&pool, &widget_id).await;
+
+    let state = build_state(pool.clone()).await;
+    let addr = spawn_app(state).await;
+
+    // First connect — get token and client_id
+    // Don't use the TestClient guard — we delete this client manually below.
+    let (mut ws1, token, first_client) = ws_connect(addr, &widget_id).await;
+    let client_id = first_client.id;
+    // Defuse the guard — we'll delete it ourselves.
+    std::mem::forget(first_client);
+    ws1.close(None).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Delete the client from DB
+    sqlx::query("DELETE FROM clients WHERE id = $1")
+        .bind(client_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // Reconnect with old token — client is gone, should get new auth
+    let url = format!(
+        "ws://{addr}/ws/{widget_id}?token={}",
+        urlencoding::encode(&token)
+    );
+    let (mut ws2, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+
+    let resp = ws2.next().await.unwrap().unwrap();
+    let auth: serde_json::Value = serde_json::from_str(resp.to_text().unwrap()).unwrap();
+    assert_eq!(auth["action"], "auth");
+
+    // New token should have a different client_id
+    let new_client_id =
+        chatbridge::jwt::verify(auth["token"].as_str().unwrap(), TEST_JWT_SECRET.as_bytes())
+            .unwrap();
+    assert_ne!(new_client_id, client_id, "should be a new client");
+    let _client = TestClient { id: new_client_id };
+
+    ws2.close(None).await.unwrap();
 }

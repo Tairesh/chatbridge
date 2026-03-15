@@ -7,7 +7,6 @@ use axum::response::IntoResponse;
 use bytes::Bytes;
 use redis::AsyncCommands;
 use serde::Deserialize;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::time::timeout;
 use tracing::Instrument;
@@ -15,17 +14,22 @@ use uuid::Uuid;
 
 use crate::config::AppState;
 use crate::error::WebhookError;
-use crate::model::{InternalMessage, ProviderKind, WsAck, WsError, WsInbound};
+use crate::model::{InternalMessage, ProviderKind, WsInbound, WsOutbound};
 use crate::provider::WebhookProvider;
 use crate::provider::instagram::InstagramProvider;
 use crate::provider::telegram::{self, TelegramProvider};
 
-struct ConnectionGuard<'a>(&'a std::sync::atomic::AtomicUsize);
+struct ConnectionGuard {
+    client_id: Uuid,
+    conn_id: u64,
+    state: Arc<AppState>,
+}
 
-impl Drop for ConnectionGuard<'_> {
+impl Drop for ConnectionGuard {
     fn drop(&mut self) {
-        let prev = self.0.fetch_sub(1, Ordering::Relaxed);
-        tracing::info!(active_connections = prev - 1, "ws disconnected");
+        self.state.registry.deregister(self.client_id, self.conn_id);
+        let count = self.state.registry.connection_count();
+        tracing::info!(active_connections = count, "ws disconnected");
     }
 }
 
@@ -33,26 +37,31 @@ const SEND_TIMEOUT: Duration = Duration::from_secs(5);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const PING_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Send a WsOutbound message to the socket. Returns false if the send fails.
+async fn send_outbound(socket: &mut WebSocket, msg: &WsOutbound) -> bool {
+    let text = serde_json::to_string(msg).expect("WsOutbound serialization cannot fail");
+    matches!(
+        timeout(SEND_TIMEOUT, socket.send(Message::Text(text.into()))).await,
+        Ok(Ok(()))
+    )
+}
+
 async fn process_text_message(
     text: &str,
     channel_id: Uuid,
+    client_id: Uuid,
     socket: &mut WebSocket,
     redis: &mut redis::aio::ConnectionManager,
 ) -> bool {
     let inbound: WsInbound = match serde_json::from_str(text) {
         Ok(v) => v,
         Err(e) => {
-            let err = WsError {
-                status: "error",
+            let err = WsOutbound::Error {
                 reason: format!("invalid message: {e}"),
             };
-            let msg = Message::Text(serde_json::to_string(&err).unwrap().into());
-            match timeout(SEND_TIMEOUT, socket.send(msg)).await {
-                Ok(Ok(())) => {}
-                _ => {
-                    tracing::warn!(channel_id = %channel_id, "error send failed, disconnecting");
-                    return false;
-                }
+            if !send_outbound(socket, &err).await {
+                tracing::warn!(channel_id = %channel_id, "error send failed, disconnecting");
+                return false;
             }
             tracing::warn!(
                 channel_id = %channel_id,
@@ -68,6 +77,7 @@ async fn process_text_message(
     let internal = InternalMessage {
         message_id: format!("widget:{}", inbound.mid),
         channel_id,
+        client_id: Some(client_id),
         provider: ProviderKind::Widget,
         event: inbound.action.into(),
         timestamp: now,
@@ -77,6 +87,7 @@ async fn process_text_message(
     tracing::info!(
         message_id = %internal.message_id,
         channel_id = %channel_id,
+        client_id = %client_id,
         event = ?internal.event,
         raw_data = ?internal.raw,
         "processed widget event"
@@ -89,17 +100,12 @@ async fn process_text_message(
         tracing::error!("redis publish failed: {e}");
     }
 
-    let ack = WsAck {
-        status: "ok",
+    let ack = WsOutbound::Ack {
         message_id: inbound.mid,
     };
-    let msg = Message::Text(serde_json::to_string(&ack).unwrap().into());
-    match timeout(SEND_TIMEOUT, socket.send(msg)).await {
-        Ok(Ok(())) => {}
-        _ => {
-            tracing::warn!(channel_id = %channel_id, "ack send failed, disconnecting");
-            return false;
-        }
+    if !send_outbound(socket, &ack).await {
+        tracing::warn!(channel_id = %channel_id, "ack send failed, disconnecting");
+        return false;
     }
 
     true // keep connection alive
@@ -109,13 +115,14 @@ async fn await_pong(
     socket: &mut WebSocket,
     deadline: tokio::time::Instant,
     channel_id: Uuid,
+    client_id: Uuid,
     redis: &mut redis::aio::ConnectionManager,
 ) -> bool {
     loop {
         match tokio::time::timeout_at(deadline, socket.recv()).await {
             Ok(Some(Ok(Message::Pong(_)))) => return true,
             Ok(Some(Ok(Message::Text(text)))) => {
-                if !process_text_message(&text, channel_id, socket, redis).await {
+                if !process_text_message(&text, channel_id, client_id, socket, redis).await {
                     return false;
                 }
             }
@@ -239,9 +246,34 @@ pub async fn telegram_ingest(
     Ok(StatusCode::OK)
 }
 
+#[derive(Deserialize)]
+pub struct WsTokenParams {
+    pub token: Option<String>,
+}
+
+/// Resolve or create a client from an optional JWT token.
+/// Returns the client_id and the JWT to send to the client (only if newly created or re-issued).
+async fn resolve_client(
+    token: Option<&str>,
+    jwt_secret: &str,
+    db: &sqlx::PgPool,
+) -> Result<(Uuid, Option<String>), sqlx::Error> {
+    if let Some(client_id) = token.and_then(|t| crate::jwt::verify(t, jwt_secret.as_bytes()))
+        && crate::db::find_client_by_id(db, client_id).await?
+    {
+        return Ok((client_id, None));
+    }
+
+    // Create new client
+    let client_id = crate::db::create_client(db).await?;
+    let token = crate::jwt::sign(client_id, jwt_secret.as_bytes());
+    Ok((client_id, Some(token)))
+}
+
 pub async fn widget_ws(
     State(state): State<Arc<AppState>>,
     Path(widget_id): Path<String>,
+    Query(params): Query<WsTokenParams>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
     let channel = match state.cache.get_widget_channel(&state.db, &widget_id).await {
@@ -256,14 +288,56 @@ pub async fn widget_ws(
         }
     };
 
-    tracing::info!(widget_id = %widget_id, channel_id = %channel.id, "websocket upgrade");
-    ws.on_upgrade(move |socket| handle_widget_socket(socket, channel.id, state))
+    let (client_id, new_token) = match resolve_client(
+        params.token.as_deref(),
+        &state.config.widget_jwt_secret,
+        &state.db,
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(e) => {
+            tracing::error!("db error resolving client: {e}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    tracing::info!(
+        widget_id = %widget_id,
+        channel_id = %channel.id,
+        %client_id,
+        returning_client = new_token.is_none(),
+        "websocket upgrade"
+    );
+    ws.on_upgrade(move |socket| {
+        handle_widget_socket(socket, channel.id, client_id, new_token, state)
+    })
 }
 
-async fn handle_widget_socket(mut socket: WebSocket, channel_id: Uuid, state: Arc<AppState>) {
-    let prev = state.ws_connections.fetch_add(1, Ordering::Relaxed);
-    tracing::info!(active_connections = prev + 1, channel_id = %channel_id, "ws connected");
-    let _guard = ConnectionGuard(&state.ws_connections);
+async fn handle_widget_socket(
+    mut socket: WebSocket,
+    channel_id: Uuid,
+    client_id: Uuid,
+    new_token: Option<String>,
+    state: Arc<AppState>,
+) {
+    let conn_id = state.registry.register(client_id);
+    let count = state.registry.connection_count();
+    tracing::info!(active_connections = count, channel_id = %channel_id, %client_id, "ws connected");
+    let _guard = ConnectionGuard {
+        client_id,
+        conn_id,
+        state: state.clone(),
+    };
+
+    // Send auth message if this is a new client
+    if let Some(token) = new_token {
+        let auth = WsOutbound::Auth { token };
+        if !send_outbound(&mut socket, &auth).await {
+            tracing::warn!(%channel_id, %client_id, "auth send failed, disconnecting");
+            return;
+        }
+    }
 
     let mut redis = state.redis.clone();
 
@@ -272,17 +346,17 @@ async fn handle_widget_socket(mut socket: WebSocket, channel_id: Uuid, state: Ar
             result = timeout(IDLE_TIMEOUT, socket.recv()) => {
                 match result {
                     Ok(Some(Ok(Message::Text(text)))) => {
-                        if !process_text_message(&text, channel_id, &mut socket, &mut redis).await {
+                        if !process_text_message(&text, channel_id, client_id, &mut socket, &mut redis).await {
                             break;
                         }
                     }
                     Ok(Some(Ok(Message::Close(_)))) => {
-                        tracing::info!(channel_id = %channel_id, "client disconnected");
+                        tracing::info!(%client_id, "client disconnected");
                         break;
                     }
                     Ok(Some(Ok(Message::Pong(_)))) => continue,
                     Ok(Some(Err(e))) => {
-                        tracing::warn!(channel_id = %channel_id, "ws recv error: {e}");
+                        tracing::warn!(%channel_id, %client_id, "ws recv error: {e}");
                         break;
                     }
                     Ok(None) => break,
@@ -293,12 +367,12 @@ async fn handle_widget_socket(mut socket: WebSocket, channel_id: Uuid, state: Ar
                             .await
                             .is_err()
                         {
-                            tracing::info!(channel_id = %channel_id, "idle client unreachable, disconnecting");
+                            tracing::info!(%channel_id, %client_id, "idle client unreachable, disconnecting");
                             break;
                         }
                         let deadline = tokio::time::Instant::now() + PING_TIMEOUT;
-                        if !await_pong(&mut socket, deadline, channel_id, &mut redis).await {
-                            tracing::info!(channel_id = %channel_id, "idle timeout, disconnecting");
+                        if !await_pong(&mut socket, deadline, channel_id, client_id, &mut redis).await {
+                            tracing::info!(%channel_id, %client_id, "idle timeout, disconnecting");
                             break;
                         }
                     }

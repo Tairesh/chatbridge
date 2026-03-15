@@ -98,6 +98,7 @@ impl WebhookProvider for InstagramProvider {
                     messages.push(InternalMessage {
                         message_id,
                         channel_id,
+                        client_id: None,
                         provider: ProviderKind::Instagram,
                         event: event_kind.clone(),
                         timestamp: event.timestamp.unwrap_or(entry.time),

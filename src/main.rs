@@ -1,8 +1,8 @@
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
 
 use chatbridge::cache::{self, ChannelCache};
 use chatbridge::config::{AppConfig, AppState};
+use chatbridge::registry::ClientRegistry;
 use chatbridge::{db, routes};
 use tokio_util::sync::CancellationToken;
 
@@ -32,7 +32,7 @@ async fn main() {
         db,
         redis,
         cache,
-        ws_connections: AtomicUsize::new(0),
+        registry: ClientRegistry::new(),
         shutdown,
     });
     let app = routes::build(state.clone());
@@ -48,23 +48,15 @@ async fn main() {
 
     // Drain existing WebSocket connections
     let drain_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-    let active = state
-        .ws_connections
-        .load(std::sync::atomic::Ordering::Relaxed);
+    let active = state.registry.connection_count();
     if active > 0 {
         tracing::info!(
             active_connections = active,
             "draining WebSocket connections"
         );
-        while state
-            .ws_connections
-            .load(std::sync::atomic::Ordering::Relaxed)
-            > 0
-        {
+        while state.registry.connection_count() > 0 {
             if tokio::time::Instant::now() >= drain_deadline {
-                let remaining = state
-                    .ws_connections
-                    .load(std::sync::atomic::Ordering::Relaxed);
+                let remaining = state.registry.connection_count();
                 tracing::warn!(remaining, "drain timeout, forcing shutdown");
                 break;
             }
