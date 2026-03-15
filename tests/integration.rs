@@ -921,7 +921,12 @@ async fn ws_unknown_action_returns_error() {
     let resp = ws.next().await.unwrap().unwrap();
     let err: serde_json::Value = serde_json::from_str(resp.to_text().unwrap()).unwrap();
     assert_eq!(err["status"], "error");
-    assert!(err["reason"].as_str().unwrap().contains("unknown action"));
+    assert!(
+        err["reason"]
+            .as_str()
+            .unwrap()
+            .contains("invalid message: unknown variant `delete`")
+    );
 
     // Connection should still be alive
     ws.send(tungstenite::Message::Text(

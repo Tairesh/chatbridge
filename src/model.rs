@@ -39,11 +39,29 @@ impl std::fmt::Display for ProviderKind {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct WsInbound {
-    pub action: String,
+    pub action: WsActionKind,
     pub mid: Uuid,
     pub text: String,
     #[serde(default)]
     pub attachments: Vec<Uuid>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Eq, PartialEq, Copy, Clone)]
+#[serde(rename_all = "snake_case")]
+pub enum WsActionKind {
+    Send,
+    Edit,
+    Read,
+}
+
+impl From<WsActionKind> for EventKind {
+    fn from(action: WsActionKind) -> Self {
+        match action {
+            WsActionKind::Send => EventKind::Message,
+            WsActionKind::Edit => EventKind::Edit,
+            WsActionKind::Read => EventKind::Read,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -70,7 +88,7 @@ mod tests {
             r#"{{"action": "send", "mid": "{TEST_UUID}", "text": "Hello", "attachments": ["{TEST_UUID}"]}}"#
         );
         let msg: WsInbound = serde_json::from_str(&json).unwrap();
-        assert_eq!(msg.action, "send");
+        assert_eq!(msg.action, WsActionKind::Send);
         assert_eq!(msg.mid.to_string(), TEST_UUID);
         assert_eq!(msg.text, "Hello");
         assert_eq!(msg.attachments.len(), 1);
@@ -80,7 +98,7 @@ mod tests {
     fn ws_inbound_deserialize_send_without_attachments() {
         let json = format!(r#"{{"action": "send", "mid": "{TEST_UUID}", "text": "Hello"}}"#);
         let msg: WsInbound = serde_json::from_str(&json).unwrap();
-        assert_eq!(msg.action, "send");
+        assert_eq!(msg.action, WsActionKind::Send);
         assert_eq!(msg.text, "Hello");
         assert!(msg.attachments.is_empty());
     }
@@ -89,7 +107,7 @@ mod tests {
     fn ws_inbound_deserialize_edit() {
         let json = format!(r#"{{"action": "edit", "mid": "{TEST_UUID}", "text": "Updated"}}"#);
         let msg: WsInbound = serde_json::from_str(&json).unwrap();
-        assert_eq!(msg.action, "edit");
+        assert_eq!(msg.action, WsActionKind::Edit);
         assert_eq!(msg.mid.to_string(), TEST_UUID);
         assert_eq!(msg.text, "Updated");
     }

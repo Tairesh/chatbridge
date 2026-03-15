@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::config::AppState;
 use crate::error::WebhookError;
-use crate::model::{EventKind, InternalMessage, ProviderKind, WsAck, WsError, WsInbound};
+use crate::model::{InternalMessage, ProviderKind, WsAck, WsError, WsInbound};
 use crate::provider::WebhookProvider;
 use crate::provider::instagram::InstagramProvider;
 use crate::provider::telegram::{self, TelegramProvider};
@@ -185,28 +185,13 @@ async fn handle_widget_socket(mut socket: WebSocket, channel_id: Uuid, state: Ar
             }
         };
 
-        let event = match inbound.action.as_str() {
-            "send" => EventKind::Message,
-            "edit" => EventKind::Edit,
-            other => {
-                let err = WsError {
-                    status: "error",
-                    reason: format!("unknown action: {other}"),
-                };
-                let _ = socket
-                    .send(Message::Text(serde_json::to_string(&err).unwrap().into()))
-                    .await;
-                continue;
-            }
-        };
-
         let now = chrono::Utc::now().timestamp();
 
         let internal = InternalMessage {
             message_id: format!("widget:{}", inbound.mid),
             channel_id,
             provider: ProviderKind::Widget,
-            event,
+            event: inbound.action.into(),
             timestamp: now,
             raw: serde_json::to_value(&inbound).unwrap_or_default(),
         };
