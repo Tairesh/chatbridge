@@ -18,7 +18,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - reqwest 0.13+ TLS feature is `rustls` (not `rustls-tls`)
 - DB client functions (`upsert_client`, `find_client_by_external_id`) accept `ProviderKind` enum, not `&str`
 - `reqwest::Client` is a `LazyLock` static in `provider/instagram.rs` — don't create new clients per-request
-- Integration tests use RAII drop guards (`TestChannel`, `TestClient`) in `tests/common/mod.rs` for DB cleanup — always use these instead of manual DELETE queries
+- Integration tests use RAII drop guards (`TestChannel`, `TestClient`, `TestChat`, `TestMessage`) in `tests/common/mod.rs` for DB cleanup — always use these instead of manual DELETE queries
+- Channel insert helpers in integration tests must INSERT into `channels` table first, then the provider-specific table (FK constraint)
+- Instagram/Telegram client resolution is async — `sender_id` may not exist in `clients` yet when the message is persisted. `persist_and_publish` verifies client existence before using `sender_id` for FK-constrained inserts
 
 ## Environment Variables
 
@@ -40,9 +42,9 @@ Multi-provider chat bridge for Instagram, Telegram, and WebSocket chat widgets, 
 - `jwt.rs` — HS256 JWT sign/verify for WebSocket widget client identity (`Claims { sub, iat }`)
 - `registry.rs` — `ClientRegistry` (tracks active WS connections per client UUID via `RwLock<HashMap<Uuid, HashSet<u64>>>`)
 - `config.rs` — `AppConfig` (from env vars) and `AppState` (config + PgPool + Redis + ChannelCache + ClientCache + ClientRegistry + shutdown token). `AppState` does NOT derive `Clone` — it's always behind `Arc<AppState>`
-- `db.rs` — Pool init, migrations, channel lookup queries, `Client` struct, `upsert_client`, `find_client_by_external_id`. `InstagramChannel` includes `access_token`
+- `db.rs` — Pool init, migrations, channel lookup queries, `Client` struct, `upsert_client`, `find_client_by_external_id`, `find_or_create_chat`, `insert_message` (with dedup), `edit_message`, `mark_messages_read` (watermark). `InstagramChannel` includes `access_token`
 - `error.rs` — `WebhookError` enum with `IntoResponse` (database errors are logged but not leaked to clients)
-- `model.rs` — `IncomingMessage` (with `id`, `external_message_id`, `sender_id`, `text`), `ProviderKind`, `EventKind`, `WsInbound`, `WsActionKind` (`send`/`edit`/`read`), `WsOutbound` (`Auth`/`Ack`/`Error`)
+- `model.rs` — `NewMessage` (pre-insert), `IncomingMessage` (post-insert new message), `IncomingEdit`, `IncomingRead`, `IncomingEvent` (tagged enum for Redis: `message`/`edit`/`read`), `ProviderKind`, `EventKind`, `WsInbound`, `WsActionKind` (`send`/`edit`/`read`), `WsOutbound` (`Auth`/`Ack`/`Error`)
 - `provider/mod.rs` — `WebhookProvider` trait (verify + parse). `parse` takes `redis: ConnectionManager` for cache invalidation publishing
 - `provider/instagram.rs` — Constant-time HMAC-SHA256 verification, Meta webhook payload parsing, client resolution via Instagram Graph API (background `tokio::spawn` with 24h staleness check)
 - `provider/telegram.rs` — Secret token verification, Telegram Update parsing, `TelegramUser` struct, `resolve_telegram_client` (cache lookup → 24h staleness → background upsert, same pattern as Instagram)
@@ -63,7 +65,7 @@ Multi-provider chat bridge for Instagram, Telegram, and WebSocket chat widgets, 
 1. Extract headers + raw body
 2. `provider.verify(headers, body)` → 403 if invalid (Instagram uses constant-time HMAC via `verify_slice`)
 3. Return 200 OK immediately
-4. `tokio::spawn` (instrumented with tracing spans) → parse payload, lookup channel via in-memory cache (read-through to DB on miss), log `IncomingMessage` to stdout, publish to Redis (`instagram:{channel_id}` / `telegram:{channel_id}`)
+4. `tokio::spawn` (instrumented with tracing spans) → parse payload → `NewMessage`, branch on `EventKind`: Message → verify sender, resolve chat, insert (dedup), publish `IncomingEvent::Message`; Edit → update text, publish `IncomingEvent::Edit`; Read → watermark mark-read, publish `IncomingEvent::Read`; Reaction/Unknown → log only
 
 ### Handler Flow (WebSocket widget)
 
@@ -71,7 +73,7 @@ Multi-provider chat bridge for Instagram, Telegram, and WebSocket chat widgets, 
 2. Upgrade to WebSocket connection
 3. JWT issued on connect (`WsOutbound::Auth`), client registered in `ClientRegistry` (RAII drop guard for deregister)
 4. Message loop via `tokio::select!`: idle timeout (5 min) triggers ping/pong keepalive, shutdown cancellation sends close frame. All sends wrapped in 5s timeout for backpressure
-5. Receive JSON `{"action": "send"|"edit", "mid": "uuid", "text": "...", "attachments": ["uuid", ...]}` → validate → log → publish to Redis (`widget:{channel_id}`) → send ACK
+5. Receive JSON `{"action": "send"|"edit"|"read", "mid": "uuid", "text": "...", "attachments": ["uuid", ...]}` → validate → persist/update DB → publish `IncomingEvent` to Redis `incoming_messages` → send ACK
 6. Unknown actions, malformed messages, and invalid `mid` values get error response; connection stays alive
 7. On shutdown signal: `CancellationToken` triggers close frame to all clients, main.rs drain loop waits up to 10s
 
@@ -88,7 +90,7 @@ A background task (`spawn_invalidation_listener`) subscribes to the `cache_inval
 
 ### Database
 
-Tables: `instagram_channels`, `telegram_channels`, `widget_channels`, `clients`. Migrations in `migrations/`. Schema managed by sqlx with auto-run on startup.
+Tables: `channels`, `instagram_channels`, `telegram_channels`, `widget_channels`, `clients`, `chats`, `messages`. The `channels` table is the unified parent — provider-specific tables have FK to `channels(id)`. `chats` tracks active conversations per `(client_id, channel_id)` with partial unique index. `messages` stores all persisted incoming messages. Migrations in `migrations/`. Schema managed by sqlx with auto-run on startup.
 
 ### Docker
 

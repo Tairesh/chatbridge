@@ -26,6 +26,11 @@ const TEST_JWT_SECRET: &str = "test-jwt-secret-at-least-32-bytes!!";
 async fn insert_test_instagram_channel(pool: &PgPool) -> (TestChannel, String) {
     let channel_id = Uuid::new_v4();
     let user_id = format!("test_{channel_id}");
+    sqlx::query("INSERT INTO channels (id, provider) VALUES ($1, 'instagram')")
+        .bind(channel_id)
+        .execute(pool)
+        .await
+        .unwrap();
     sqlx::query("INSERT INTO instagram_channels (id, user_id, access_token) VALUES ($1, $2, $3)")
         .bind(channel_id)
         .bind(&user_id)
@@ -43,6 +48,11 @@ async fn insert_test_instagram_channel(pool: &PgPool) -> (TestChannel, String) {
 async fn insert_test_telegram_channel(pool: &PgPool, bot_secret: &str) -> TestChannel {
     let channel_id = Uuid::new_v4();
     let bot_token = format!("test:{channel_id}");
+    sqlx::query("INSERT INTO channels (id, provider) VALUES ($1, 'telegram')")
+        .bind(channel_id)
+        .execute(pool)
+        .await
+        .unwrap();
     sqlx::query("INSERT INTO telegram_channels (id, bot_token, bot_secret) VALUES ($1, $2, $3)")
         .bind(channel_id)
         .bind(&bot_token)
@@ -58,6 +68,11 @@ async fn insert_test_telegram_channel(pool: &PgPool, bot_secret: &str) -> TestCh
 
 async fn insert_test_widget_channel(pool: &PgPool, widget_id: &str) -> TestChannel {
     let channel_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO channels (id, provider) VALUES ($1, 'widget')")
+        .bind(channel_id)
+        .execute(pool)
+        .await
+        .unwrap();
     sqlx::query("INSERT INTO widget_channels (id, widget_id) VALUES ($1, $2)")
         .bind(channel_id)
         .bind(widget_id)
@@ -71,6 +86,32 @@ async fn insert_test_widget_channel(pool: &PgPool, widget_id: &str) -> TestChann
 }
 
 // --- Test helpers ---
+
+/// Wait for a Redis message on the `incoming_messages` channel that matches the given channel_id.
+/// Skips messages from other channels (concurrent tests).
+async fn wait_for_redis_msg(
+    stream: &mut (impl futures_util::Stream<Item = redis::Msg> + Unpin),
+    expected_channel_id: Uuid,
+) -> serde_json::Value {
+    use futures_util::StreamExt;
+    let deadline = std::time::Duration::from_secs(5);
+    let start = std::time::Instant::now();
+    loop {
+        let remaining = deadline.saturating_sub(start.elapsed());
+        if remaining.is_zero() {
+            panic!("timed out waiting for Redis message for channel {expected_channel_id}");
+        }
+        let msg = tokio::time::timeout(remaining, stream.next())
+            .await
+            .expect("timed out waiting for Redis message")
+            .unwrap();
+        let payload: String = msg.get_payload().unwrap();
+        let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        if value["channel_id"] == expected_channel_id.to_string() {
+            return value;
+        }
+    }
+}
 
 fn sign_body(secret: &str, body: &[u8]) -> String {
     let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("valid key");
@@ -663,10 +704,7 @@ async fn ws_publishes_to_redis() {
     let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".into());
     let sub_client = redis::Client::open(redis_url.as_str()).unwrap();
     let mut pubsub = sub_client.get_async_pubsub().await.unwrap();
-    pubsub
-        .subscribe(format!("widget:{}", guard.id))
-        .await
-        .unwrap();
+    pubsub.subscribe("incoming_messages").await.unwrap();
     let mut pubsub_stream = pubsub.on_message();
 
     let state = build_state(pool.clone()).await;
@@ -684,20 +722,10 @@ async fn ws_publishes_to_redis() {
     let _ = ws.next().await.unwrap().unwrap();
 
     // Check Redis received the published message
-    let redis_msg = tokio::time::timeout(std::time::Duration::from_secs(2), pubsub_stream.next())
-        .await
-        .expect("timed out waiting for Redis message")
-        .unwrap();
-
-    let payload: String = redis_msg.get_payload().unwrap();
-    let internal: serde_json::Value = serde_json::from_str(&payload).unwrap();
-    assert_eq!(internal["provider"], "Widget");
-    assert_eq!(internal["channel_id"], guard.id.to_string());
-    assert_eq!(
-        internal["raw"]["mid"],
-        "550e8400-e29b-41d4-a716-446655440000"
-    );
-    assert_eq!(internal["raw"]["text"], "redis test");
+    let internal = wait_for_redis_msg(&mut pubsub_stream, guard.id).await;
+    assert_eq!(internal["type"], "message");
+    assert_eq!(internal["text"], "redis test");
+    assert_eq!(internal["status"], "new");
 
     ws.close(None).await.unwrap();
 }
@@ -712,10 +740,7 @@ async fn instagram_publishes_to_redis() {
     let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".into());
     let sub_client = redis::Client::open(redis_url.as_str()).unwrap();
     let mut pubsub = sub_client.get_async_pubsub().await.unwrap();
-    pubsub
-        .subscribe(format!("instagram:{}", guard.id))
-        .await
-        .unwrap();
+    pubsub.subscribe("incoming_messages").await.unwrap();
     let mut pubsub_stream = pubsub.on_message();
 
     let state = build_state(pool.clone()).await;
@@ -748,15 +773,8 @@ async fn instagram_publishes_to_redis() {
         .unwrap();
     assert_eq!(resp.status(), 200);
 
-    let redis_msg = tokio::time::timeout(std::time::Duration::from_secs(2), pubsub_stream.next())
-        .await
-        .expect("timed out waiting for Redis message")
-        .unwrap();
-
-    let payload: String = redis_msg.get_payload().unwrap();
-    let internal: serde_json::Value = serde_json::from_str(&payload).unwrap();
-    assert_eq!(internal["provider"], "Instagram");
-    assert_eq!(internal["channel_id"], guard.id.to_string());
+    let internal = wait_for_redis_msg(&mut pubsub_stream, guard.id).await;
+    assert_eq!(internal["type"], "message");
 
     // Clean up the client created by the background task
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -779,10 +797,7 @@ async fn telegram_publishes_to_redis() {
     let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".into());
     let sub_client = redis::Client::open(redis_url.as_str()).unwrap();
     let mut pubsub = sub_client.get_async_pubsub().await.unwrap();
-    pubsub
-        .subscribe(format!("telegram:{}", guard.id))
-        .await
-        .unwrap();
+    pubsub.subscribe("incoming_messages").await.unwrap();
     let mut pubsub_stream = pubsub.on_message();
 
     let state = build_state(pool.clone()).await;
@@ -810,15 +825,8 @@ async fn telegram_publishes_to_redis() {
         .unwrap();
     assert_eq!(resp.status(), 200);
 
-    let redis_msg = tokio::time::timeout(std::time::Duration::from_secs(2), pubsub_stream.next())
-        .await
-        .expect("timed out waiting for Redis message")
-        .unwrap();
-
-    let payload: String = redis_msg.get_payload().unwrap();
-    let internal: serde_json::Value = serde_json::from_str(&payload).unwrap();
-    assert_eq!(internal["provider"], "Telegram");
-    assert_eq!(internal["channel_id"], guard.id.to_string());
+    let internal = wait_for_redis_msg(&mut pubsub_stream, guard.id).await;
+    assert_eq!(internal["type"], "message");
 
     // Clean up the client created by the background task
     let _client_guard = chatbridge::db::find_client_by_external_id(
@@ -881,10 +889,7 @@ async fn ws_edit_publishes_edit_event_to_redis() {
     let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".into());
     let sub_client = redis::Client::open(redis_url.as_str()).unwrap();
     let mut pubsub = sub_client.get_async_pubsub().await.unwrap();
-    pubsub
-        .subscribe(format!("widget:{}", guard.id))
-        .await
-        .unwrap();
+    pubsub.subscribe("incoming_messages").await.unwrap();
     let mut pubsub_stream = pubsub.on_message();
 
     let state = build_state(pool.clone()).await;
@@ -901,9 +906,7 @@ async fn ws_edit_publishes_edit_event_to_redis() {
     let _ = ws.next().await.unwrap().unwrap();
 
     // Consume the send event from Redis
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), pubsub_stream.next())
-        .await
-        .expect("timed out waiting for send Redis message");
+    let _ = wait_for_redis_msg(&mut pubsub_stream, guard.id).await;
 
     // Edit the message
     ws.send(tungstenite::Message::Text(
@@ -915,20 +918,9 @@ async fn ws_edit_publishes_edit_event_to_redis() {
     let _ = ws.next().await.unwrap().unwrap();
 
     // Check Redis received the edit event
-    let redis_msg = tokio::time::timeout(std::time::Duration::from_secs(2), pubsub_stream.next())
-        .await
-        .expect("timed out waiting for edit Redis message")
-        .unwrap();
-
-    let payload: String = redis_msg.get_payload().unwrap();
-    let internal: serde_json::Value = serde_json::from_str(&payload).unwrap();
-    assert_eq!(internal["event"], "Edit");
-    assert_eq!(
-        internal["raw"]["mid"],
-        "770e8400-e29b-41d4-a716-446655440002"
-    );
-    assert_eq!(internal["raw"]["text"], "Hello");
-    assert_eq!(internal["raw"]["action"], "edit");
+    let internal = wait_for_redis_msg(&mut pubsub_stream, guard.id).await;
+    assert_eq!(internal["type"], "edit");
+    assert_eq!(internal["text"], "Hello");
 
     ws.close(None).await.unwrap();
 }
@@ -1344,10 +1336,7 @@ async fn ws_redis_message_includes_client_id() {
     let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".into());
     let sub_client = redis::Client::open(redis_url.as_str()).unwrap();
     let mut pubsub = sub_client.get_async_pubsub().await.unwrap();
-    pubsub
-        .subscribe(format!("widget:{}", guard.id))
-        .await
-        .unwrap();
+    pubsub.subscribe("incoming_messages").await.unwrap();
     let mut pubsub_stream = pubsub.on_message();
 
     let state = build_state(pool.clone()).await;
@@ -1366,13 +1355,7 @@ async fn ws_redis_message_includes_client_id() {
     let _ = ws.next().await.unwrap().unwrap();
 
     // Check Redis message has client_id
-    let redis_msg = tokio::time::timeout(std::time::Duration::from_secs(2), pubsub_stream.next())
-        .await
-        .expect("timed out waiting for Redis message")
-        .unwrap();
-
-    let payload: String = redis_msg.get_payload().unwrap();
-    let internal: serde_json::Value = serde_json::from_str(&payload).unwrap();
+    let internal = wait_for_redis_msg(&mut pubsub_stream, guard.id).await;
     assert_eq!(internal["sender_id"], client_id.to_string());
 
     ws.close(None).await.unwrap();
@@ -1646,4 +1629,271 @@ async fn client_cache_invalidated_via_redis_pubsub() {
         Some("New Name"),
         "cache should return fresh DB data after invalidation"
     );
+}
+
+// --- Chat and message persistence tests ---
+
+#[tokio::test]
+async fn find_or_create_chat_creates_new() {
+    let pool = setup_pool().await;
+    let channel = insert_test_widget_channel(&pool, &format!("chat_test_{}", Uuid::new_v4())).await;
+    let client_id = chatbridge::db::create_client(&pool).await.unwrap();
+    let _client_guard = TestClient { id: client_id };
+
+    let chat_id = chatbridge::db::find_or_create_chat(&pool, client_id, channel.id)
+        .await
+        .unwrap();
+
+    let _chat_guard = common::TestChat { id: chat_id };
+
+    // Calling again returns the same chat
+    let chat_id2 = chatbridge::db::find_or_create_chat(&pool, client_id, channel.id)
+        .await
+        .unwrap();
+    assert_eq!(chat_id, chat_id2);
+}
+
+#[tokio::test]
+async fn insert_message_returns_incoming_with_id() {
+    use chatbridge::model::{EventKind, NewMessage, ProviderKind};
+
+    let pool = setup_pool().await;
+    let channel = insert_test_widget_channel(&pool, &format!("msg_test_{}", Uuid::new_v4())).await;
+    let client_id = chatbridge::db::create_client(&pool).await.unwrap();
+    let _client_guard = TestClient { id: client_id };
+
+    let chat_id = chatbridge::db::find_or_create_chat(&pool, client_id, channel.id)
+        .await
+        .unwrap();
+    let _chat_guard = common::TestChat { id: chat_id };
+
+    let new_msg = NewMessage {
+        external_message_id: "widget:test-mid".into(),
+        channel_id: channel.id,
+        sender_id: Some(client_id),
+        provider: ProviderKind::Widget,
+        event: EventKind::Message,
+        text: Some("hello".into()),
+        raw: serde_json::json!({"action": "send", "text": "hello"}),
+    };
+
+    let incoming = chatbridge::db::insert_message(&pool, &new_msg, Some(chat_id))
+        .await
+        .unwrap()
+        .expect("should not be a duplicate");
+
+    let _msg_guard = common::TestMessage { id: incoming.id };
+
+    assert_eq!(incoming.external_message_id, "widget:test-mid");
+    assert_eq!(incoming.channel_id, channel.id);
+    assert_eq!(incoming.chat_id, Some(chat_id));
+    assert_eq!(incoming.sender_id, Some(client_id));
+    assert_eq!(incoming.text.as_deref(), Some("hello"));
+    assert_eq!(incoming.status, "new");
+}
+
+#[tokio::test]
+async fn insert_message_without_sender_has_no_chat() {
+    use chatbridge::model::{EventKind, NewMessage, ProviderKind};
+
+    let pool = setup_pool().await;
+    let channel = insert_test_widget_channel(&pool, &format!("nosender_{}", Uuid::new_v4())).await;
+
+    let new_msg = NewMessage {
+        external_message_id: "instagram:mid_orphan".into(),
+        channel_id: channel.id,
+        sender_id: None,
+        provider: ProviderKind::Instagram,
+        event: EventKind::Message,
+        text: Some("orphan msg".into()),
+        raw: serde_json::json!({}),
+    };
+
+    let incoming = chatbridge::db::insert_message(&pool, &new_msg, None)
+        .await
+        .unwrap()
+        .expect("should not be a duplicate");
+
+    let _msg_guard = common::TestMessage { id: incoming.id };
+
+    assert!(incoming.chat_id.is_none());
+    assert!(incoming.sender_id.is_none());
+}
+
+#[tokio::test]
+async fn ws_message_creates_chat_and_sets_chat_id() {
+    let pool = setup_pool().await;
+    let widget_id = format!("test_widget_{}", Uuid::new_v4());
+    let guard = insert_test_widget_channel(&pool, &widget_id).await;
+
+    // Subscribe to Redis before sending
+    let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".into());
+    let sub_client = redis::Client::open(redis_url.as_str()).unwrap();
+    let mut pubsub = sub_client.get_async_pubsub().await.unwrap();
+    pubsub.subscribe("incoming_messages").await.unwrap();
+    let mut pubsub_stream = pubsub.on_message();
+
+    let state = build_state(pool.clone()).await;
+    let addr = spawn_app(state).await;
+
+    let (mut ws, token, _client) = ws_connect(addr, &widget_id).await;
+    let client_id = chatbridge::jwt::verify(&token, TEST_JWT_SECRET.as_bytes()).unwrap();
+
+    ws.send(tungstenite::Message::Text(
+        r#"{"action": "send", "text": "chat test", "mid": "550e8400-e29b-41d4-a716-446655440000"}"#
+            .into(),
+    ))
+    .await
+    .unwrap();
+
+    // Consume ACK
+    let _ = ws.next().await.unwrap().unwrap();
+
+    // Check Redis message has non-null chat_id and correct sender_id
+    let internal = wait_for_redis_msg(&mut pubsub_stream, guard.id).await;
+    assert_eq!(internal["type"], "message");
+    assert_eq!(
+        internal["sender_id"],
+        client_id.to_string(),
+        "sender_id should be set for widget messages"
+    );
+    assert!(
+        !internal["chat_id"].is_null(),
+        "chat_id should not be null for widget messages, got: {internal}"
+    );
+
+    ws.close(None).await.unwrap();
+}
+
+#[tokio::test]
+async fn edit_message_updates_text_and_edited_at() {
+    use chatbridge::model::{EventKind, NewMessage, ProviderKind};
+
+    let pool = setup_pool().await;
+    let channel = insert_test_widget_channel(&pool, &format!("edit_test_{}", Uuid::new_v4())).await;
+
+    let new_msg = NewMessage {
+        external_message_id: "widget:edit-target".into(),
+        channel_id: channel.id,
+        sender_id: None,
+        provider: ProviderKind::Widget,
+        event: EventKind::Message,
+        text: Some("original".into()),
+        raw: serde_json::json!({}),
+    };
+    let incoming = chatbridge::db::insert_message(&pool, &new_msg, None)
+        .await
+        .unwrap()
+        .unwrap();
+    let _msg_guard = common::TestMessage { id: incoming.id };
+
+    let edit =
+        chatbridge::db::edit_message(&pool, channel.id, "widget:edit-target", Some("updated"))
+            .await
+            .unwrap()
+            .expect("message should exist");
+
+    assert_eq!(edit.id, incoming.id);
+    assert_eq!(edit.text.as_deref(), Some("updated"));
+    assert!(edit.edited_at >= incoming.created_at);
+}
+
+#[tokio::test]
+async fn edit_message_unknown_returns_none() {
+    let pool = setup_pool().await;
+    let channel = insert_test_widget_channel(&pool, &format!("edit_miss_{}", Uuid::new_v4())).await;
+
+    let result =
+        chatbridge::db::edit_message(&pool, channel.id, "widget:nonexistent", Some("text"))
+            .await
+            .unwrap();
+    assert!(result.is_none());
+}
+
+#[tokio::test]
+async fn mark_messages_read_watermark() {
+    use chatbridge::model::{EventKind, NewMessage, ProviderKind};
+
+    let pool = setup_pool().await;
+    let channel = insert_test_widget_channel(&pool, &format!("read_test_{}", Uuid::new_v4())).await;
+    let client_id = chatbridge::db::create_client(&pool).await.unwrap();
+    let _client_guard = TestClient { id: client_id };
+    let chat_id = chatbridge::db::find_or_create_chat(&pool, client_id, channel.id)
+        .await
+        .unwrap();
+    let _chat_guard = common::TestChat { id: chat_id };
+
+    let mut msg_guards = Vec::new();
+    for i in 1..=3 {
+        let new_msg = NewMessage {
+            external_message_id: format!("widget:read-{i}"),
+            channel_id: channel.id,
+            sender_id: Some(client_id),
+            provider: ProviderKind::Widget,
+            event: EventKind::Message,
+            text: Some(format!("msg {i}")),
+            raw: serde_json::json!({}),
+        };
+        let incoming = chatbridge::db::insert_message(&pool, &new_msg, Some(chat_id))
+            .await
+            .unwrap()
+            .unwrap();
+        msg_guards.push(common::TestMessage { id: incoming.id });
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    // Mark read up to message 2 (watermark) — should mark messages 1 and 2
+    let reads = chatbridge::db::mark_messages_read(&pool, channel.id, "widget:read-2")
+        .await
+        .unwrap();
+    assert_eq!(reads.len(), 2, "should mark messages 1 and 2 as read");
+
+    // Message 3 should still be 'new'
+    let reads_again = chatbridge::db::mark_messages_read(&pool, channel.id, "widget:read-3")
+        .await
+        .unwrap();
+    assert_eq!(reads_again.len(), 1, "only message 3 should be newly read");
+}
+
+#[tokio::test]
+async fn mark_messages_read_unknown_returns_empty() {
+    let pool = setup_pool().await;
+    let channel = insert_test_widget_channel(&pool, &format!("read_miss_{}", Uuid::new_v4())).await;
+
+    let reads = chatbridge::db::mark_messages_read(&pool, channel.id, "widget:nonexistent")
+        .await
+        .unwrap();
+    assert!(reads.is_empty());
+}
+
+#[tokio::test]
+async fn insert_message_dedup_returns_none() {
+    use chatbridge::model::{EventKind, NewMessage, ProviderKind};
+
+    let pool = setup_pool().await;
+    let channel =
+        insert_test_widget_channel(&pool, &format!("dedup_test_{}", Uuid::new_v4())).await;
+
+    let new_msg = NewMessage {
+        external_message_id: "widget:dedup-mid".into(),
+        channel_id: channel.id,
+        sender_id: None,
+        provider: ProviderKind::Widget,
+        event: EventKind::Message,
+        text: Some("first".into()),
+        raw: serde_json::json!({}),
+    };
+
+    let first = chatbridge::db::insert_message(&pool, &new_msg, None)
+        .await
+        .unwrap();
+    assert!(first.is_some());
+    let _msg_guard = common::TestMessage {
+        id: first.unwrap().id,
+    };
+
+    let second = chatbridge::db::insert_message(&pool, &new_msg, None)
+        .await
+        .unwrap();
+    assert!(second.is_none(), "duplicate should return None");
 }

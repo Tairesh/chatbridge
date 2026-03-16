@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use crate::config::AppState;
 use crate::error::WebhookError;
-use crate::model::{EventKind, IncomingMessage, ProviderKind, WsInbound, WsOutbound};
+use crate::model::{EventKind, IncomingEvent, NewMessage, ProviderKind, WsInbound, WsOutbound};
 use crate::provider::WebhookProvider;
 use crate::provider::instagram::InstagramProvider;
 use crate::provider::telegram::{self, TelegramProvider};
@@ -36,6 +36,120 @@ impl Drop for ConnectionGuard {
 const SEND_TIMEOUT: Duration = Duration::from_secs(5);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const PING_TIMEOUT: Duration = Duration::from_secs(10);
+const REDIS_CHANNEL: &str = "incoming_messages";
+
+async fn publish_event(redis: &mut redis::aio::ConnectionManager, event: &IncomingEvent) {
+    let payload = serde_json::to_string(event).expect("IncomingEvent serialization cannot fail");
+    if let Err(e) = redis.publish::<_, _, ()>(REDIS_CHANNEL, &payload).await {
+        tracing::error!("redis publish failed: {e}");
+    }
+}
+
+async fn persist_and_publish(
+    db: &sqlx::PgPool,
+    redis: &mut redis::aio::ConnectionManager,
+    msg: &NewMessage,
+) {
+    match msg.event {
+        EventKind::Message => {
+            // Verify the client exists before using sender_id for FK-constrained inserts.
+            // Instagram/Telegram resolve client_id optimistically before the async upsert completes.
+            let verified_sender = match msg.sender_id {
+                Some(id) if crate::db::find_client_by_id(db, id).await.unwrap_or(false) => Some(id),
+                _ => None,
+            };
+
+            let chat_id = match verified_sender {
+                Some(sender_id) => {
+                    match crate::db::find_or_create_chat(db, sender_id, msg.channel_id).await {
+                        Ok(id) => Some(id),
+                        Err(e) => {
+                            tracing::error!("find_or_create_chat failed: {e}");
+                            None
+                        }
+                    }
+                }
+                None => None,
+            };
+
+            let insert_msg = if verified_sender != msg.sender_id {
+                &NewMessage {
+                    sender_id: verified_sender,
+                    ..msg.clone()
+                }
+            } else {
+                msg
+            };
+
+            match crate::db::insert_message(db, insert_msg, chat_id).await {
+                Ok(Some(incoming)) => {
+                    tracing::info!(message = ?incoming, "processed incoming message");
+                    publish_event(redis, &IncomingEvent::Message(incoming)).await;
+                }
+                Ok(None) => {
+                    tracing::debug!(
+                        external_message_id = %msg.external_message_id,
+                        "duplicate message, skipping"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!("insert_message failed: {e}");
+                }
+            }
+        }
+        EventKind::Edit => {
+            match crate::db::edit_message(
+                db,
+                msg.channel_id,
+                &msg.external_message_id,
+                msg.text.as_deref(),
+            )
+            .await
+            {
+                Ok(Some(edit)) => {
+                    tracing::info!(edit = ?edit, "processed edit");
+                    publish_event(redis, &IncomingEvent::Edit(edit)).await;
+                }
+                Ok(None) => {
+                    tracing::warn!(
+                        external_message_id = %msg.external_message_id,
+                        "edit for unknown message, dropping"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!("edit_message failed: {e}");
+                }
+            }
+        }
+        EventKind::Read => {
+            match crate::db::mark_messages_read(db, msg.channel_id, &msg.external_message_id).await
+            {
+                Ok(reads) if reads.is_empty() => {
+                    tracing::warn!(
+                        external_message_id = %msg.external_message_id,
+                        "read receipt for unknown or already-read message"
+                    );
+                }
+                Ok(reads) => {
+                    tracing::info!(count = reads.len(), "processed read receipt");
+                    for read in &reads {
+                        publish_event(redis, &IncomingEvent::Read(read.clone())).await;
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("mark_messages_read failed: {e}");
+                }
+            }
+        }
+        EventKind::Reaction | EventKind::Unknown => {
+            tracing::info!(
+                event = %msg.event,
+                external_message_id = %msg.external_message_id,
+                "event logged (not persisted)"
+            );
+        }
+    }
+}
 
 /// Send a WsOutbound message to the socket. Returns false if the send fails.
 async fn send_outbound(socket: &mut WebSocket, msg: &WsOutbound) -> bool {
@@ -51,6 +165,7 @@ async fn process_text_message(
     channel_id: Uuid,
     client_id: Uuid,
     socket: &mut WebSocket,
+    db: &sqlx::PgPool,
     redis: &mut redis::aio::ConnectionManager,
 ) -> bool {
     let inbound: WsInbound = match serde_json::from_str(text) {
@@ -72,33 +187,23 @@ async fn process_text_message(
         }
     };
 
-    let now = chrono::Utc::now().timestamp();
     let event_kind: EventKind = inbound.action.into();
     let text = match event_kind {
         EventKind::Message | EventKind::Edit => Some(inbound.text.clone()),
         _ => None,
     };
 
-    let msg = IncomingMessage {
-        id: Uuid::new_v4(),
+    let msg = NewMessage {
         external_message_id: format!("widget:{}", inbound.mid),
         channel_id,
         sender_id: Some(client_id),
         provider: ProviderKind::Widget,
         event: event_kind,
         text,
-        timestamp: now,
         raw: serde_json::to_value(&inbound).unwrap_or_default(),
     };
 
-    tracing::info!(message = ?msg, "processed incoming message");
-
-    let redis_channel = format!("widget:{channel_id}");
-    let payload =
-        serde_json::to_string(&msg).expect("IncomingMessage serialization cannot fail");
-    if let Err(e) = redis.publish::<_, _, ()>(&redis_channel, &payload).await {
-        tracing::error!("redis publish failed: {e}");
-    }
+    persist_and_publish(db, redis, &msg).await;
 
     let ack = WsOutbound::Ack {
         message_id: inbound.mid,
@@ -116,13 +221,14 @@ async fn await_pong(
     deadline: tokio::time::Instant,
     channel_id: Uuid,
     client_id: Uuid,
+    db: &sqlx::PgPool,
     redis: &mut redis::aio::ConnectionManager,
 ) -> bool {
     loop {
         match tokio::time::timeout_at(deadline, socket.recv()).await {
             Ok(Some(Ok(Message::Pong(_)))) => return true,
             Ok(Some(Ok(Message::Text(text)))) => {
-                if !process_text_message(&text, channel_id, client_id, socket, redis).await {
+                if !process_text_message(&text, channel_id, client_id, socket, db, redis).await {
                     return false;
                 }
             }
@@ -182,13 +288,7 @@ pub async fn instagram_ingest(
             match provider.parse(&body, &db, redis.clone()).await {
                 Ok(messages) => {
                     for msg in &messages {
-                        tracing::info!(message = ?msg, "processed incoming message");
-                        let payload = serde_json::to_string(msg)
-                            .expect("IncomingMessage serialization cannot fail");
-                        let channel = format!("instagram:{}", msg.channel_id);
-                        if let Err(e) = redis.publish::<_, _, ()>(&channel, &payload).await {
-                            tracing::error!("redis publish failed: {e}");
-                        }
+                        persist_and_publish(&db, &mut redis, msg).await;
                     }
                 }
                 Err(e) => tracing::error!("instagram parse failed: {e}"),
@@ -225,13 +325,7 @@ pub async fn telegram_ingest(
             match provider.parse(&body, &db, redis.clone()).await {
                 Ok(messages) => {
                     for msg in &messages {
-                        tracing::info!(message = ?msg, "processed incoming message");
-                        let payload = serde_json::to_string(msg)
-                            .expect("IncomingMessage serialization cannot fail");
-                        let channel = format!("telegram:{}", msg.channel_id);
-                        if let Err(e) = redis.publish::<_, _, ()>(&channel, &payload).await {
-                            tracing::error!("redis publish failed: {e}");
-                        }
+                        persist_and_publish(&db, &mut redis, msg).await;
                     }
                 }
                 Err(e) => tracing::error!("telegram parse failed: {e}"),
@@ -343,7 +437,7 @@ async fn handle_widget_socket(
             result = timeout(IDLE_TIMEOUT, socket.recv()) => {
                 match result {
                     Ok(Some(Ok(Message::Text(text)))) => {
-                        if !process_text_message(&text, channel_id, client_id, &mut socket, &mut redis).await {
+                        if !process_text_message(&text, channel_id, client_id, &mut socket, &state.db, &mut redis).await {
                             break;
                         }
                     }
@@ -368,7 +462,7 @@ async fn handle_widget_socket(
                             break;
                         }
                         let deadline = tokio::time::Instant::now() + PING_TIMEOUT;
-                        if !await_pong(&mut socket, deadline, channel_id, client_id, &mut redis).await {
+                        if !await_pong(&mut socket, deadline, channel_id, client_id, &state.db, &mut redis).await {
                             tracing::info!(%channel_id, %client_id, "idle timeout, disconnecting");
                             break;
                         }

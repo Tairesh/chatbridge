@@ -17,16 +17,50 @@ pub enum EventKind {
     Unknown,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct IncomingMessage {
     pub id: Uuid,
+    pub external_message_id: String,
+    pub channel_id: Uuid,
+    pub chat_id: Option<Uuid>,
+    pub sender_id: Option<Uuid>,
+    pub text: Option<String>,
+    pub status: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct IncomingEdit {
+    pub id: Uuid,
+    pub external_message_id: String,
+    pub channel_id: Uuid,
+    pub text: Option<String>,
+    pub edited_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct IncomingRead {
+    pub id: Uuid,
+    pub external_message_id: String,
+    pub channel_id: Uuid,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum IncomingEvent {
+    Message(IncomingMessage),
+    Edit(IncomingEdit),
+    Read(IncomingRead),
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NewMessage {
     pub external_message_id: String,
     pub channel_id: Uuid,
     pub sender_id: Option<Uuid>,
     pub provider: ProviderKind,
     pub event: EventKind,
     pub text: Option<String>,
-    pub timestamp: i64,
     pub raw: serde_json::Value,
 }
 
@@ -36,6 +70,18 @@ impl std::fmt::Display for ProviderKind {
             ProviderKind::Instagram => write!(f, "instagram"),
             ProviderKind::Telegram => write!(f, "telegram"),
             ProviderKind::Widget => write!(f, "widget"),
+        }
+    }
+}
+
+impl std::fmt::Display for EventKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EventKind::Message => write!(f, "message"),
+            EventKind::Edit => write!(f, "edit"),
+            EventKind::Read => write!(f, "read"),
+            EventKind::Reaction => write!(f, "reaction"),
+            EventKind::Unknown => write!(f, "unknown"),
         }
     }
 }

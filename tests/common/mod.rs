@@ -7,8 +7,18 @@ use uuid::Uuid;
 
 /// Run a DELETE query in a fresh runtime (safe to call from Drop).
 fn drop_delete(table: &str, id: Uuid) {
+    drop_delete_by_column(table, "id", id);
+}
+
+/// Run a DELETE query matching a specific column value.
+fn drop_delete_by_column(table: &str, column: &str, id: Uuid) {
+    drop_query(&format!("DELETE FROM {} WHERE {} = $1", table, column), id);
+}
+
+/// Run an arbitrary query with a single UUID bind parameter.
+fn drop_query(query: &str, id: Uuid) {
     let db_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
-    let query = format!("DELETE FROM {} WHERE id = $1", table);
+    let query = query.to_owned();
     // Fresh pool on a fresh runtime — the original pool's connections are
     // pinned to the test runtime's I/O driver and can't be reused here.
     std::thread::scope(|s| {
@@ -29,7 +39,34 @@ pub struct TestChannel {
 
 impl Drop for TestChannel {
     fn drop(&mut self) {
-        drop_delete(self.table, self.id);
+        let table = self.table;
+        let id = self.id;
+        let db_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                tokio::runtime::Runtime::new().unwrap().block_on(async {
+                    let pool = PgPool::connect(&db_url).await.unwrap();
+                    // Collect client IDs before deleting referencing rows
+                    let client_ids: Vec<(Uuid,)> = sqlx::query_as(
+                        "SELECT sender_id AS id FROM messages WHERE channel_id = $1 AND sender_id IS NOT NULL
+                         UNION
+                         SELECT client_id FROM chats WHERE channel_id = $1",
+                    )
+                    .bind(id)
+                    .fetch_all(&pool)
+                    .await
+                    .unwrap_or_default();
+                    // Delete in FK order
+                    let _ = sqlx::query("DELETE FROM messages WHERE channel_id = $1").bind(id).execute(&pool).await;
+                    let _ = sqlx::query("DELETE FROM chats WHERE channel_id = $1").bind(id).execute(&pool).await;
+                    for (client_id,) in &client_ids {
+                        let _ = sqlx::query("DELETE FROM clients WHERE id = $1").bind(client_id).execute(&pool).await;
+                    }
+                    let _ = sqlx::query(&format!("DELETE FROM {} WHERE id = $1", table)).bind(id).execute(&pool).await;
+                    let _ = sqlx::query("DELETE FROM channels WHERE id = $1").bind(id).execute(&pool).await;
+                });
+            });
+        });
     }
 }
 
@@ -41,6 +78,28 @@ pub struct TestClient {
 impl Drop for TestClient {
     fn drop(&mut self) {
         drop_delete("clients", self.id);
+    }
+}
+
+/// RAII guard that deletes a chat row on drop.
+pub struct TestChat {
+    pub id: Uuid,
+}
+
+impl Drop for TestChat {
+    fn drop(&mut self) {
+        drop_delete("chats", self.id);
+    }
+}
+
+/// RAII guard that deletes a message row on drop.
+pub struct TestMessage {
+    pub id: Uuid,
+}
+
+impl Drop for TestMessage {
+    fn drop(&mut self) {
+        drop_delete("messages", self.id);
     }
 }
 

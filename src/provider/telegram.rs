@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use crate::cache::{ChannelCache, ClientCache};
 use crate::error::WebhookError;
-use crate::model::{EventKind, IncomingMessage, ProviderKind};
+use crate::model::{EventKind, NewMessage, ProviderKind};
 use crate::provider::WebhookProvider;
 
 pub struct TelegramProvider {
@@ -65,7 +65,7 @@ impl WebhookProvider for TelegramProvider {
         body: &[u8],
         db: &PgPool,
         redis: redis::aio::ConnectionManager,
-    ) -> Result<Vec<IncomingMessage>, WebhookError> {
+    ) -> Result<Vec<NewMessage>, WebhookError> {
         let update: TelegramUpdate =
             serde_json::from_slice(body).map_err(|e| WebhookError::BadRequest(e.to_string()))?;
 
@@ -77,9 +77,9 @@ impl WebhookProvider for TelegramProvider {
             (EventKind::Unknown, None)
         };
 
-        let (message_id, timestamp) = match msg_ref {
-            Some(msg) => (msg.message_id, msg.date),
-            None => (update.update_id, 0),
+        let message_id = match msg_ref {
+            Some(msg) => msg.message_id,
+            None => update.update_id,
         };
 
         let client_id = if let Some(from) = msg_ref.and_then(|m| m.from.as_ref()) {
@@ -94,15 +94,13 @@ impl WebhookProvider for TelegramProvider {
         };
         let raw = serde_json::from_slice(body).unwrap_or(serde_json::Value::Null);
 
-        Ok(vec![IncomingMessage {
-            id: Uuid::new_v4(),
+        Ok(vec![NewMessage {
             external_message_id: format!("telegram:{message_id}"),
             channel_id: self.channel_id,
             sender_id: client_id,
             provider: ProviderKind::Telegram,
             event: event_kind,
             text,
-            timestamp,
             raw,
         }])
     }

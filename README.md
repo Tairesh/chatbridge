@@ -23,8 +23,8 @@ Multi-provider chat bridge for **Instagram**, **Telegram**, and **WebSocket chat
                          │      │  (in-memory cache → DB)      │
                          │      ├─ Resolve client identity     │
                          │      │  (DB lookup + Graph API bg)  │
-                         │      ├─ Emit IncomingMessage ──▶ stdout
-                         │      └─ Publish ──▶ Redis instagram:{id}
+                         │      ├─ Persist → Postgres messages │
+                         │      └─ Publish ──▶ Redis incoming_messages
                          │                                     │
     Telegram ────POST────▶ /webhook/telegram/{channel_id}      │
                          │   │                                 │
@@ -39,8 +39,8 @@ Multi-provider chat bridge for **Instagram**, **Telegram**, and **WebSocket chat
                          │   └─ Background: parse Update       │
                          │      ├─ Resolve client from `from`  │
                          │      │  (cache → DB, 24h staleness) │
-                         │      ├─ Emit IncomingMessage ──▶ stdout
-                         │      └─ Publish ──▶ Redis telegram:{id}
+                         │      ├─ Persist → Postgres messages │
+                         │      └─ Publish ──▶ Redis incoming_messages
                          │                                     │
   Widget Client ───WS────▶ /ws/{widget_id}                     │
                          │   │                                 │
@@ -55,8 +55,8 @@ Multi-provider chat bridge for **Instagram**, **Telegram**, and **WebSocket chat
                          │      ├─ Shutdown → close frame      │
                          │      ├─ Parse JSON action message    │
                          │      │  (send / edit)                │
-                         │      ├─ Emit IncomingMessage ──▶ stdout
-                         │      ├─ Publish ──▶ Redis widget:{id}
+                         │      ├─ Persist → Postgres messages │
+                         │      ├─ Publish ──▶ Redis incoming_messages
                          │      └─ Send ACK ──▶ client (5s timeout)
                          │                                     │
   Instagram/Meta ──GET───▶ /webhook/instagram                  │
@@ -68,32 +68,37 @@ Multi-provider chat bridge for **Instagram**, **Telegram**, and **WebSocket chat
                             │ Postgres │      │   Redis   │
                             │  :5432   │      │   :6379   │
                             └─────────┘      └───────────┘
-                         instagram_channels   pub/sub channels:
-                         telegram_channels    instagram:{uuid}
-                         widget_channels      telegram:{uuid}
-                         clients              widget:{uuid}
-                                              cache_invalidation
+                         channels             pub/sub channels:
+                         instagram_channels   incoming_messages
+                         telegram_channels    cache_invalidation
+                         widget_channels
+                         clients
+                         chats
+                         messages
 ```
 
-### IncomingMessage
+### Message Lifecycle
 
-Every successfully parsed webhook event becomes an `IncomingMessage`:
+Handlers build a `NewMessage`, then branch on `EventKind`:
 
 ```
-┌──────────────────────────────────────────────┐
-│ IncomingMessage                              │
-├──────────────────────────────────────────────┤
-│ id                    UUID (generated)       │
-│ external_message_id   "instagram:aWdf..." / "telegram:42" / "widget:uuid" │
-│ channel_id            UUID (from DB)         │
-│ sender_id             UUID (auto-resolved per sender) │
-│ provider              Instagram | Telegram | Widget   │
-│ event                 Message | Edit | Read | Reaction | Unknown │
-│ text                  Message text (Message/Edit only) │
-│ timestamp             Unix ms                │
-│ raw                   Full original JSON     │
-└──────────────────────────────────────────────┘
+EventKind::Message  → INSERT (dedup) → publish IncomingEvent::Message
+EventKind::Edit     → UPDATE text    → publish IncomingEvent::Edit
+EventKind::Read     → UPDATE status  → publish IncomingEvent::Read (watermark)
+EventKind::Reaction → log only
+EventKind::Unknown  → log only
 ```
+
+Only `Message` events create rows. `Edit` and `Read` mutate existing rows found by `(channel_id, external_message_id)`. Read receipts use watermark semantics: all messages in the same chat up to the referenced message are marked as read.
+
+Published to Redis as `IncomingEvent` with a `"type"` discriminator:
+```json
+{"type": "message", "id": "...", "text": "...", "status": "new", ...}
+{"type": "edit", "id": "...", "text": "...", "edited_at": "...", ...}
+{"type": "read", "id": "...", ...}
+```
+
+Chat resolution: if the sender exists in the `clients` table, `find_or_create_chat` finds or creates an active chat for `(client_id, channel_id)`. At most one active chat per pair (enforced by partial unique index).
 
 ### Caching
 
@@ -117,11 +122,11 @@ src/
 ├── lib.rs               # Public module re-exports
 ├── cache.rs             # In-memory channel + client caches with Redis Pub/Sub invalidation
 ├── config.rs            # AppConfig (env vars) + AppState (config + DB pool + Redis + cache + registry + shutdown token)
-├── db.rs                # Postgres pool, migrations, channel queries, client identity upsert
+├── db.rs                # Postgres pool, migrations, channel queries, client identity upsert, chat resolution, message persistence
 ├── error.rs             # WebhookError → HTTP status mapping
 ├── jwt.rs               # HS256 JWT sign/verify for WebSocket widget client identity
 ├── registry.rs          # ClientRegistry (tracks active WS connections per client UUID)
-├── model.rs             # IncomingMessage, ProviderKind, EventKind, WsInbound/WsOutbound
+├── model.rs             # NewMessage, IncomingMessage, ProviderKind, EventKind, WsInbound/WsOutbound
 ├── handler.rs           # Axum request handlers + WebSocket handler
 ├── routes.rs            # Router assembly
 └── provider/
@@ -215,7 +220,7 @@ Integration tests cover:
 - Channel cache (read-through, per-channel invalidation, Redis Pub/Sub eviction, cross-channel isolation)
 - Client cache invalidation via Redis Pub/Sub
 
-Test data cleanup uses RAII drop guards (`TestChannel`, `TestClient`) in `tests/common/` to ensure rows are deleted even if a test panics.
+Test data cleanup uses RAII drop guards (`TestChannel`, `TestClient`, `TestChat`, `TestMessage`) in `tests/common/` to ensure rows are deleted even if a test panics.
 
 ### Linting
 

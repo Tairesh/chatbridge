@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::cache::{ChannelCache, ClientCache};
 use crate::error::WebhookError;
-use crate::model::{EventKind, IncomingMessage, ProviderKind};
+use crate::model::{EventKind, NewMessage, ProviderKind};
 use crate::provider::WebhookProvider;
 
 static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
@@ -67,7 +67,7 @@ impl WebhookProvider for InstagramProvider {
         body: &[u8],
         db: &PgPool,
         redis: redis::aio::ConnectionManager,
-    ) -> Result<Vec<IncomingMessage>, WebhookError> {
+    ) -> Result<Vec<NewMessage>, WebhookError> {
         let payload: MetaWebhookPayload =
             serde_json::from_slice(body).map_err(|e| WebhookError::BadRequest(e.to_string()))?;
 
@@ -115,15 +115,13 @@ impl WebhookProvider for InstagramProvider {
                     EventKind::Edit => event.message_edit.as_ref().and_then(|e| e.text.clone()),
                     _ => None,
                 };
-                messages.push(IncomingMessage {
-                    id: Uuid::new_v4(),
+                messages.push(NewMessage {
                     external_message_id,
                     channel_id: channel.id,
                     sender_id: client_id,
                     provider: ProviderKind::Instagram,
                     event: event_kind,
                     text,
-                    timestamp: event.timestamp.unwrap_or(entry.time),
                     raw,
                 });
             }
