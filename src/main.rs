@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use chatbridge::cache::{self, ChannelCache};
+use chatbridge::cache::{self, ChannelCache, ClientCache};
 use chatbridge::config::{AppConfig, AppState};
 use chatbridge::registry::ClientRegistry;
 use chatbridge::{db, routes};
@@ -23,7 +23,9 @@ async fn main() {
     tracing::info!("connected to Redis");
 
     let cache = Arc::new(ChannelCache::new());
-    cache::spawn_invalidation_listener(&config.redis_url, cache.clone()).await;
+    let client_cache = Arc::new(ClientCache::new());
+    cache::spawn_invalidation_listener(&config.redis_url, cache.clone(), client_cache.clone())
+        .await;
 
     let shutdown = CancellationToken::new();
     let state = Arc::new(AppState {
@@ -31,6 +33,7 @@ async fn main() {
         db,
         redis,
         cache,
+        client_cache,
         registry: ClientRegistry::new(),
         shutdown,
     });

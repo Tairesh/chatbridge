@@ -14,5 +14,6 @@ pub trait WebhookProvider: Send + Sync {
         &self,
         body: &[u8],
         db: &PgPool,
+        redis: redis::aio::ConnectionManager,
     ) -> impl std::future::Future<Output = Result<Vec<InternalMessage>, WebhookError>> + Send;
 }

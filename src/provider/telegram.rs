@@ -5,18 +5,22 @@ use serde::Deserialize;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::cache::ChannelCache;
+use crate::cache::{ChannelCache, ClientCache};
 use crate::error::WebhookError;
 use crate::model::{EventKind, InternalMessage, ProviderKind};
 use crate::provider::WebhookProvider;
 
 pub struct TelegramProvider {
     channel_id: Uuid,
+    client_cache: Arc<ClientCache>,
 }
 
 impl TelegramProvider {
-    pub fn new(channel_id: Uuid) -> Self {
-        Self { channel_id }
+    pub fn new(channel_id: Uuid, client_cache: Arc<ClientCache>) -> Self {
+        Self {
+            channel_id,
+            client_cache,
+        }
     }
 
     /// Load the channel's bot_secret from the cache (or database on miss) and return
@@ -25,12 +29,13 @@ impl TelegramProvider {
         channel_id: Uuid,
         db: &PgPool,
         cache: &Arc<ChannelCache>,
+        client_cache: Arc<ClientCache>,
     ) -> Result<(Self, String), WebhookError> {
         let channel = cache
             .get_telegram_channel(db, channel_id)
             .await?
             .ok_or_else(|| WebhookError::NotFound(format!("channel {channel_id} not found")))?;
-        Ok((Self::new(channel_id), channel.bot_secret))
+        Ok((Self::new(channel_id, client_cache), channel.bot_secret))
     }
 }
 
@@ -55,7 +60,12 @@ impl WebhookProvider for TelegramProvider {
         Ok(())
     }
 
-    async fn parse(&self, body: &[u8], db: &PgPool) -> Result<Vec<InternalMessage>, WebhookError> {
+    async fn parse(
+        &self,
+        body: &[u8],
+        db: &PgPool,
+        redis: redis::aio::ConnectionManager,
+    ) -> Result<Vec<InternalMessage>, WebhookError> {
         let update: TelegramUpdate =
             serde_json::from_slice(body).map_err(|e| WebhookError::BadRequest(e.to_string()))?;
 
@@ -72,28 +82,8 @@ impl WebhookProvider for TelegramProvider {
             None => (update.update_id, 0),
         };
 
-        // Upsert client from the `from` field if present (non-blocking)
         let client_id = if let Some(from) = msg_ref.and_then(|m| m.from.as_ref()) {
-            let client_id = Uuid::new_v4();
-            let name = build_display_name(from);
-            let db = db.clone();
-            let external_id = from.id.to_string();
-            let username = from.username.clone();
-            tokio::spawn(async move {
-                if let Err(e) = crate::db::upsert_client(
-                    &db,
-                    client_id,
-                    ProviderKind::Telegram,
-                    &external_id,
-                    Some(name.as_str()),
-                    username.as_deref(),
-                )
-                .await
-                {
-                    tracing::error!("telegram client upsert failed: {e}");
-                }
-            });
-            Some(client_id)
+            resolve_telegram_client(db, &self.client_cache, from, redis).await
         } else {
             None
         };
@@ -110,6 +100,66 @@ impl WebhookProvider for TelegramProvider {
             raw,
         }])
     }
+}
+
+/// Look up or create a client from the Telegram user, spawning a background
+/// task to upsert the client row when needed.
+async fn resolve_telegram_client(
+    db: &PgPool,
+    client_cache: &ClientCache,
+    from: &TelegramUser,
+    redis: redis::aio::ConnectionManager,
+) -> Option<Uuid> {
+    let external_id = from.id.to_string();
+    match client_cache
+        .get_client(db, ProviderKind::Telegram, &external_id)
+        .await
+    {
+        Ok(Some(client)) => {
+            let age = chrono::Utc::now() - client.updated_at;
+            if age > chrono::TimeDelta::hours(24) {
+                spawn_telegram_upsert(db.clone(), client.id, from, redis);
+            }
+            Some(client.id)
+        }
+        Ok(None) => {
+            let client_id = Uuid::new_v4();
+            spawn_telegram_upsert(db.clone(), client_id, from, redis);
+            Some(client_id)
+        }
+        Err(e) => {
+            tracing::error!("telegram client lookup failed: {e}");
+            None
+        }
+    }
+}
+
+fn spawn_telegram_upsert(
+    db: PgPool,
+    client_id: Uuid,
+    from: &TelegramUser,
+    redis: redis::aio::ConnectionManager,
+) {
+    let name = build_display_name(from);
+    let external_id = from.id.to_string();
+    let username = from.username.clone();
+    tokio::spawn(async move {
+        let mut redis = redis;
+        if let Err(e) = crate::db::upsert_client(
+            &db,
+            client_id,
+            ProviderKind::Telegram,
+            &external_id,
+            Some(name.as_str()),
+            username.as_deref(),
+        )
+        .await
+        {
+            tracing::error!("telegram client upsert failed: {e}");
+        } else {
+            crate::cache::publish_invalidation(&mut redis, "client", client_id).await;
+        }
+    });
 }
 
 // --- Telegram Update types (minimal) ---
@@ -148,6 +198,7 @@ fn build_display_name(user: &TelegramUser) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cache::ClientCache;
     use crate::provider::WebhookProvider;
 
     #[test]
@@ -181,7 +232,7 @@ mod tests {
     #[tokio::test]
     async fn parse_telegram_message() {
         let channel_id = uuid::Uuid::new_v4();
-        let provider = TelegramProvider::new(channel_id);
+        let provider = TelegramProvider::new(channel_id, Arc::new(ClientCache::new()));
 
         let body = serde_json::json!({
             "update_id": 100,

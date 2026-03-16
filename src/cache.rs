@@ -4,11 +4,12 @@ use std::sync::RwLock;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::db::{self, InstagramChannel, TelegramChannel, WidgetChannel};
+use crate::db::{self, Client, InstagramChannel, TelegramChannel, WidgetChannel};
 use crate::error::WebhookError;
+use crate::model::ProviderKind;
 
 /// In-memory channel cache with read-through to Postgres.
-/// Invalidated via Redis Pub/Sub on the `channel_invalidation` topic.
+/// Invalidated via Redis Pub/Sub on the `cache_invalidation` topic.
 /// Only caches positive lookups — misses always hit the database.
 pub struct ChannelCache {
     instagram: RwLock<HashMap<String, InstagramChannel>>,
@@ -88,43 +89,81 @@ impl ChannelCache {
         Ok(channel)
     }
 
-    /// Evict a single channel from the cache.
-    ///
-    /// `provider` is `"instagram"`, `"telegram"`, or `"widget"`.
-    /// `channel_id` is the channel UUID to remove.
-    pub fn invalidate(&self, provider: &str, channel_id: Uuid) {
-        match provider {
-            "instagram" => {
-                self.instagram
-                    .write()
-                    .unwrap()
-                    .retain(|_, v| v.id != channel_id);
-            }
-            "telegram" => {
-                self.telegram.write().unwrap().remove(&channel_id);
-            }
-            "widget" => {
-                self.widget
-                    .write()
-                    .unwrap()
-                    .retain(|_, v| v.id != channel_id);
-            }
-            other => {
-                tracing::warn!(provider = other, "unknown provider in cache invalidation");
-            }
+    /// Evict a single channel from the cache (all provider maps).
+    pub fn invalidate(&self, channel_id: Uuid) {
+        self.instagram
+            .write()
+            .unwrap()
+            .retain(|_, v| v.id != channel_id);
+        self.telegram.write().unwrap().remove(&channel_id);
+        self.widget
+            .write()
+            .unwrap()
+            .retain(|_, v| v.id != channel_id);
+    }
+}
+
+/// In-memory client cache with read-through to Postgres.
+/// Keyed by (provider, external_id). Invalidated by client UUID via retain().
+pub struct ClientCache {
+    clients: RwLock<HashMap<(ProviderKind, String), Client>>,
+}
+
+impl Default for ClientCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ClientCache {
+    pub fn new() -> Self {
+        Self {
+            clients: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Read-through lookup. On miss, queries DB and caches positive results only.
+    pub async fn get_client(
+        &self,
+        pool: &PgPool,
+        provider: ProviderKind,
+        external_id: &str,
+    ) -> Result<Option<Client>, sqlx::Error> {
+        let key = (provider.clone(), external_id.to_owned());
+        if let Some(cached) = self.clients.read().unwrap().get(&key) {
+            return Ok(Some(cached.clone()));
+        }
+
+        let client = crate::db::find_client_by_external_id(pool, provider, external_id).await?;
+        if let Some(ref c) = client {
+            self.clients.write().unwrap().insert(key, c.clone());
+        }
+        Ok(client)
+    }
+
+    /// Evict a client by its UUID (linear scan via retain).
+    pub fn invalidate(&self, client_id: Uuid) {
+        self.clients
+            .write()
+            .unwrap()
+            .retain(|_, v| v.id != client_id);
     }
 }
 
 /// Redis Pub/Sub invalidation topic.
-pub const INVALIDATION_CHANNEL: &str = "channel_invalidation";
+pub const INVALIDATION_CHANNEL: &str = "cache_invalidation";
 
-/// Spawn a background task that subscribes to Redis `channel_invalidation`
-/// and evicts individual channels from the local cache.
+/// Spawn a background task that subscribes to Redis `cache_invalidation`
+/// and evicts individual entries from the local caches.
 ///
-/// Expected message format: `"provider:channel_uuid"`
-/// e.g. `"instagram:550e8400-e29b-41d4-a716-446655440000"`
-pub async fn spawn_invalidation_listener(redis_url: &str, cache: std::sync::Arc<ChannelCache>) {
+/// Expected message format: `"entity_type:uuid"`
+/// e.g. `"channel:550e8400-e29b-41d4-a716-446655440000"`
+/// or  `"client:550e8400-e29b-41d4-a716-446655440000"`
+pub async fn spawn_invalidation_listener(
+    redis_url: &str,
+    channel_cache: std::sync::Arc<ChannelCache>,
+    client_cache: std::sync::Arc<ClientCache>,
+) {
     let client = redis::Client::open(redis_url).expect("invalid REDIS_URL for cache listener");
     let mut pubsub = client
         .get_async_pubsub()
@@ -134,7 +173,7 @@ pub async fn spawn_invalidation_listener(redis_url: &str, cache: std::sync::Arc<
     pubsub
         .subscribe(INVALIDATION_CHANNEL)
         .await
-        .expect("failed to subscribe to channel_invalidation");
+        .expect("failed to subscribe to cache_invalidation");
 
     tokio::spawn(async move {
         use futures_util::StreamExt;
@@ -157,18 +196,97 @@ pub async fn spawn_invalidation_listener(redis_url: &str, cache: std::sync::Arc<
                 }
             };
 
-            let Some((provider, uuid_str)) = payload.split_once(':') else {
-                tracing::warn!(payload = %payload, "invalid invalidation format, expected provider:uuid");
+            let Some((entity_type, uuid_str)) = payload.split_once(':') else {
+                tracing::warn!(payload = %payload, "invalid invalidation format, expected entity_type:uuid");
                 continue;
             };
 
-            let Ok(channel_id) = uuid_str.parse::<Uuid>() else {
+            let Ok(id) = uuid_str.parse::<Uuid>() else {
                 tracing::warn!(payload = %payload, "invalid uuid in invalidation message");
                 continue;
             };
 
-            tracing::info!(provider = provider, %channel_id, "invalidating cached channel");
-            cache.invalidate(provider, channel_id);
+            match entity_type {
+                "channel" => {
+                    tracing::info!(%id, "invalidating cached channel");
+                    channel_cache.invalidate(id);
+                }
+                "client" => {
+                    tracing::info!(%id, "invalidating cached client");
+                    client_cache.invalidate(id);
+                }
+                other => {
+                    tracing::warn!(
+                        entity_type = other,
+                        "unknown entity type in cache invalidation"
+                    );
+                }
+            }
         }
     });
+}
+
+/// Publish a cache invalidation event to Redis.
+pub async fn publish_invalidation(
+    redis: &mut redis::aio::ConnectionManager,
+    entity_type: &str,
+    id: Uuid,
+) {
+    use redis::AsyncCommands;
+    let msg = format!("{entity_type}:{id}");
+    if let Err(e) = redis.publish::<_, _, ()>(INVALIDATION_CHANNEL, &msg).await {
+        tracing::error!("failed to publish cache invalidation: {e}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::ProviderKind;
+
+    #[test]
+    fn client_cache_invalidate_removes_matching_entry() {
+        let cache = ClientCache::new();
+        let client_id = Uuid::new_v4();
+        let client = crate::db::Client {
+            id: client_id,
+            provider: "telegram".into(),
+            external_id: Some("12345".into()),
+            name: Some("Test".into()),
+            username: None,
+            updated_at: chrono::Utc::now(),
+        };
+        cache
+            .clients
+            .write()
+            .unwrap()
+            .insert((ProviderKind::Telegram, "12345".into()), client);
+
+        assert_eq!(cache.clients.read().unwrap().len(), 1);
+        cache.invalidate(client_id);
+        assert!(cache.clients.read().unwrap().is_empty());
+    }
+
+    #[test]
+    fn client_cache_invalidate_keeps_non_matching_entries() {
+        let cache = ClientCache::new();
+        let client_id = Uuid::new_v4();
+        let other_id = Uuid::new_v4();
+        let client = crate::db::Client {
+            id: client_id,
+            provider: "instagram".into(),
+            external_id: Some("abc".into()),
+            name: None,
+            username: None,
+            updated_at: chrono::Utc::now(),
+        };
+        cache
+            .clients
+            .write()
+            .unwrap()
+            .insert((ProviderKind::Instagram, "abc".into()), client);
+
+        cache.invalidate(other_id);
+        assert_eq!(cache.clients.read().unwrap().len(), 1);
+    }
 }

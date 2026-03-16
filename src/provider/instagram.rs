@@ -7,7 +7,7 @@ use sha2::Sha256;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::cache::ChannelCache;
+use crate::cache::{ChannelCache, ClientCache};
 use crate::error::WebhookError;
 use crate::model::{EventKind, InternalMessage, ProviderKind};
 use crate::provider::WebhookProvider;
@@ -28,13 +28,15 @@ struct InstagramProfile {
 pub struct InstagramProvider {
     app_secret: String,
     cache: Arc<ChannelCache>,
+    client_cache: Arc<ClientCache>,
 }
 
 impl InstagramProvider {
-    pub fn new(app_secret: &str, cache: Arc<ChannelCache>) -> Self {
+    pub fn new(app_secret: &str, cache: Arc<ChannelCache>, client_cache: Arc<ClientCache>) -> Self {
         Self {
             app_secret: app_secret.to_owned(),
             cache,
+            client_cache,
         }
     }
 }
@@ -60,7 +62,12 @@ impl WebhookProvider for InstagramProvider {
         Ok(())
     }
 
-    async fn parse(&self, body: &[u8], db: &PgPool) -> Result<Vec<InternalMessage>, WebhookError> {
+    async fn parse(
+        &self,
+        body: &[u8],
+        db: &PgPool,
+        redis: redis::aio::ConnectionManager,
+    ) -> Result<Vec<InternalMessage>, WebhookError> {
         let payload: MetaWebhookPayload =
             serde_json::from_slice(body).map_err(|e| WebhookError::BadRequest(e.to_string()))?;
 
@@ -92,7 +99,14 @@ impl WebhookProvider for InstagramProvider {
                     continue;
                 };
 
-                let client_id = resolve_instagram_client(db, event.sender.as_ref(), &channel).await;
+                let client_id = resolve_instagram_client(
+                    db,
+                    &self.client_cache,
+                    event.sender.as_ref(),
+                    &channel,
+                    redis.clone(),
+                )
+                .await;
 
                 let raw = serde_json::to_value(event).unwrap_or(serde_json::Value::Null);
                 let message_id = format!("instagram:{}", mid.unwrap_or(&entry.id));
@@ -135,21 +149,26 @@ use crate::db::InstagramChannel;
 /// task to fetch the Instagram profile and upsert the client row.
 async fn resolve_instagram_client(
     db: &PgPool,
+    client_cache: &ClientCache,
     sender: Option<&Participant>,
     channel: &InstagramChannel,
+    redis: redis::aio::ConnectionManager,
 ) -> Option<Uuid> {
     let sid = sender?.id.as_str();
-    match crate::db::find_client_by_external_id(db, ProviderKind::Instagram, sid).await {
+    match client_cache
+        .get_client(db, ProviderKind::Instagram, sid)
+        .await
+    {
         Ok(Some(client)) => {
             let age = chrono::Utc::now() - client.updated_at;
             if age > chrono::TimeDelta::hours(24) {
-                spawn_instagram_upsert(db.clone(), client.id, sid, channel);
+                spawn_instagram_upsert(db.clone(), client.id, sid, channel, redis);
             }
             Some(client.id)
         }
         Ok(None) => {
             let client_id = Uuid::new_v4();
-            spawn_instagram_upsert(db.clone(), client_id, sid, channel);
+            spawn_instagram_upsert(db.clone(), client_id, sid, channel, redis);
             Some(client_id)
         }
         Err(e) => {
@@ -159,10 +178,18 @@ async fn resolve_instagram_client(
     }
 }
 
-fn spawn_instagram_upsert(db: PgPool, client_id: Uuid, sid: &str, channel: &InstagramChannel) {
+fn spawn_instagram_upsert(
+    db: PgPool,
+    client_id: Uuid,
+    sid: &str,
+    channel: &InstagramChannel,
+    redis: redis::aio::ConnectionManager,
+) {
     let sid = sid.to_owned();
     let token = channel.access_token.clone();
-    tokio::spawn(fetch_and_upsert_instagram_client(db, client_id, sid, token));
+    tokio::spawn(fetch_and_upsert_instagram_client(
+        db, client_id, sid, token, redis,
+    ));
 }
 
 /// Fetch Instagram profile and upsert client. Always creates the client row,
@@ -172,6 +199,7 @@ async fn fetch_and_upsert_instagram_client(
     client_id: Uuid,
     sender_id: String,
     access_token: String,
+    mut redis: redis::aio::ConnectionManager,
 ) {
     let url = format!(
         "https://graph.instagram.com/v25.0/{sender_id}?fields=username,name&access_token={access_token}"
@@ -206,6 +234,8 @@ async fn fetch_and_upsert_instagram_client(
     .await
     {
         tracing::error!(%sender_id, "instagram client upsert failed: {e}");
+    } else {
+        crate::cache::publish_invalidation(&mut redis, "client", client_id).await;
     }
 }
 
@@ -270,7 +300,7 @@ pub struct Reaction {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cache::ChannelCache;
+    use crate::cache::{ChannelCache, ClientCache};
     use crate::provider::WebhookProvider;
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
@@ -278,7 +308,11 @@ mod tests {
     const TEST_SECRET: &str = "test_secret_key";
 
     fn test_provider() -> InstagramProvider {
-        InstagramProvider::new(TEST_SECRET, Arc::new(ChannelCache::new()))
+        InstagramProvider::new(
+            TEST_SECRET,
+            Arc::new(ChannelCache::new()),
+            Arc::new(ClientCache::new()),
+        )
     }
 
     fn sign(secret: &str, body: &[u8]) -> String {

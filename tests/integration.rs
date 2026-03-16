@@ -11,6 +11,7 @@ use tokio_tungstenite::tungstenite;
 use tower::ServiceExt;
 use uuid::Uuid;
 
+use chatbridge::cache::ClientCache;
 use chatbridge::config::{AppConfig, AppState};
 use chatbridge::model::ProviderKind;
 use chatbridge::registry::ClientRegistry;
@@ -101,6 +102,7 @@ async fn build_state(db: PgPool) -> Arc<AppState> {
         db,
         redis,
         cache: Arc::new(Default::default()),
+        client_cache: Arc::new(ClientCache::new()),
         registry: ClientRegistry::new(),
         shutdown: CancellationToken::new(),
     })
@@ -1040,7 +1042,7 @@ async fn cache_instagram_lookup_and_invalidation() {
     assert_eq!(cached.id, guard.id);
 
     // Invalidate the specific channel
-    cache.invalidate("instagram", guard.id);
+    cache.invalidate(guard.id);
 
     // Now cache is empty, lookup goes to DB — channel is gone
     let after = cache.get_instagram_channel(&pool, &user_id).await.unwrap();
@@ -1080,7 +1082,7 @@ async fn cache_telegram_lookup_and_invalidation() {
     assert_eq!(cached.bot_secret, bot_secret);
 
     // Invalidate
-    cache.invalidate("telegram", guard.id);
+    cache.invalidate(guard.id);
 
     let after = cache.get_telegram_channel(&pool, guard.id).await.unwrap();
     assert!(
@@ -1119,7 +1121,7 @@ async fn cache_widget_lookup_and_invalidation() {
     assert_eq!(cached.id, guard.id);
 
     // Invalidate
-    cache.invalidate("widget", guard.id);
+    cache.invalidate(guard.id);
 
     let after = cache.get_widget_channel(&pool, &widget_id).await.unwrap();
     assert!(
@@ -1146,7 +1148,12 @@ async fn cache_invalidation_via_redis_pubsub() {
     assert_eq!(ch.bot_secret, bot_secret);
 
     // Start invalidation listener
-    chatbridge::cache::spawn_invalidation_listener(&redis_url, cache.clone()).await;
+    chatbridge::cache::spawn_invalidation_listener(
+        &redis_url,
+        cache.clone(),
+        Arc::new(ClientCache::new()),
+    )
+    .await;
 
     // Delete from DB so we can detect cache eviction
     sqlx::query("DELETE FROM telegram_channels WHERE id = $1")
@@ -1160,7 +1167,7 @@ async fn cache_invalidation_via_redis_pubsub() {
     redis::AsyncCommands::publish::<_, _, ()>(
         &mut redis,
         chatbridge::cache::INVALIDATION_CHANNEL,
-        format!("telegram:{}", guard.id),
+        format!("channel:{}", guard.id),
     )
     .await
     .unwrap();
@@ -1197,7 +1204,7 @@ async fn cache_invalidation_does_not_affect_other_channels() {
         .unwrap();
 
     // Invalidate only A
-    cache.invalidate("telegram", guard_a.id);
+    cache.invalidate(guard_a.id);
 
     // B should still be cached even if we delete it from DB
     sqlx::query("DELETE FROM telegram_channels WHERE id = $1")
@@ -1219,7 +1226,11 @@ async fn instagram_rejects_non_instagram_object() {
     use chatbridge::provider::instagram::InstagramProvider;
 
     fn test_provider() -> InstagramProvider {
-        InstagramProvider::new(TEST_APP_SECRET, Arc::new(ChannelCache::new()))
+        InstagramProvider::new(
+            TEST_APP_SECRET,
+            Arc::new(ChannelCache::new()),
+            Arc::new(ClientCache::new()),
+        )
     }
 
     let pool = setup_pool().await;
@@ -1235,7 +1246,8 @@ async fn instagram_rejects_non_instagram_object() {
     });
     let body_bytes = serde_json::to_vec(&body).unwrap();
 
-    let err = provider.parse(&body_bytes, &pool).await.unwrap_err();
+    let redis = setup_redis().await;
+    let err = provider.parse(&body_bytes, &pool, redis).await.unwrap_err();
     assert!(err.to_string().contains("unexpected object: page"));
 }
 
@@ -1452,4 +1464,186 @@ async fn ws_valid_token_deleted_client_gets_new_auth() {
     let _client = TestClient { id: new_client_id };
 
     ws2.close(None).await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Telegram client reuse
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn telegram_ingest_reuses_client_id() {
+    let pool = setup_pool().await;
+    let state = build_state(pool.clone()).await;
+
+    let bot_secret = "reuse_secret";
+    let _ch = insert_test_telegram_channel(&pool, bot_secret).await;
+    let channel_id = _ch.id;
+
+    let telegram_user_id = 99887766_i64;
+    let body = serde_json::json!({
+        "update_id": 200,
+        "message": {
+            "message_id": 50,
+            "date": 1700000000,
+            "from": {"id": telegram_user_id, "first_name": "Reuse"},
+            "chat": {"id": telegram_user_id, "type": "private"},
+            "text": "first message"
+        }
+    });
+    let body_bytes = serde_json::to_vec(&body).unwrap();
+
+    let app = routes::build(state.clone());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/webhook/telegram/{channel_id}"))
+                .header("X-Telegram-Bot-Api-Secret-Token", bot_secret)
+                .header("content-type", "application/json")
+                .body(Body::from(body_bytes.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Wait for background upsert
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // Verify client was created
+    let client = chatbridge::db::find_client_by_external_id(
+        &pool,
+        chatbridge::model::ProviderKind::Telegram,
+        &telegram_user_id.to_string(),
+    )
+    .await
+    .unwrap()
+    .expect("client should exist after first message");
+
+    let _client_guard = TestClient { id: client.id };
+    let first_client_id = client.id;
+
+    // Send second message from same user
+    let body2 = serde_json::json!({
+        "update_id": 201,
+        "message": {
+            "message_id": 51,
+            "date": 1700000001,
+            "from": {"id": telegram_user_id, "first_name": "Reuse"},
+            "chat": {"id": telegram_user_id, "type": "private"},
+            "text": "second message"
+        }
+    });
+    let body2_bytes = serde_json::to_vec(&body2).unwrap();
+
+    let app2 = routes::build(state.clone());
+    let resp2 = app2
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/webhook/telegram/{channel_id}"))
+                .header("X-Telegram-Bot-Api-Secret-Token", bot_secret)
+                .header("content-type", "application/json")
+                .body(Body::from(body2_bytes))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp2.status(), StatusCode::OK);
+
+    // Wait for background processing
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // Verify same client_id — no duplicate
+    let client2 = chatbridge::db::find_client_by_external_id(
+        &pool,
+        chatbridge::model::ProviderKind::Telegram,
+        &telegram_user_id.to_string(),
+    )
+    .await
+    .unwrap()
+    .expect("client should still exist");
+
+    assert_eq!(
+        first_client_id, client2.id,
+        "second message should reuse the same client_id"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Client cache invalidation via Redis pub/sub
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn client_cache_invalidated_via_redis_pubsub() {
+    let pool = setup_pool().await;
+    let mut redis = setup_redis().await;
+    let client_cache = Arc::new(chatbridge::cache::ClientCache::new());
+
+    // Insert a client
+    let client_id = Uuid::new_v4();
+    chatbridge::db::upsert_client(
+        &pool,
+        client_id,
+        chatbridge::model::ProviderKind::Telegram,
+        "invalidation_test_user",
+        Some("Old Name"),
+        None,
+    )
+    .await
+    .unwrap();
+    let _client_guard = TestClient { id: client_id };
+
+    // Populate cache via read-through
+    let cached = client_cache
+        .get_client(
+            &pool,
+            chatbridge::model::ProviderKind::Telegram,
+            "invalidation_test_user",
+        )
+        .await
+        .unwrap();
+    assert_eq!(cached.unwrap().name.as_deref(), Some("Old Name"));
+
+    // Start invalidation listener
+    let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".into());
+    let channel_cache = Arc::new(chatbridge::cache::ChannelCache::new());
+    chatbridge::cache::spawn_invalidation_listener(&redis_url, channel_cache, client_cache.clone())
+        .await;
+
+    // Give listener time to subscribe
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // Publish invalidation
+    chatbridge::cache::publish_invalidation(&mut redis, "client", client_id).await;
+
+    // Wait for invalidation to propagate
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // Update DB with new name
+    chatbridge::db::upsert_client(
+        &pool,
+        client_id,
+        chatbridge::model::ProviderKind::Telegram,
+        "invalidation_test_user",
+        Some("New Name"),
+        None,
+    )
+    .await
+    .unwrap();
+
+    // Cache should have been cleared — next read-through returns fresh data
+    let refreshed = client_cache
+        .get_client(
+            &pool,
+            chatbridge::model::ProviderKind::Telegram,
+            "invalidation_test_user",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        refreshed.unwrap().name.as_deref(),
+        Some("New Name"),
+        "cache should return fresh DB data after invalidation"
+    );
 }

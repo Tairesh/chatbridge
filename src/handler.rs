@@ -162,7 +162,11 @@ pub async fn instagram_ingest(
     headers: HeaderMap,
     body: Bytes,
 ) -> StatusCode {
-    let provider = InstagramProvider::new(&state.config.instagram_app_secret, state.cache.clone());
+    let provider = InstagramProvider::new(
+        &state.config.instagram_app_secret,
+        state.cache.clone(),
+        state.client_cache.clone(),
+    );
 
     if let Err(e) = provider.verify(&headers, &body) {
         tracing::warn!("instagram verify failed: {e}");
@@ -175,7 +179,7 @@ pub async fn instagram_ingest(
     let body = body.to_vec();
     tokio::spawn(
         async move {
-            match provider.parse(&body, &db).await {
+            match provider.parse(&body, &db, redis.clone()).await {
                 Ok(messages) => {
                     for msg in &messages {
                         tracing::info!(
@@ -209,8 +213,13 @@ pub async fn telegram_ingest(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<StatusCode, WebhookError> {
-    let (provider, bot_secret) =
-        TelegramProvider::load(channel_id, &state.db, &state.cache).await?;
+    let (provider, bot_secret) = TelegramProvider::load(
+        channel_id,
+        &state.db,
+        &state.cache,
+        state.client_cache.clone(),
+    )
+    .await?;
 
     telegram::verify_secret_token(&headers, &bot_secret)?;
 
@@ -220,7 +229,7 @@ pub async fn telegram_ingest(
     let body = body.to_vec();
     tokio::spawn(
         async move {
-            match provider.parse(&body, &db).await {
+            match provider.parse(&body, &db, redis.clone()).await {
                 Ok(messages) => {
                     for msg in &messages {
                         tracing::info!(
