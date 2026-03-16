@@ -36,16 +36,16 @@ Multi-provider chat bridge for Instagram, Telegram, and WebSocket chat widgets, 
 
 ### Module Structure
 
-- `cache.rs` — `ChannelCache` (in-memory read-through cache for channel lookups, invalidated via Redis Pub/Sub)
+- `cache.rs` — `ChannelCache` (in-memory read-through for channel lookups) + `ClientCache` (in-memory read-through for client lookups by `(ProviderKind, external_id)`), both invalidated via Redis Pub/Sub. Also: `publish_invalidation` helper, `spawn_invalidation_listener`
 - `jwt.rs` — HS256 JWT sign/verify for WebSocket widget client identity (`Claims { sub, iat }`)
 - `registry.rs` — `ClientRegistry` (tracks active WS connections per client UUID via `RwLock<HashMap<Uuid, HashSet<u64>>>`)
-- `config.rs` — `AppConfig` (from env vars) and `AppState` (config + PgPool + Redis + ChannelCache + ClientRegistry + shutdown token). `AppState` does NOT derive `Clone` — it's always behind `Arc<AppState>`
+- `config.rs` — `AppConfig` (from env vars) and `AppState` (config + PgPool + Redis + ChannelCache + ClientCache + ClientRegistry + shutdown token). `AppState` does NOT derive `Clone` — it's always behind `Arc<AppState>`
 - `db.rs` — Pool init, migrations, channel lookup queries, `Client` struct, `upsert_client`, `find_client_by_external_id`. `InstagramChannel` includes `access_token`
 - `error.rs` — `WebhookError` enum with `IntoResponse` (database errors are logged but not leaked to clients)
 - `model.rs` — `InternalMessage` (with optional `client_id`), `ProviderKind`, `EventKind`, `WsInbound`, `WsActionKind` (`send`/`edit`/`read`), `WsOutbound` (`Auth`/`Ack`/`Error`)
-- `provider/mod.rs` — `WebhookProvider` trait (verify + parse)
+- `provider/mod.rs` — `WebhookProvider` trait (verify + parse). `parse` takes `redis: ConnectionManager` for cache invalidation publishing
 - `provider/instagram.rs` — Constant-time HMAC-SHA256 verification, Meta webhook payload parsing, client resolution via Instagram Graph API (background `tokio::spawn` with 24h staleness check)
-- `provider/telegram.rs` — Secret token verification, Telegram Update parsing, `TelegramUser` struct, background client upsert from `from` field (updated on every message)
+- `provider/telegram.rs` — Secret token verification, Telegram Update parsing, `TelegramUser` struct, `resolve_telegram_client` (cache lookup → 24h staleness → background upsert, same pattern as Instagram)
 - `handler.rs` — Axum handlers (`meta_verify`, `instagram_ingest`, `telegram_ingest`, `widget_ws`)
 - `routes.rs` — Router assembly
 
@@ -77,15 +77,14 @@ Multi-provider chat bridge for Instagram, Telegram, and WebSocket chat widgets, 
 
 ### Channel Cache
 
-Channel data is cached in-memory (`ChannelCache` in `cache.rs`) to avoid hitting Postgres on every incoming webhook. Cache uses read-through: on miss, queries DB and stores the result. Invalidation is per-channel via Redis Pub/Sub:
+Channel and client data is cached in-memory (`ChannelCache` and `ClientCache` in `cache.rs`) to avoid hitting Postgres on every incoming webhook/message. Both caches use read-through: on miss, queries DB and stores the result. Invalidation is via Redis Pub/Sub on a universal `cache_invalidation` topic:
 
 ```
-PUBLISH channel_invalidation "instagram:<channel_uuid>"
-PUBLISH channel_invalidation "telegram:<channel_uuid>"
-PUBLISH channel_invalidation "widget:<channel_uuid>"
+PUBLISH cache_invalidation "channel:<uuid>"
+PUBLISH cache_invalidation "client:<uuid>"
 ```
 
-A background task (`spawn_invalidation_listener`) subscribes to the `channel_invalidation` topic and evicts the matching entry. All replicas receive the event and update their local cache.
+A background task (`spawn_invalidation_listener`) subscribes to the `cache_invalidation` topic and dispatches by entity type (`channel` → `ChannelCache`, `client` → `ClientCache`). All replicas receive the event and update their local cache. Providers call `publish_invalidation` after every `upsert_client`.
 
 ### Database
 

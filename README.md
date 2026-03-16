@@ -38,7 +38,7 @@ Multi-provider chat bridge for **Instagram**, **Telegram**, and **WebSocket chat
                          │   │                                 │
                          │   └─ Background: parse Update       │
                          │      ├─ Resolve client from `from`  │
-                         │      │  (inline upsert, no API)     │
+                         │      │  (cache → DB, 24h staleness) │
                          │      ├─ Emit InternalMessage ──▶ stdout
                          │      └─ Publish ──▶ Redis telegram:{id}
                          │                                     │
@@ -72,7 +72,7 @@ Multi-provider chat bridge for **Instagram**, **Telegram**, and **WebSocket chat
                          telegram_channels    instagram:{uuid}
                          widget_channels      telegram:{uuid}
                          clients              widget:{uuid}
-                                              channel_invalidation
+                                              cache_invalidation
 ```
 
 ### InternalMessage
@@ -93,20 +93,19 @@ Every successfully parsed webhook event becomes an `InternalMessage`:
 └──────────────────────────────────────────────┘
 ```
 
-### Channel Cache
+### Caching
 
-Channel configuration (tokens, secrets, IDs) is cached in-memory to avoid a Postgres round-trip on every incoming webhook. The cache uses a read-through strategy: on a miss it queries the database and stores the result locally.
+Channel configuration and client data are cached in-memory to avoid a Postgres round-trip on every incoming webhook. Both `ChannelCache` and `ClientCache` use a read-through strategy: on a miss, query the database and store the result locally.
 
-When a channel is updated or deleted, publish an invalidation event to Redis so all replicas evict the stale entry:
+When data is updated, publish an invalidation event to Redis so all replicas evict the stale entry:
 
 ```bash
-# Invalidate a specific channel
-redis-cli PUBLISH channel_invalidation "instagram:<channel_uuid>"
-redis-cli PUBLISH channel_invalidation "telegram:<channel_uuid>"
-redis-cli PUBLISH channel_invalidation "widget:<channel_uuid>"
+# Invalidate a specific channel or client
+redis-cli PUBLISH cache_invalidation "channel:<uuid>"
+redis-cli PUBLISH cache_invalidation "client:<uuid>"
 ```
 
-Each replica runs a background listener on the `channel_invalidation` topic that parses the `"provider:uuid"` message and evicts only the matching cache entry.
+Each replica runs a background listener on the `cache_invalidation` topic that dispatches by entity type (`channel` → `ChannelCache`, `client` → `ClientCache`). Providers automatically publish client invalidation after every `upsert_client`.
 
 ## Project Structure
 
@@ -114,7 +113,7 @@ Each replica runs a background listener on the `channel_invalidation` topic that
 src/
 ├── main.rs              # Entrypoint: load config, connect DB, start server, graceful shutdown with WS drain
 ├── lib.rs               # Public module re-exports
-├── cache.rs             # In-memory channel cache with Redis Pub/Sub invalidation
+├── cache.rs             # In-memory channel + client caches with Redis Pub/Sub invalidation
 ├── config.rs            # AppConfig (env vars) + AppState (config + DB pool + Redis + cache + registry + shutdown token)
 ├── db.rs                # Postgres pool, migrations, channel queries, client identity upsert
 ├── error.rs             # WebhookError → HTTP status mapping
@@ -126,7 +125,7 @@ src/
 └── provider/
     ├── mod.rs           # WebhookProvider trait (verify + parse)
     ├── instagram.rs     # HMAC-SHA256 verification, Meta payload parsing, client identity via Graph API
-    └── telegram.rs      # Secret token verification, Telegram Update parsing, client identity from `from` field
+    └── telegram.rs      # Secret token verification, Telegram Update parsing, client resolution (cache + 24h staleness)
 
 docker/
 ├── Dockerfile           # Multi-stage build
@@ -210,7 +209,9 @@ Integration tests cover:
 - WebSocket edit action (edit ACK, Redis edit event, unknown action error)
 - Redis pub/sub verification for all three providers
 - Client identity upsert (create, update, conflict handling)
+- Telegram client reuse (same client_id across messages from same user)
 - Channel cache (read-through, per-channel invalidation, Redis Pub/Sub eviction, cross-channel isolation)
+- Client cache invalidation via Redis Pub/Sub
 
 Test data cleanup uses RAII drop guards (`TestChannel`, `TestClient`) in `tests/common/` to ensure rows are deleted even if a test panics.
 
