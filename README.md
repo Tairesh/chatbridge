@@ -23,7 +23,7 @@ Multi-provider chat bridge for **Instagram**, **Telegram**, and **WebSocket chat
                          │      │  (in-memory cache → DB)      │
                          │      ├─ Resolve client identity     │
                          │      │  (DB lookup + Graph API bg)  │
-                         │      ├─ Emit InternalMessage ──▶ stdout
+                         │      ├─ Emit IncomingMessage ──▶ stdout
                          │      └─ Publish ──▶ Redis instagram:{id}
                          │                                     │
     Telegram ────POST────▶ /webhook/telegram/{channel_id}      │
@@ -39,7 +39,7 @@ Multi-provider chat bridge for **Instagram**, **Telegram**, and **WebSocket chat
                          │   └─ Background: parse Update       │
                          │      ├─ Resolve client from `from`  │
                          │      │  (cache → DB, 24h staleness) │
-                         │      ├─ Emit InternalMessage ──▶ stdout
+                         │      ├─ Emit IncomingMessage ──▶ stdout
                          │      └─ Publish ──▶ Redis telegram:{id}
                          │                                     │
   Widget Client ───WS────▶ /ws/{widget_id}                     │
@@ -55,7 +55,7 @@ Multi-provider chat bridge for **Instagram**, **Telegram**, and **WebSocket chat
                          │      ├─ Shutdown → close frame      │
                          │      ├─ Parse JSON action message    │
                          │      │  (send / edit)                │
-                         │      ├─ Emit InternalMessage ──▶ stdout
+                         │      ├─ Emit IncomingMessage ──▶ stdout
                          │      ├─ Publish ──▶ Redis widget:{id}
                          │      └─ Send ACK ──▶ client (5s timeout)
                          │                                     │
@@ -75,21 +75,23 @@ Multi-provider chat bridge for **Instagram**, **Telegram**, and **WebSocket chat
                                               cache_invalidation
 ```
 
-### InternalMessage
+### IncomingMessage
 
-Every successfully parsed webhook event becomes an `InternalMessage`:
+Every successfully parsed webhook event becomes an `IncomingMessage`:
 
 ```
 ┌──────────────────────────────────────────────┐
-│ InternalMessage                              │
+│ IncomingMessage                              │
 ├──────────────────────────────────────────────┤
-│ message_id   "instagram:aWdf..." / "telegram:42" / "widget:uuid" │
-│ channel_id   UUID (from DB)                  │
-│ client_id    UUID (auto-resolved per sender) │
-│ provider     Instagram | Telegram | Widget   │
-│ event        Message | Edit | Read | Reaction | Unknown │
-│ timestamp    Unix ms                         │
-│ raw          Full original JSON              │
+│ id                    UUID (generated)       │
+│ external_message_id   "instagram:aWdf..." / "telegram:42" / "widget:uuid" │
+│ channel_id            UUID (from DB)         │
+│ sender_id             UUID (auto-resolved per sender) │
+│ provider              Instagram | Telegram | Widget   │
+│ event                 Message | Edit | Read | Reaction | Unknown │
+│ text                  Message text (Message/Edit only) │
+│ timestamp             Unix ms                │
+│ raw                   Full original JSON     │
 └──────────────────────────────────────────────┘
 ```
 
@@ -119,7 +121,7 @@ src/
 ├── error.rs             # WebhookError → HTTP status mapping
 ├── jwt.rs               # HS256 JWT sign/verify for WebSocket widget client identity
 ├── registry.rs          # ClientRegistry (tracks active WS connections per client UUID)
-├── model.rs             # InternalMessage, ProviderKind, EventKind, WsInbound/WsOutbound
+├── model.rs             # IncomingMessage, ProviderKind, EventKind, WsInbound/WsOutbound
 ├── handler.rs           # Axum request handlers + WebSocket handler
 ├── routes.rs            # Router assembly
 └── provider/

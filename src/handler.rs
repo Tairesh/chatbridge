@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use crate::config::AppState;
 use crate::error::WebhookError;
-use crate::model::{InternalMessage, ProviderKind, WsInbound, WsOutbound};
+use crate::model::{EventKind, IncomingMessage, ProviderKind, WsInbound, WsOutbound};
 use crate::provider::WebhookProvider;
 use crate::provider::instagram::InstagramProvider;
 use crate::provider::telegram::{self, TelegramProvider};
@@ -73,29 +73,29 @@ async fn process_text_message(
     };
 
     let now = chrono::Utc::now().timestamp();
+    let event_kind: EventKind = inbound.action.into();
+    let text = match event_kind {
+        EventKind::Message | EventKind::Edit => Some(inbound.text.clone()),
+        _ => None,
+    };
 
-    let internal = InternalMessage {
-        message_id: format!("widget:{}", inbound.mid),
+    let msg = IncomingMessage {
+        id: Uuid::new_v4(),
+        external_message_id: format!("widget:{}", inbound.mid),
         channel_id,
-        client_id: Some(client_id),
+        sender_id: Some(client_id),
         provider: ProviderKind::Widget,
-        event: inbound.action.into(),
+        event: event_kind,
+        text,
         timestamp: now,
         raw: serde_json::to_value(&inbound).unwrap_or_default(),
     };
 
-    tracing::info!(
-        message_id = %internal.message_id,
-        channel_id = %channel_id,
-        client_id = %client_id,
-        event = ?internal.event,
-        raw_data = ?internal.raw,
-        "processed widget event"
-    );
+    tracing::info!(message = ?msg, "processed incoming message");
 
     let redis_channel = format!("widget:{channel_id}");
     let payload =
-        serde_json::to_string(&internal).expect("InternalMessage serialization cannot fail");
+        serde_json::to_string(&msg).expect("IncomingMessage serialization cannot fail");
     if let Err(e) = redis.publish::<_, _, ()>(&redis_channel, &payload).await {
         tracing::error!("redis publish failed: {e}");
     }
@@ -182,16 +182,9 @@ pub async fn instagram_ingest(
             match provider.parse(&body, &db, redis.clone()).await {
                 Ok(messages) => {
                     for msg in &messages {
-                        tracing::info!(
-                            message_id = %msg.message_id,
-                            channel_id = %msg.channel_id,
-                            client_id = ?msg.client_id,
-                            event = ?msg.event,
-                            raw_data = ?msg.raw,
-                            "processed instagram event"
-                        );
+                        tracing::info!(message = ?msg, "processed incoming message");
                         let payload = serde_json::to_string(msg)
-                            .expect("InternalMessage serialization cannot fail");
+                            .expect("IncomingMessage serialization cannot fail");
                         let channel = format!("instagram:{}", msg.channel_id);
                         if let Err(e) = redis.publish::<_, _, ()>(&channel, &payload).await {
                             tracing::error!("redis publish failed: {e}");
@@ -232,16 +225,9 @@ pub async fn telegram_ingest(
             match provider.parse(&body, &db, redis.clone()).await {
                 Ok(messages) => {
                     for msg in &messages {
-                        tracing::info!(
-                            message_id = %msg.message_id,
-                            channel_id = %msg.channel_id,
-                            client_id = ?msg.client_id,
-                            event = ?msg.event,
-                            raw_data = ?msg.raw,
-                            "processed telegram event"
-                        );
+                        tracing::info!(message = ?msg, "processed incoming message");
                         let payload = serde_json::to_string(msg)
-                            .expect("InternalMessage serialization cannot fail");
+                            .expect("IncomingMessage serialization cannot fail");
                         let channel = format!("telegram:{}", msg.channel_id);
                         if let Err(e) = redis.publish::<_, _, ()>(&channel, &payload).await {
                             tracing::error!("redis publish failed: {e}");

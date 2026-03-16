@@ -42,7 +42,7 @@ Multi-provider chat bridge for Instagram, Telegram, and WebSocket chat widgets, 
 - `config.rs` — `AppConfig` (from env vars) and `AppState` (config + PgPool + Redis + ChannelCache + ClientCache + ClientRegistry + shutdown token). `AppState` does NOT derive `Clone` — it's always behind `Arc<AppState>`
 - `db.rs` — Pool init, migrations, channel lookup queries, `Client` struct, `upsert_client`, `find_client_by_external_id`. `InstagramChannel` includes `access_token`
 - `error.rs` — `WebhookError` enum with `IntoResponse` (database errors are logged but not leaked to clients)
-- `model.rs` — `InternalMessage` (with optional `client_id`), `ProviderKind`, `EventKind`, `WsInbound`, `WsActionKind` (`send`/`edit`/`read`), `WsOutbound` (`Auth`/`Ack`/`Error`)
+- `model.rs` — `IncomingMessage` (with `id`, `external_message_id`, `sender_id`, `text`), `ProviderKind`, `EventKind`, `WsInbound`, `WsActionKind` (`send`/`edit`/`read`), `WsOutbound` (`Auth`/`Ack`/`Error`)
 - `provider/mod.rs` — `WebhookProvider` trait (verify + parse). `parse` takes `redis: ConnectionManager` for cache invalidation publishing
 - `provider/instagram.rs` — Constant-time HMAC-SHA256 verification, Meta webhook payload parsing, client resolution via Instagram Graph API (background `tokio::spawn` with 24h staleness check)
 - `provider/telegram.rs` — Secret token verification, Telegram Update parsing, `TelegramUser` struct, `resolve_telegram_client` (cache lookup → 24h staleness → background upsert, same pattern as Instagram)
@@ -63,7 +63,7 @@ Multi-provider chat bridge for Instagram, Telegram, and WebSocket chat widgets, 
 1. Extract headers + raw body
 2. `provider.verify(headers, body)` → 403 if invalid (Instagram uses constant-time HMAC via `verify_slice`)
 3. Return 200 OK immediately
-4. `tokio::spawn` (instrumented with tracing spans) → parse payload, lookup channel via in-memory cache (read-through to DB on miss), log `InternalMessage` to stdout, publish to Redis (`instagram:{channel_id}` / `telegram:{channel_id}`)
+4. `tokio::spawn` (instrumented with tracing spans) → parse payload, lookup channel via in-memory cache (read-through to DB on miss), log `IncomingMessage` to stdout, publish to Redis (`instagram:{channel_id}` / `telegram:{channel_id}`)
 
 ### Handler Flow (WebSocket widget)
 

@@ -18,12 +18,14 @@ pub enum EventKind {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct InternalMessage {
-    pub message_id: String,
+pub struct IncomingMessage {
+    pub id: Uuid,
+    pub external_message_id: String,
     pub channel_id: Uuid,
-    pub client_id: Option<Uuid>,
+    pub sender_id: Option<Uuid>,
     pub provider: ProviderKind,
     pub event: EventKind,
+    pub text: Option<String>,
     pub timestamp: i64,
     pub raw: serde_json::Value,
 }

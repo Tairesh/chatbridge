@@ -1373,7 +1373,7 @@ async fn ws_redis_message_includes_client_id() {
 
     let payload: String = redis_msg.get_payload().unwrap();
     let internal: serde_json::Value = serde_json::from_str(&payload).unwrap();
-    assert_eq!(internal["client_id"], client_id.to_string());
+    assert_eq!(internal["sender_id"], client_id.to_string());
 
     ws.close(None).await.unwrap();
 }

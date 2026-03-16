@@ -2,7 +2,7 @@ use axum::http::HeaderMap;
 use sqlx::PgPool;
 
 use crate::error::WebhookError;
-use crate::model::InternalMessage;
+use crate::model::IncomingMessage;
 
 pub mod instagram;
 pub mod telegram;
@@ -15,5 +15,5 @@ pub trait WebhookProvider: Send + Sync {
         body: &[u8],
         db: &PgPool,
         redis: redis::aio::ConnectionManager,
-    ) -> impl std::future::Future<Output = Result<Vec<InternalMessage>, WebhookError>> + Send;
+    ) -> impl std::future::Future<Output = Result<Vec<IncomingMessage>, WebhookError>> + Send;
 }
