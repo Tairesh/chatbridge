@@ -98,6 +98,7 @@ impl WebhookProvider for TelegramProvider {
             external_message_id: format!("telegram:{message_id}"),
             channel_id: self.channel_id,
             sender_id: client_id,
+            sender_type: "client".into(),
             provider: ProviderKind::Telegram,
             event: event_kind,
             text,

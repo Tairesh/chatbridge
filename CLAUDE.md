@@ -29,7 +29,7 @@ Required at runtime:
 - `INSTAGRAM_APP_SECRET` — HMAC-SHA256 secret for Instagram payload signature validation
 - `DATABASE_URL` — Postgres connection string (e.g. `postgres://chatbridge:chatbridge@localhost:5432/chatbridge`)
 - `REDIS_URL` — Redis connection string (e.g. `redis://localhost:6379`)
-- `WIDGET_JWT_SECRET` — HMAC-SHA256 secret for signing/verifying WebSocket widget JWTs
+- `WIDGET_JWT_SECRET` — HMAC-SHA256 secret for signing/verifying WebSocket JWTs (used for both widget clients and operators)
 
 
 ## Project Overview
@@ -38,17 +38,17 @@ Multi-provider chat bridge for Instagram, Telegram, and WebSocket chat widgets, 
 
 ### Module Structure
 
-- `cache.rs` — `ChannelCache` (in-memory read-through for channel lookups) + `ClientCache` (in-memory read-through for client lookups by `(ProviderKind, external_id)`), both invalidated via Redis Pub/Sub. Also: `publish_invalidation` helper, `spawn_invalidation_listener`
+- `cache.rs` — `ChannelCache`, `ClientCache`, `OperatorCache`, `ChatCache` — all in-memory read-through, invalidated via Redis Pub/Sub. Also: `publish_invalidation` helper, `spawn_invalidation_listener`
 - `jwt.rs` — HS256 JWT sign/verify for WebSocket widget client identity (`Claims { sub, iat }`)
-- `registry.rs` — `ClientRegistry` (tracks active WS connections per client UUID via `RwLock<HashMap<Uuid, HashSet<u64>>>`)
-- `config.rs` — `AppConfig` (from env vars) and `AppState` (config + PgPool + Redis + ChannelCache + ClientCache + ClientRegistry + shutdown token). `AppState` does NOT derive `Clone` — it's always behind `Arc<AppState>`
-- `db.rs` — Pool init, migrations, channel lookup queries, `Client` struct, `upsert_client`, `find_client_by_external_id`, `find_or_create_chat`, `insert_message` (with dedup), `edit_message`, `mark_messages_read` (watermark). `InstagramChannel` includes `access_token`
+- `registry.rs` — `ClientRegistry` (tracks active WS connections per client/operator UUID via `RwLock<HashMap<Uuid, HashMap<u64, mpsc::Sender<String>>>>` + `operator_ids: HashSet<Uuid>`)
+- `config.rs` — `AppConfig` (from env vars) and `AppState` (config + PgPool + Redis + ChannelCache + ClientCache + OperatorCache + ChatCache + ClientRegistry + shutdown token). `AppState` does NOT derive `Clone` — it's always behind `Arc<AppState>`
+- `db.rs` — Pool init, migrations, channel lookup queries, `Client`/`Operator`/`ChatInfo`/`ChatSummary`/`ChatMessage` structs, `upsert_client`, `find_client_by_external_id`, `find_or_create_chat`, `insert_message` (with dedup), `edit_message`, `mark_messages_read` (watermark), `mark_messages_read_by_id` (by UUID). `InstagramChannel` includes `access_token`
 - `error.rs` — `WebhookError` enum with `IntoResponse` (database errors are logged but not leaked to clients)
-- `model.rs` — `NewMessage` (pre-insert), `IncomingMessage` (post-insert new message), `IncomingEdit`, `IncomingRead`, `IncomingEvent` (tagged enum for Redis: `message`/`edit`/`read`), `ProviderKind`, `EventKind`, `WsInbound`, `WsActionKind` (`send`/`edit`/`read`), `WsOutbound` (`Auth`/`Ack`/`Error`)
+- `model.rs` — `Sender`, `NewMessage` (pre-insert), `IncomingMessage`/`IncomingEdit`/`IncomingRead` (post-insert), `IncomingEvent` (tagged enum for Redis: `message`/`edit`/`read`), `ProviderKind`, `EventKind`, `WsInbound`, `OperatorInbound`, `WsActionKind` (`send`/`edit`/`read`), `WsOutbound` (`Auth`/`Ack`/`Error`)
 - `provider/mod.rs` — `WebhookProvider` trait (verify + parse). `parse` takes `redis: ConnectionManager` for cache invalidation publishing
 - `provider/instagram.rs` — Constant-time HMAC-SHA256 verification, Meta webhook payload parsing, client resolution via Instagram Graph API (background `tokio::spawn` with 24h staleness check)
 - `provider/telegram.rs` — Secret token verification, Telegram Update parsing, `TelegramUser` struct, `resolve_telegram_client` (cache lookup → 24h staleness → background upsert, same pattern as Instagram)
-- `handler.rs` — Axum handlers (`meta_verify`, `instagram_ingest`, `telegram_ingest`, `widget_ws`)
+- `handler.rs` — Axum handlers (`meta_verify`, `instagram_ingest`, `telegram_ingest`, `widget_ws`, `operator_ws`, `get_chats`, `get_chat_messages`), `spawn_message_listener` (shared Redis listener for dispatching events to WS clients). In read events (`IncomingRead`), `sender` = original message author (not the reader). The shared listener uses this for routing: if sender matches chat's client → deliver to client; otherwise → deliver to operators
 - `routes.rs` — Router assembly
 
 ### Routes
@@ -59,6 +59,9 @@ Multi-provider chat bridge for Instagram, Telegram, and WebSocket chat widgets, 
 | POST | `/webhook/instagram` | `instagram_ingest` | HMAC via `INSTAGRAM_APP_SECRET`, channel lookup by sender/recipient ID |
 | POST | `/webhook/telegram/{channel_id}` | `telegram_ingest` | Secret token from DB by channel UUID |
 | GET | `/ws/{widget_id}` | `widget_ws` | WebSocket upgrade, validates widget_id against DB, publishes to Redis |
+| GET | `/api/chats` | `get_chats` | List active chats with last message summary |
+| GET | `/api/chats/{chat_id}` | `get_chat_messages` | Chat message history |
+| GET | `/ws/operator` | `operator_ws` | Operator WebSocket, JWT auth via `?token=` query param |
 
 ### Handler Flow (HTTP webhooks)
 
@@ -84,13 +87,15 @@ Channel and client data is cached in-memory (`ChannelCache` and `ClientCache` in
 ```
 PUBLISH cache_invalidation "channel:<uuid>"
 PUBLISH cache_invalidation "client:<uuid>"
+PUBLISH cache_invalidation "operator:<uuid>"
+PUBLISH cache_invalidation "chat:<uuid>"
 ```
 
 A background task (`spawn_invalidation_listener`) subscribes to the `cache_invalidation` topic and dispatches by entity type (`channel` → `ChannelCache`, `client` → `ClientCache`). All replicas receive the event and update their local cache. Providers call `publish_invalidation` after every `upsert_client`.
 
 ### Database
 
-Tables: `channels`, `instagram_channels`, `telegram_channels`, `widget_channels`, `clients`, `chats`, `messages`. The `channels` table is the unified parent — provider-specific tables have FK to `channels(id)`. `chats` tracks active conversations per `(client_id, channel_id)` with partial unique index. `messages` stores all persisted incoming messages. Migrations in `migrations/`. Schema managed by sqlx with auto-run on startup.
+Tables: `channels`, `instagram_channels`, `telegram_channels`, `widget_channels`, `clients`, `operators`, `chats`, `messages`. The `channels` table is the unified parent — provider-specific tables have FK to `channels(id)`. `chats` tracks active conversations per `(client_id, channel_id)` with partial unique index. `messages` stores all persisted incoming messages. Migrations in `migrations/`. Schema managed by sqlx with auto-run on startup.
 
 ### Docker
 

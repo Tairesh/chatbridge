@@ -2,7 +2,9 @@ services:
   nginx:
     image: nginx:alpine
     ports: ["80:80"]
-    volumes: ["./docker/nginx.conf:/etc/nginx/conf.d/default.conf:ro"]
+    volumes:
+      - ./docker/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./frontend:/usr/share/nginx/html/frontend:ro
     depends_on:
       chatbridge: { condition: service_healthy }
 

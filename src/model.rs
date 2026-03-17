@@ -17,32 +17,46 @@ pub enum EventKind {
     Unknown,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Sender {
+    pub id: Uuid,
+    #[serde(rename = "type")]
+    pub sender_type: String,
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IncomingMessage {
     pub id: Uuid,
     pub external_message_id: String,
     pub channel_id: Uuid,
     pub chat_id: Option<Uuid>,
-    pub sender_id: Option<Uuid>,
     pub text: Option<String>,
     pub status: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    pub sender: Sender,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IncomingEdit {
     pub id: Uuid,
     pub external_message_id: String,
     pub channel_id: Uuid,
+    pub chat_id: Option<Uuid>,
     pub text: Option<String>,
     pub edited_at: chrono::DateTime<chrono::Utc>,
+    pub sender: Sender,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IncomingRead {
     pub id: Uuid,
     pub external_message_id: String,
     pub channel_id: Uuid,
+    pub chat_id: Option<Uuid>,
+    pub sender: Sender,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,11 +67,30 @@ pub enum IncomingEvent {
     Read(IncomingRead),
 }
 
+impl IncomingEvent {
+    pub fn sender_id(&self) -> Uuid {
+        match self {
+            IncomingEvent::Message(m) => m.sender.id,
+            IncomingEvent::Edit(e) => e.sender.id,
+            IncomingEvent::Read(r) => r.sender.id,
+        }
+    }
+
+    pub fn chat_id(&self) -> Option<Uuid> {
+        match self {
+            IncomingEvent::Message(m) => m.chat_id,
+            IncomingEvent::Edit(e) => e.chat_id,
+            IncomingEvent::Read(r) => r.chat_id,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct NewMessage {
     pub external_message_id: String,
     pub channel_id: Uuid,
     pub sender_id: Option<Uuid>,
+    pub sender_type: String,
     pub provider: ProviderKind,
     pub event: EventKind,
     pub text: Option<String>,
@@ -90,7 +123,7 @@ impl std::fmt::Display for EventKind {
 pub struct WsInbound {
     pub action: WsActionKind,
     pub mid: Uuid,
-    pub text: String,
+    pub text: Option<String>,
     #[serde(default)]
     pub attachments: Vec<Uuid>,
 }
@@ -116,9 +149,25 @@ impl From<WsActionKind> for EventKind {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum WsOutbound {
-    Auth { token: String },
-    Ack { message_id: Uuid },
-    Error { reason: String },
+    Auth {
+        token: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        operator_id: Option<Uuid>,
+    },
+    Ack {
+        message_id: Uuid,
+    },
+    Error {
+        reason: String,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct OperatorInbound {
+    pub action: WsActionKind,
+    pub chat_id: Uuid,
+    pub mid: String,
+    pub text: Option<String>,
 }
 
 #[cfg(test)]
@@ -135,7 +184,7 @@ mod tests {
         let msg: WsInbound = serde_json::from_str(&json).unwrap();
         assert_eq!(msg.action, WsActionKind::Send);
         assert_eq!(msg.mid.to_string(), TEST_UUID);
-        assert_eq!(msg.text, "Hello");
+        assert_eq!(msg.text, Some("Hello".into()));
         assert_eq!(msg.attachments.len(), 1);
     }
 
@@ -144,7 +193,7 @@ mod tests {
         let json = format!(r#"{{"action": "send", "mid": "{TEST_UUID}", "text": "Hello"}}"#);
         let msg: WsInbound = serde_json::from_str(&json).unwrap();
         assert_eq!(msg.action, WsActionKind::Send);
-        assert_eq!(msg.text, "Hello");
+        assert_eq!(msg.text, Some("Hello".into()));
         assert!(msg.attachments.is_empty());
     }
 
@@ -154,7 +203,15 @@ mod tests {
         let msg: WsInbound = serde_json::from_str(&json).unwrap();
         assert_eq!(msg.action, WsActionKind::Edit);
         assert_eq!(msg.mid.to_string(), TEST_UUID);
-        assert_eq!(msg.text, "Updated");
+        assert_eq!(msg.text, Some("Updated".into()));
+    }
+
+    #[test]
+    fn ws_inbound_deserialize_read_no_text() {
+        let json = format!(r#"{{"action": "read", "mid": "{TEST_UUID}"}}"#);
+        let msg: WsInbound = serde_json::from_str(&json).unwrap();
+        assert_eq!(msg.action, WsActionKind::Read);
+        assert_eq!(msg.text, None);
     }
 
     #[test]
@@ -187,10 +244,24 @@ mod tests {
     fn ws_outbound_auth_serializes_correctly() {
         let msg = WsOutbound::Auth {
             token: "eyJ.test.token".into(),
+            operator_id: None,
         };
         let json = serde_json::to_value(&msg).unwrap();
         assert_eq!(json["action"], "auth");
         assert_eq!(json["token"], "eyJ.test.token");
+        assert!(json.get("operator_id").is_none());
+    }
+
+    #[test]
+    fn ws_outbound_auth_with_operator_id() {
+        let op_id: Uuid = TEST_UUID.parse().unwrap();
+        let msg = WsOutbound::Auth {
+            token: "eyJ.test.token".into(),
+            operator_id: Some(op_id),
+        };
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json["action"], "auth");
+        assert_eq!(json["operator_id"], TEST_UUID);
     }
 
     #[test]
@@ -215,5 +286,75 @@ mod tests {
     #[test]
     fn provider_kind_widget_display() {
         assert_eq!(ProviderKind::Widget.to_string(), "widget");
+    }
+
+    #[test]
+    fn sender_serializes_operator() {
+        let sender = Sender {
+            id: TEST_UUID.parse().unwrap(),
+            sender_type: "operator".into(),
+            name: Some("Alice".into()),
+            username: None,
+        };
+        let json = serde_json::to_value(&sender).unwrap();
+        assert_eq!(json["id"], TEST_UUID);
+        assert_eq!(json["type"], "operator");
+        assert_eq!(json["name"], "Alice");
+        assert!(json.get("username").is_none());
+    }
+
+    #[test]
+    fn sender_serializes_client_with_username() {
+        let sender = Sender {
+            id: TEST_UUID.parse().unwrap(),
+            sender_type: "client".into(),
+            name: Some("John".into()),
+            username: Some("john123".into()),
+        };
+        let json = serde_json::to_value(&sender).unwrap();
+        assert_eq!(json["type"], "client");
+        assert_eq!(json["username"], "john123");
+    }
+
+    #[test]
+    fn incoming_message_with_sender_serializes() {
+        let event = IncomingEvent::Message(IncomingMessage {
+            id: TEST_UUID.parse().unwrap(),
+            external_message_id: "widget:123".into(),
+            channel_id: TEST_UUID.parse().unwrap(),
+            chat_id: Some(TEST_UUID.parse().unwrap()),
+            text: Some("hello".into()),
+            status: "new".into(),
+            created_at: chrono::Utc::now(),
+            sender: Sender {
+                id: TEST_UUID.parse().unwrap(),
+                sender_type: "client".into(),
+                name: Some("John".into()),
+                username: None,
+            },
+        });
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["type"], "message");
+        assert_eq!(json["sender"]["type"], "client");
+        assert!(json.get("sender_id").is_none());
+    }
+
+    #[test]
+    fn operator_inbound_deserialize_send() {
+        let json = format!(
+            r#"{{"action": "send", "chat_id": "{TEST_UUID}", "mid": "{TEST_UUID}", "text": "hello"}}"#
+        );
+        let msg: OperatorInbound = serde_json::from_str(&json).unwrap();
+        assert_eq!(msg.action, WsActionKind::Send);
+        assert_eq!(msg.text, Some("hello".into()));
+    }
+
+    #[test]
+    fn operator_inbound_deserialize_read_no_text() {
+        let json =
+            format!(r#"{{"action": "read", "chat_id": "{TEST_UUID}", "mid": "{TEST_UUID}"}}"#);
+        let msg: OperatorInbound = serde_json::from_str(&json).unwrap();
+        assert_eq!(msg.action, WsActionKind::Read);
+        assert_eq!(msg.text, None);
     }
 }

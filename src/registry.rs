@@ -2,15 +2,13 @@ use std::collections::{HashMap, HashSet};
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use tokio::sync::mpsc;
 use uuid::Uuid;
-
-// Note: The spec shows `mpsc::Sender<WsOutbound>` in the inner map for future outbound
-// delivery. We use `HashSet<u64>` for now since outbound delivery is out of scope.
-// When outbound delivery is added, the inner type will change to store senders.
 
 pub struct ClientRegistry {
     next_id: AtomicU64,
-    connections: RwLock<HashMap<Uuid, HashSet<u64>>>,
+    connections: RwLock<HashMap<Uuid, HashMap<u64, mpsc::Sender<String>>>>,
+    operator_ids: RwLock<HashSet<Uuid>>,
 }
 
 impl Default for ClientRegistry {
@@ -24,33 +22,56 @@ impl ClientRegistry {
         Self {
             next_id: AtomicU64::new(1),
             connections: RwLock::new(HashMap::new()),
+            operator_ids: RwLock::new(HashSet::new()),
         }
     }
 
-    /// Register a connection for a client. Returns the connection ID.
-    pub fn register(&self, client_id: Uuid) -> u64 {
+    /// Register a connection. Returns (conn_id, receiver).
+    /// If `is_operator`, the id is also added to the operator set.
+    pub fn register(&self, id: Uuid, is_operator: bool) -> (u64, mpsc::Receiver<String>) {
         let conn_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = mpsc::channel(64);
         self.connections
             .write()
             .unwrap()
-            .entry(client_id)
+            .entry(id)
             .or_default()
-            .insert(conn_id);
-        conn_id
+            .insert(conn_id, tx);
+        if is_operator {
+            self.operator_ids.write().unwrap().insert(id);
+        }
+        (conn_id, rx)
     }
 
-    /// Deregister a connection. Removes the client entry if no connections remain.
-    pub fn deregister(&self, client_id: Uuid, conn_id: u64) {
+    /// Deregister a connection. Removes id from operator set if last connection.
+    pub fn deregister(&self, id: Uuid, conn_id: u64) {
         let mut map = self.connections.write().unwrap();
-        if let Some(conns) = map.get_mut(&client_id) {
+        if let Some(conns) = map.get_mut(&id) {
             conns.remove(&conn_id);
             if conns.is_empty() {
-                map.remove(&client_id);
+                map.remove(&id);
+                self.operator_ids.write().unwrap().remove(&id);
             }
         }
     }
 
-    /// Total number of active connections across all clients.
+    /// Send a message to all connections for a given id.
+    pub fn send_to(&self, id: Uuid, payload: &str) {
+        let map = self.connections.read().unwrap();
+        if let Some(conns) = map.get(&id) {
+            for tx in conns.values() {
+                let _ = tx.try_send(payload.to_owned());
+            }
+        }
+    }
+
+    /// Snapshot of currently connected operator IDs.
+    pub fn operator_ids(&self) -> HashSet<Uuid> {
+        // TODO: use ref instead of clone?
+        self.operator_ids.read().unwrap().clone()
+    }
+
+    /// Total number of active connections across all ids.
     pub fn connection_count(&self) -> usize {
         self.connections
             .read()
@@ -66,20 +87,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn register_and_deregister() {
+    fn register_returns_receiver_and_increments_count() {
         let reg = ClientRegistry::new();
-        let client = Uuid::new_v4();
-
-        let conn1 = reg.register(client);
+        let id = Uuid::new_v4();
+        let (_conn_id, _rx) = reg.register(id, false);
         assert_eq!(reg.connection_count(), 1);
+    }
 
-        let conn2 = reg.register(client);
+    #[test]
+    fn deregister_decrements_count() {
+        let reg = ClientRegistry::new();
+        let id = Uuid::new_v4();
+        let (conn1, _rx1) = reg.register(id, false);
+        let (conn2, _rx2) = reg.register(id, false);
         assert_eq!(reg.connection_count(), 2);
-
-        reg.deregister(client, conn1);
+        reg.deregister(id, conn1);
         assert_eq!(reg.connection_count(), 1);
-
-        reg.deregister(client, conn2);
+        reg.deregister(id, conn2);
         assert_eq!(reg.connection_count(), 0);
     }
 
@@ -91,17 +115,50 @@ mod tests {
     }
 
     #[test]
-    fn multiple_clients() {
+    fn operator_ids_tracked() {
         let reg = ClientRegistry::new();
-        let a = Uuid::new_v4();
-        let b = Uuid::new_v4();
+        let op = Uuid::new_v4();
+        let (conn, _rx) = reg.register(op, true);
+        assert!(reg.operator_ids().contains(&op));
+        reg.deregister(op, conn);
+        assert!(!reg.operator_ids().contains(&op));
+    }
 
-        let a1 = reg.register(a);
-        let _b1 = reg.register(b);
-        let _a2 = reg.register(a);
-        assert_eq!(reg.connection_count(), 3);
+    #[test]
+    fn send_to_delivers_message() {
+        let reg = ClientRegistry::new();
+        let id = Uuid::new_v4();
+        let (_conn, mut rx) = reg.register(id, false);
+        reg.send_to(id, r#"{"test":true}"#);
+        assert_eq!(rx.try_recv().unwrap(), r#"{"test":true}"#);
+    }
 
-        reg.deregister(a, a1);
-        assert_eq!(reg.connection_count(), 2);
+    #[test]
+    fn send_to_unknown_id_is_noop() {
+        let reg = ClientRegistry::new();
+        reg.send_to(Uuid::new_v4(), "msg"); // should not panic
+    }
+
+    #[test]
+    fn send_to_fans_out_to_multiple_connections() {
+        let reg = ClientRegistry::new();
+        let id = Uuid::new_v4();
+        let (_c1, mut rx1) = reg.register(id, false);
+        let (_c2, mut rx2) = reg.register(id, false);
+        reg.send_to(id, "hello");
+        assert_eq!(rx1.try_recv().unwrap(), "hello");
+        assert_eq!(rx2.try_recv().unwrap(), "hello");
+    }
+
+    #[test]
+    fn operator_removed_from_set_only_when_last_connection_drops() {
+        let reg = ClientRegistry::new();
+        let op = Uuid::new_v4();
+        let (c1, _rx1) = reg.register(op, true);
+        let (c2, _rx2) = reg.register(op, true);
+        reg.deregister(op, c1);
+        assert!(reg.operator_ids().contains(&op));
+        reg.deregister(op, c2);
+        assert!(!reg.operator_ids().contains(&op));
     }
 }

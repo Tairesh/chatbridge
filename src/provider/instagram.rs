@@ -119,6 +119,7 @@ impl WebhookProvider for InstagramProvider {
                     external_message_id,
                     channel_id: channel.id,
                     sender_id: client_id,
+                    sender_type: "client".into(),
                     provider: ProviderKind::Instagram,
                     event: event_kind,
                     text,

@@ -4,7 +4,7 @@ use redis::aio::ConnectionManager;
 use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 
-use crate::cache::{ChannelCache, ClientCache};
+use crate::cache::{ChannelCache, ChatCache, ClientCache, OperatorCache};
 use crate::registry::ClientRegistry;
 
 pub struct AppState {
@@ -13,6 +13,8 @@ pub struct AppState {
     pub redis: ConnectionManager,
     pub cache: Arc<ChannelCache>,
     pub client_cache: Arc<ClientCache>,
+    pub operator_cache: Arc<OperatorCache>,
+    pub chat_cache: Arc<ChatCache>,
     pub registry: ClientRegistry,
     pub shutdown: CancellationToken,
 }

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use chatbridge::cache::{self, ChannelCache, ClientCache};
+use chatbridge::cache::{self, ChannelCache, ChatCache, ClientCache, OperatorCache};
 use chatbridge::config::{AppConfig, AppState};
 use chatbridge::registry::ClientRegistry;
 use chatbridge::{db, routes};
@@ -24,8 +24,16 @@ async fn main() {
 
     let cache = Arc::new(ChannelCache::new());
     let client_cache = Arc::new(ClientCache::new());
-    cache::spawn_invalidation_listener(&config.redis_url, cache.clone(), client_cache.clone())
-        .await;
+    let operator_cache = Arc::new(OperatorCache::new());
+    let chat_cache = Arc::new(ChatCache::new());
+    cache::spawn_invalidation_listener(
+        &config.redis_url,
+        cache.clone(),
+        client_cache.clone(),
+        operator_cache.clone(),
+        chat_cache.clone(),
+    )
+    .await;
 
     let shutdown = CancellationToken::new();
     let state = Arc::new(AppState {
@@ -34,9 +42,12 @@ async fn main() {
         redis,
         cache,
         client_cache,
+        operator_cache,
+        chat_cache,
         registry: ClientRegistry::new(),
         shutdown,
     });
+    chatbridge::handler::spawn_message_listener(state.clone()).await;
     let app = routes::build(state.clone());
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3800").await.unwrap();

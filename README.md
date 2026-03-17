@@ -2,67 +2,97 @@
 
 [![CI](https://github.com/Tairesh/chatbridge/actions/workflows/ci.yml/badge.svg)](https://github.com/Tairesh/chatbridge/actions/workflows/ci.yml)
 
-Multi-provider chat bridge for **Instagram**, **Telegram**, and **WebSocket chat widgets**, built with Rust, Axum, PostgreSQL, and Redis.
+Multi-provider chat bridge for **Instagram**, **Telegram**, and **WebSocket chat widgets** with **operator dashboard**, built with Rust, Axum, PostgreSQL, and Redis. Supports bidirectional messaging between operators and clients across all providers.
 
 ## Event Flow
 
 ```
-                         ┌─────────────────────────────────────┐
-                         │          Chatbridge Server           │
-                         │              :3800                  │
-                         │                                     │
-  Instagram/Meta ──POST──▶ /webhook/instagram                  │
-                         │   │                                 │
-                         │   ├─ Verify HMAC-SHA256 signature   │
-                         │   │  (X-Hub-Signature-256 header)   │
-                         │   │                                 │
-                         │   ├─ Return 200 OK ◀── immediate    │
-                         │   │                                 │
-                         │   └─ Background: parse payload      │
-                         │      ├─ Match sender/recipient ID   │
-                         │      │  (in-memory cache → DB)      │
-                         │      ├─ Resolve client identity     │
-                         │      │  (DB lookup + Graph API bg)  │
-                         │      ├─ Persist → Postgres messages │
+                         ┌──────────────────────────────────────────┐
+                         │           Chatbridge Server               │
+                         │               :3800                      │
+                         │                                          │
+  Instagram/Meta ──POST──▶ /webhook/instagram                       │
+                         │   │                                      │
+                         │   ├─ Verify HMAC-SHA256 signature        │
+                         │   │  (X-Hub-Signature-256 header)        │
+                         │   │                                      │
+                         │   ├─ Return 200 OK ◀── immediate         │
+                         │   │                                      │
+                         │   └─ Background: parse payload           │
+                         │      ├─ Match sender/recipient ID        │
+                         │      │  (in-memory cache → DB)           │
+                         │      ├─ Resolve client identity          │
+                         │      │  (DB lookup + Graph API bg)       │
+                         │      ├─ Persist → Postgres messages      │
                          │      └─ Publish ──▶ Redis incoming_messages
-                         │                                     │
-    Telegram ────POST────▶ /webhook/telegram/{channel_id}      │
-                         │   │                                 │
-                         │   ├─ Lookup bot_secret by UUID      │
-                         │   │  (in-memory cache → DB fallback)│
-                         │   │                                 │
-                         │   ├─ Verify secret token header     │
-                         │   │  (X-Telegram-Bot-Api-Secret-Token)
-                         │   │                                 │
-                         │   ├─ Return 200 OK ◀── immediate    │
-                         │   │                                 │
-                         │   └─ Background: parse Update       │
-                         │      ├─ Resolve client from `from`  │
-                         │      │  (cache → DB, 24h staleness) │
-                         │      ├─ Persist → Postgres messages │
+                         │                                          │
+    Telegram ────POST────▶ /webhook/telegram/{channel_id}           │
+                         │   │                                      │
+                         │   ├─ Lookup bot_secret by UUID           │
+                         │   │  (in-memory cache → DB fallback)     │
+                         │   │                                      │
+                         │   ├─ Verify secret token header          │
+                         │   │  (X-Telegram-Bot-Api-Secret-Token)   │
+                         │   │                                      │
+                         │   ├─ Return 200 OK ◀── immediate         │
+                         │   │                                      │
+                         │   └─ Background: parse Update            │
+                         │      ├─ Resolve client from `from`       │
+                         │      │  (cache → DB, 24h staleness)      │
+                         │      ├─ Persist → Postgres messages      │
                          │      └─ Publish ──▶ Redis incoming_messages
-                         │                                     │
-  Widget Client ───WS────▶ /ws/{widget_id}                     │
-                         │   │                                 │
-                         │   ├─ Lookup widget_id               │
-                         │   │  (in-memory cache → DB)         │
-                         │   ├─ Upgrade to WebSocket           │
-                         │   │                                 │
-                         │   ├─ Track connection (AtomicUsize) │
-                         │   │                                 │
-                         │   └─ Message loop (select!):        │
-                         │      ├─ 5min idle → ping/pong       │
-                         │      ├─ Shutdown → close frame      │
-                         │      ├─ Parse JSON action message    │
-                         │      │  (send / edit)                │
-                         │      ├─ Persist → Postgres messages │
+                         │                                          │
+  Widget Client ───WS────▶ /ws/{widget_id}                          │
+                         │   │                                      │
+                         │   ├─ Lookup widget_id                    │
+                         │   │  (in-memory cache → DB)              │
+                         │   ├─ Upgrade to WebSocket                │
+                         │   ├─ JWT auth (issue or verify)          │
+                         │   ├─ Register in ClientRegistry (mpsc)   │
+                         │   │                                      │
+                         │   └─ Message loop (select!):             │
+                         │      ├─ Receive from registry → forward  │
+                         │      ├─ 5min idle → ping/pong            │
+                         │      ├─ Shutdown → close frame           │
+                         │      ├─ Parse JSON action                │
+                         │      │  (send / edit / read)             │
+                         │      ├─ Persist → Postgres messages      │
                          │      ├─ Publish ──▶ Redis incoming_messages
-                         │      └─ Send ACK ──▶ client (5s timeout)
-                         │                                     │
-  Instagram/Meta ──GET───▶ /webhook/instagram                  │
-                         │   └─ Subscription verification      │
-                         │      (hub.challenge handshake)      │
-                         └───────┬─────────────────┬───────────┘
+                         │      └─ Send ACK ──▶ client (5s timeout) │
+                         │                                          │
+    Operator ──────WS────▶ /ws/operator                             │
+                         │   │                                      │
+                         │   ├─ JWT auth (issue or verify)          │
+                         │   ├─ Register in ClientRegistry (mpsc)   │
+                         │   │                                      │
+                         │   └─ Message loop (select!):             │
+                         │      ├─ Receive from registry → forward  │
+                         │      ├─ 5min idle → ping/pong            │
+                         │      ├─ Shutdown → close frame           │
+                         │      ├─ Parse JSON action                │
+                         │      │  {action, chat_id, mid, text}     │
+                         │      ├─ Persist → Postgres messages      │
+                         │      ├─ Publish ──▶ Redis incoming_messages
+                         │      └─ Send ACK ──▶ operator            │
+                         │                                          │
+    Operator ──────GET───▶ /api/chats                               │
+                         │   └─ List active chats with summaries    │
+                         │                                          │
+    Operator ──────GET───▶ /api/chats/{chat_id}                     │
+                         │   └─ Chat message history                │
+                         │                                          │
+  Instagram/Meta ──GET───▶ /webhook/instagram                       │
+                         │   └─ Subscription verification           │
+                         │      (hub.challenge handshake)           │
+                         │                                          │
+                         │  ┌─ Shared Redis Listener ─────────────┐ │
+                         │  │ Subscribe: incoming_messages        │ │
+                         │  │ On event:                           │ │
+                         │  │  ├─ Resolve chat → client_id        │ │
+                         │  │  ├─ Send to client (if not sender)  │ │
+                         │  │  └─ Send to operators (skip sender) │ │
+                         │  └─────────────────────────────────────┘ │
+                         └───────┬─────────────────┬────────────────┘
                                  │                 │
                             ┌────▼────┐      ┌─────▼─────┐
                             │ Postgres │      │   Redis   │
@@ -73,6 +103,7 @@ Multi-provider chat bridge for **Instagram**, **Telegram**, and **WebSocket chat
                          telegram_channels    cache_invalidation
                          widget_channels
                          clients
+                         operators
                          chats
                          messages
 ```
@@ -102,32 +133,34 @@ Chat resolution: if the sender exists in the `clients` table, `find_or_create_ch
 
 ### Caching
 
-Channel configuration and client data are cached in-memory to avoid a Postgres round-trip on every incoming webhook. Both `ChannelCache` and `ClientCache` use a read-through strategy: on a miss, query the database and store the result locally.
+Channel, client, operator, and chat data are cached in-memory (`ChannelCache`, `ClientCache`, `OperatorCache`, `ChatCache`) to avoid a Postgres round-trip on every incoming webhook/message. All caches use a read-through strategy: on a miss, query the database and store the result locally.
 
 When data is updated, publish an invalidation event to Redis so all replicas evict the stale entry:
 
 ```bash
-# Invalidate a specific channel or client
+# Invalidate a specific entity
 redis-cli PUBLISH cache_invalidation "channel:<uuid>"
 redis-cli PUBLISH cache_invalidation "client:<uuid>"
+redis-cli PUBLISH cache_invalidation "operator:<uuid>"
+redis-cli PUBLISH cache_invalidation "chat:<uuid>"
 ```
 
-Each replica runs a background listener on the `cache_invalidation` topic that dispatches by entity type (`channel` → `ChannelCache`, `client` → `ClientCache`). Providers automatically publish client invalidation after every `upsert_client`.
+Each replica runs a background listener on the `cache_invalidation` topic that dispatches by entity type. Providers automatically publish client invalidation after every `upsert_client`.
 
 ## Project Structure
 
 ```
 src/
-├── main.rs              # Entrypoint: load config, connect DB, start server, graceful shutdown with WS drain
+├── main.rs              # Entrypoint: load config, connect DB, start server, spawn shared listener, graceful shutdown
 ├── lib.rs               # Public module re-exports
-├── cache.rs             # In-memory channel + client caches with Redis Pub/Sub invalidation
-├── config.rs            # AppConfig (env vars) + AppState (config + DB pool + Redis + cache + registry + shutdown token)
-├── db.rs                # Postgres pool, migrations, channel queries, client identity upsert, chat resolution, message persistence
+├── cache.rs             # In-memory caches (channel, client, operator, chat) with Redis Pub/Sub invalidation
+├── config.rs            # AppConfig (env vars) + AppState (config + DB pool + Redis + caches + registry + shutdown token)
+├── db.rs                # Postgres pool, migrations, channel/client/operator/chat queries, message persistence
 ├── error.rs             # WebhookError → HTTP status mapping
-├── jwt.rs               # HS256 JWT sign/verify for WebSocket widget client identity
-├── registry.rs          # ClientRegistry (tracks active WS connections per client UUID)
-├── model.rs             # NewMessage, IncomingMessage, ProviderKind, EventKind, WsInbound/WsOutbound
-├── handler.rs           # Axum request handlers + WebSocket handler
+├── jwt.rs               # HS256 JWT sign/verify for WebSocket identity (widget clients + operators)
+├── registry.rs          # ClientRegistry (tracks active WS connections per client/operator UUID via mpsc channels)
+├── model.rs             # Sender, NewMessage, IncomingMessage/Edit/Read, ProviderKind, EventKind, WsInbound, OperatorInbound, WsOutbound
+├── handler.rs           # Axum handlers, widget/operator WS, shared Redis listener (spawn_message_listener)
 ├── routes.rs            # Router assembly
 └── provider/
     ├── mod.rs           # WebhookProvider trait (verify + parse)
@@ -138,8 +171,9 @@ docker/
 ├── Dockerfile           # Multi-stage build
 └── nginx.conf           # Nginx reverse proxy config
 
-widget/
-└── index.html           # Chat widget test page (WebSocket client)
+frontend/
+├── widget.html          # Chat widget test page (WebSocket client)
+└── operator.html        # Operator dashboard (WebSocket + REST API)
 
 migrations/              # SQL migrations (auto-run on startup)
 tests/
@@ -188,7 +222,7 @@ Migrations run automatically on startup.
 | `INSTAGRAM_APP_SECRET` | yes | — | HMAC-SHA256 secret for Instagram signature validation |
 | `DATABASE_URL` | yes | — | Postgres connection string |
 | `REDIS_URL` | yes | — | Redis connection string |
-| `WIDGET_JWT_SECRET` | yes | — | HMAC-SHA256 secret for WebSocket widget JWTs |
+| `WIDGET_JWT_SECRET` | yes | — | HMAC-SHA256 secret for WebSocket JWTs (widget clients + operators) |
 
 ## Testing
 
@@ -214,13 +248,16 @@ Integration tests cover:
 - Telegram POST ingestion (valid/invalid secret, unknown channel → 404)
 - WebSocket widget (connect, ACK, multiple messages, error recovery, unknown widget, invalid mid rejection)
 - WebSocket edit action (edit ACK, Redis edit event, unknown action error)
+- Operator WebSocket (connect, send message to widget client, edit reaches widget client)
+- Read receipt forwarding (widget read → operator, operator read → widget)
+- Operator REST API (list chats, chat messages, unknown chat → 404)
 - Redis pub/sub verification for all three providers
 - Client identity upsert (create, update, conflict handling)
 - Telegram client reuse (same client_id across messages from same user)
 - Channel cache (read-through, per-channel invalidation, Redis Pub/Sub eviction, cross-channel isolation)
 - Client cache invalidation via Redis Pub/Sub
 
-Test data cleanup uses RAII drop guards (`TestChannel`, `TestClient`, `TestChat`, `TestMessage`) in `tests/common/` to ensure rows are deleted even if a test panics.
+Test data cleanup uses RAII drop guards (`TestChannel`, `TestClient`, `TestChat`, `TestMessage`, `TestOperator`) in `tests/common/` to ensure rows are deleted even if a test panics.
 
 ### Linting
 

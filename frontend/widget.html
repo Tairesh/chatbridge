@@ -77,16 +77,37 @@
 
       ws.addEventListener('message', (event) => {
         const msg = JSON.parse(event.data);
-        switch (msg.action) {
-          case 'auth':
-            localStorage.setItem(TOKEN_KEY, msg.token);
-            break;
-          case 'ack':
-            handleAck(msg.message_id);
-            break;
-          case 'error':
-            addSystemMessage('Error: ' + msg.reason);
-            break;
+        // Handle action-based messages (auth, ack, error)
+        if (msg.action) {
+          switch (msg.action) {
+            case 'auth':
+              if (msg.token) localStorage.setItem(TOKEN_KEY, msg.token);
+              break;
+            case 'ack':
+              handleAck(msg.message_id);
+              break;
+            case 'error':
+              addSystemMessage('Error: ' + msg.reason);
+              break;
+          }
+          return;
+        }
+        // Handle type-based events (from operator via shared listener)
+        if (msg.type === 'message') {
+          appendInboundMessage(msg);
+          // Auto read receipt
+          if (msg.id) {
+            ws.send(JSON.stringify({ action: 'read', mid: msg.id }));
+          }
+          return;
+        }
+        if (msg.type === 'edit') {
+          updateInboundEdit(msg);
+          return;
+        }
+        if (msg.type === 'read') {
+          updateReadStatus(msg);
+          return;
         }
       });
 
@@ -217,6 +238,40 @@
       editingMid = null;
       const textSpan = entry.element.querySelector('.msg-text');
       textSpan.textContent = originalText;
+    }
+
+    function appendInboundMessage(event) {
+      const div = document.createElement('div');
+      div.className = 'message received';
+      div.dataset.externalId = event.external_message_id;
+      const senderName = event.sender && event.sender.name ? event.sender.name : 'Operator';
+      div.innerHTML = `
+        <div style="font-size:11px;font-weight:600;color:#6b7280;margin-bottom:2px">${escapeHtml(senderName)}</div>
+        <span class="msg-text">${escapeHtml(event.text || '')}</span>
+        <div class="msg-meta">
+          <span class="msg-edited" style="display:none">edited</span>
+          <span class="msg-time">${formatTime(new Date(event.created_at || Date.now()))}</span>
+        </div>
+      `;
+      messagesEl.appendChild(div);
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+    }
+
+    function updateInboundEdit(event) {
+      const el = messagesEl.querySelector(`[data-external-id="${event.external_message_id}"]`);
+      if (!el) return;
+      const textEl = el.querySelector('.msg-text');
+      if (textEl) textEl.textContent = event.text || '';
+      const editedSpan = el.querySelector('.msg-edited');
+      if (editedSpan) editedSpan.style.display = '';
+    }
+
+    function updateReadStatus(event) {
+      // Find the message by external_message_id and show read badge
+      const el = document.getElementById('msg-' + event.external_message_id?.replace('widget:', ''));
+      if (!el) return;
+      const statusSpan = el.querySelector('.msg-status');
+      if (statusSpan) statusSpan.innerHTML = '<span class="checkmark" style="color:rgba(255,255,255,0.8)">✓✓</span>';
     }
 
     function send() {

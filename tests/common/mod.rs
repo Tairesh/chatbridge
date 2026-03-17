@@ -103,6 +103,17 @@ impl Drop for TestMessage {
     }
 }
 
+/// RAII guard that deletes an operator row on drop.
+pub struct TestOperator {
+    pub id: Uuid,
+}
+
+impl Drop for TestOperator {
+    fn drop(&mut self) {
+        drop_delete("operators", self.id);
+    }
+}
+
 pub async fn setup_pool() -> PgPool {
     let url =
         std::env::var("DATABASE_URL").expect("DATABASE_URL must be set for integration tests");
