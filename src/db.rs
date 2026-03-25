@@ -85,14 +85,6 @@ pub async fn create_client(pool: &PgPool) -> Result<Uuid, sqlx::Error> {
     Ok(row.0)
 }
 
-pub async fn find_client_by_id(pool: &PgPool, client_id: Uuid) -> Result<bool, sqlx::Error> {
-    let row: Option<(Uuid,)> = sqlx::query_as("SELECT id FROM clients WHERE id = $1")
-        .bind(client_id)
-        .fetch_optional(pool)
-        .await?;
-    Ok(row.is_some())
-}
-
 #[derive(Debug, Clone, FromRow)]
 pub struct Client {
     pub id: Uuid,

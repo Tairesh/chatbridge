@@ -41,8 +41,9 @@ pub(crate) async fn resolve_sender(
             }
         }
         _ => {
-            // TODO: use cache
-            let client = crate::db::find_client_by_uuid(db, sender_id)
+            let client = state
+                .client_cache
+                .get_client_by_uuid(db, sender_id)
                 .await
                 .ok()
                 .flatten();
@@ -71,7 +72,15 @@ pub(crate) async fn persist_and_publish(
             } else {
                 // Client path: verify sender exists (FK safety), then find_or_create_chat
                 let verified_sender = match msg.sender_id {
-                    Some(id) if crate::db::find_client_by_id(db, id).await.unwrap_or(false) => {
+                    Some(id)
+                        if state
+                            .client_cache
+                            .get_client_by_uuid(db, id)
+                            .await
+                            .ok()
+                            .flatten()
+                            .is_some() =>
+                    {
                         Some(id)
                     }
                     _ => None,

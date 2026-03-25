@@ -153,7 +153,7 @@ Each replica runs a background listener on the `cache_invalidation` topic that d
 src/
 ├── main.rs              # Entrypoint: load config, connect DB, start server, spawn shared listener, graceful shutdown
 ├── lib.rs               # Public module re-exports
-├── cache.rs             # In-memory caches (channel, client, operator, chat) with Redis Pub/Sub invalidation
+├── cache.rs             # In-memory caches (channel, client, operator, chat) with Redis Pub/Sub invalidation; ClientCache dual-keyed by UUID + (provider, external_id)
 ├── config.rs            # AppConfig (env vars) + AppState (config + DB pool + Redis + caches + registry + shutdown token)
 ├── db.rs                # Postgres pool, migrations, channel/client/operator/chat queries, message persistence
 ├── error.rs             # WebhookError → HTTP status mapping

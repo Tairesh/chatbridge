@@ -26,7 +26,7 @@ pub async fn operator_ws(
     let (operator_id, new_token) = resolve_operator(
         params.token.as_deref(),
         &state.config.widget_jwt_secret,
-        &state.db,
+        &state,
     )
     .await
     .map_err(|e| {

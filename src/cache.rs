@@ -104,9 +104,11 @@ impl ChannelCache {
 }
 
 /// In-memory client cache with read-through to Postgres.
-/// Keyed by (provider, external_id). Invalidated by client UUID via retain().
+/// Primary store keyed by UUID; secondary index `(provider, external_id) → UUID`.
+/// Invalidated by client UUID — evicts from both maps.
 pub struct ClientCache {
-    clients: RwLock<HashMap<(ProviderKind, String), Client>>,
+    by_uuid: RwLock<HashMap<Uuid, Client>>,
+    ext_index: RwLock<HashMap<(ProviderKind, String), Uuid>>,
 }
 
 impl Default for ClientCache {
@@ -118,11 +120,29 @@ impl Default for ClientCache {
 impl ClientCache {
     pub fn new() -> Self {
         Self {
-            clients: RwLock::new(HashMap::new()),
+            by_uuid: RwLock::new(HashMap::new()),
+            ext_index: RwLock::new(HashMap::new()),
         }
     }
 
-    /// Read-through lookup. On miss, queries DB and caches positive results only.
+    /// Insert a client into both the primary store and the secondary index.
+    fn insert(&self, client: &Client) {
+        self.by_uuid
+            .write()
+            .unwrap()
+            .insert(client.id, client.clone());
+        if let Some(ref ext_id) = client.external_id
+            && let Ok(provider) = client.provider.parse::<ProviderKind>()
+        {
+            self.ext_index
+                .write()
+                .unwrap()
+                .insert((provider, ext_id.clone()), client.id);
+        }
+    }
+
+    /// Read-through lookup by provider + external_id.
+    /// Resolves UUID via the secondary index, then fetches from the primary store.
     pub async fn get_client(
         &self,
         pool: &PgPool,
@@ -130,23 +150,43 @@ impl ClientCache {
         external_id: &str,
     ) -> Result<Option<Client>, sqlx::Error> {
         let key = (provider.clone(), external_id.to_owned());
-        if let Some(cached) = self.clients.read().unwrap().get(&key) {
+        if let Some(&uuid) = self.ext_index.read().unwrap().get(&key)
+            && let Some(cached) = self.by_uuid.read().unwrap().get(&uuid)
+        {
             return Ok(Some(cached.clone()));
         }
 
         let client = crate::db::find_client_by_external_id(pool, provider, external_id).await?;
         if let Some(ref c) = client {
-            self.clients.write().unwrap().insert(key, c.clone());
+            self.insert(c);
         }
         Ok(client)
     }
 
-    /// Evict a client by its UUID (linear scan via retain).
+    /// Read-through lookup by UUID.
+    pub async fn get_client_by_uuid(
+        &self,
+        pool: &PgPool,
+        client_id: Uuid,
+    ) -> Result<Option<Client>, sqlx::Error> {
+        if let Some(cached) = self.by_uuid.read().unwrap().get(&client_id) {
+            return Ok(Some(cached.clone()));
+        }
+
+        let client = crate::db::find_client_by_uuid(pool, client_id).await?;
+        if let Some(ref c) = client {
+            self.insert(c);
+        }
+        Ok(client)
+    }
+
+    /// Evict a client by UUID from both maps.
     pub fn invalidate(&self, client_id: Uuid) {
-        self.clients
+        self.by_uuid.write().unwrap().remove(&client_id);
+        self.ext_index
             .write()
             .unwrap()
-            .retain(|_, v| v.id != client_id);
+            .retain(|_, v| *v != client_id);
     }
 }
 
@@ -345,7 +385,6 @@ pub async fn publish_invalidation(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::ProviderKind;
 
     #[test]
     fn client_cache_invalidate_removes_matching_entry() {
@@ -359,15 +398,13 @@ mod tests {
             username: None,
             updated_at: chrono::Utc::now(),
         };
-        cache
-            .clients
-            .write()
-            .unwrap()
-            .insert((ProviderKind::Telegram, "12345".into()), client);
+        cache.insert(&client);
 
-        assert_eq!(cache.clients.read().unwrap().len(), 1);
+        assert_eq!(cache.by_uuid.read().unwrap().len(), 1);
+        assert_eq!(cache.ext_index.read().unwrap().len(), 1);
         cache.invalidate(client_id);
-        assert!(cache.clients.read().unwrap().is_empty());
+        assert!(cache.by_uuid.read().unwrap().is_empty());
+        assert!(cache.ext_index.read().unwrap().is_empty());
     }
 
     #[test]
@@ -415,13 +452,10 @@ mod tests {
             username: None,
             updated_at: chrono::Utc::now(),
         };
-        cache
-            .clients
-            .write()
-            .unwrap()
-            .insert((ProviderKind::Instagram, "abc".into()), client);
+        cache.insert(&client);
 
         cache.invalidate(other_id);
-        assert_eq!(cache.clients.read().unwrap().len(), 1);
+        assert_eq!(cache.by_uuid.read().unwrap().len(), 1);
+        assert_eq!(cache.ext_index.read().unwrap().len(), 1);
     }
 }

@@ -38,7 +38,7 @@ Multi-provider chat bridge for Instagram, Telegram, and WebSocket chat widgets, 
 
 ### Module Structure
 
-- `cache.rs` — `ChannelCache`, `ClientCache`, `OperatorCache`, `ChatCache` — all in-memory read-through, invalidated via Redis Pub/Sub. Also: `publish_invalidation` helper, `spawn_invalidation_listener`
+- `cache.rs` — `ChannelCache`, `ClientCache`, `OperatorCache`, `ChatCache` — all in-memory read-through, invalidated via Redis Pub/Sub. `ClientCache` is dual-keyed: primary `HashMap<Uuid, Client>`, secondary index `HashMap<(ProviderKind, String), Uuid>` for provider lookups. Also: `publish_invalidation` helper, `spawn_invalidation_listener`
 - `jwt.rs` — HS256 JWT sign/verify for WebSocket widget client identity (`Claims { sub, iat }`)
 - `registry.rs` — `ClientRegistry` (tracks active WS connections per client/operator UUID via `RwLock<HashMap<Uuid, HashMap<u64, mpsc::Sender<String>>>>` + `operator_ids: HashSet<Uuid>`)
 - `config.rs` — `AppConfig` (from env vars) and `AppState` (config + PgPool + Redis + ChannelCache + ClientCache + OperatorCache + ChatCache + ClientRegistry + shutdown token). `AppState` does NOT derive `Clone` — it's always behind `Arc<AppState>`

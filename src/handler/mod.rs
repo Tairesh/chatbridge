@@ -50,15 +50,19 @@ pub struct WsTokenParams {
 async fn resolve_client(
     token: Option<&str>,
     jwt_secret: &str,
-    db: &sqlx::PgPool,
+    state: &AppState,
 ) -> Result<(Uuid, Option<String>), sqlx::Error> {
     if let Some(client_id) = token.and_then(|t| crate::jwt::verify(t, jwt_secret.as_bytes()))
-        && crate::db::find_client_by_id(db, client_id).await?
+        && state
+            .client_cache
+            .get_client_by_uuid(&state.db, client_id)
+            .await?
+            .is_some()
     {
         return Ok((client_id, None));
     }
 
-    let client_id = crate::db::create_client(db).await?;
+    let client_id = crate::db::create_client(&state.db).await?;
     let token = crate::jwt::sign(client_id, jwt_secret.as_bytes());
     Ok((client_id, Some(token)))
 }
@@ -67,16 +71,18 @@ async fn resolve_client(
 async fn resolve_operator(
     token: Option<&str>,
     jwt_secret: &str,
-    db: &sqlx::PgPool,
+    state: &AppState,
 ) -> Result<(Uuid, Option<String>), sqlx::Error> {
     if let Some(operator_id) = token.and_then(|t| crate::jwt::verify(t, jwt_secret.as_bytes()))
-        && crate::db::find_operator_by_id(db, operator_id)
+        && state
+            .operator_cache
+            .get_operator(&state.db, operator_id)
             .await?
             .is_some()
     {
         return Ok((operator_id, None));
     }
-    let operator_id = crate::db::create_operator(db).await?;
+    let operator_id = crate::db::create_operator(&state.db).await?;
     let token = crate::jwt::sign(operator_id, jwt_secret.as_bytes());
     Ok((operator_id, Some(token)))
 }

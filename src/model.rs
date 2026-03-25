@@ -97,6 +97,19 @@ pub struct NewMessage {
     pub raw: serde_json::Value,
 }
 
+impl std::str::FromStr for ProviderKind {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "instagram" => Ok(Self::Instagram),
+            "telegram" => Ok(Self::Telegram),
+            "widget" => Ok(Self::Widget),
+            other => Err(format!("unknown provider: {other}")),
+        }
+    }
+}
+
 impl std::fmt::Display for ProviderKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
