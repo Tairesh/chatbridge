@@ -47,7 +47,7 @@ async fn main() {
         registry: ClientRegistry::new(),
         shutdown,
     });
-    chatbridge::handler::spawn_message_listener(state.clone()).await;
+    chatbridge::listener::spawn_message_listener(state.clone()).await;
     let app = routes::build(state.clone());
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3800").await.unwrap();

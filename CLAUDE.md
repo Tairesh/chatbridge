@@ -48,8 +48,14 @@ Multi-provider chat bridge for Instagram, Telegram, and WebSocket chat widgets, 
 - `provider/mod.rs` — `WebhookProvider` trait (verify + parse). `parse` takes `redis: ConnectionManager` for cache invalidation publishing
 - `provider/instagram.rs` — Constant-time HMAC-SHA256 verification, Meta webhook payload parsing, client resolution via Instagram Graph API (background `tokio::spawn` with 24h staleness check)
 - `provider/telegram.rs` — Secret token verification, Telegram Update parsing, `TelegramUser` struct, `resolve_telegram_client` (cache lookup → 24h staleness → background upsert, same pattern as Instagram)
-- `handler.rs` — Axum handlers (`meta_verify`, `instagram_ingest`, `telegram_ingest`, `widget_ws`, `operator_ws`, `get_chats`, `get_chat_messages`), `spawn_message_listener` (shared Redis listener for dispatching events to WS clients). In read events (`IncomingRead`), `sender` = original message author (not the reader). The shared listener uses this for routing: if sender matches chat's client → deliver to client; otherwise → deliver to operators
-- `routes.rs` — Router assembly
+- `pipeline.rs` — `publish_event`, `resolve_sender`, `persist_and_publish` — shared message processing pipeline (verify sender, resolve chat, insert/update DB, publish `IncomingEvent` to Redis). Leaf module: depends on `db`, `cache`, `model`, `config` but never on `handler` or `listener`
+- `listener.rs` — `spawn_message_listener` — shared Redis subscriber that dispatches `IncomingEvent`s to WebSocket connections via `ClientRegistry`. In read events (`IncomingRead`), `sender` = original message author (not the reader). Routing: if sender matches chat's client → deliver to client; otherwise → deliver to operators
+- `handler/mod.rs` — Shared handler utilities: `ConnectionGuard` (RAII WS deregister), `send_outbound`, `resolve_client`/`resolve_operator` (JWT), WS constants (`SEND_TIMEOUT`, `IDLE_TIMEOUT`, `PING_TIMEOUT`), `WsTokenParams`
+- `handler/webhook.rs` — HTTP webhook handlers (`meta_verify`, `instagram_ingest`, `telegram_ingest`)
+- `handler/widget_ws.rs` — Widget WebSocket handler (`widget_ws`, `handle_widget_socket`, `process_text_message`, `await_pong`)
+- `handler/operator_ws.rs` — Operator WebSocket handler (`operator_ws`, `handle_operator_socket`, `process_operator_message`)
+- `handler/api.rs` — REST API handlers (`get_chats`, `get_chat_messages`)
+- `routes.rs` — Router assembly (uses qualified handler submodule paths: `webhook::meta_verify`, `api::get_chats`, etc.)
 
 ### Routes
 

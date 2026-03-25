@@ -153,7 +153,7 @@ async fn build_state(db: PgPool) -> Arc<AppState> {
 
 /// Start the app on a random port and return the address.
 async fn spawn_app(state: Arc<AppState>) -> std::net::SocketAddr {
-    chatbridge::handler::spawn_message_listener(state.clone()).await;
+    chatbridge::listener::spawn_message_listener(state.clone()).await;
     let app = routes::build(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

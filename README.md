@@ -160,7 +160,14 @@ src/
 ├── jwt.rs               # HS256 JWT sign/verify for WebSocket identity (widget clients + operators)
 ├── registry.rs          # ClientRegistry (tracks active WS connections per client/operator UUID via mpsc channels)
 ├── model.rs             # Sender, NewMessage, IncomingMessage/Edit/Read, ProviderKind, EventKind, WsInbound, OperatorInbound, WsOutbound
-├── handler.rs           # Axum handlers, widget/operator WS, shared Redis listener (spawn_message_listener)
+├── pipeline.rs          # Shared message processing pipeline (persist_and_publish, resolve_sender, publish_event)
+├── listener.rs          # Shared Redis listener (spawn_message_listener) — dispatches events to WS connections
+├── handler/
+│   ├── mod.rs           # Shared handler utilities (ConnectionGuard, send_outbound, resolve_client/operator, WS constants)
+│   ├── webhook.rs       # HTTP webhook handlers (meta_verify, instagram_ingest, telegram_ingest)
+│   ├── widget_ws.rs     # Widget WebSocket handler
+│   ├── operator_ws.rs   # Operator WebSocket handler
+│   └── api.rs           # REST API handlers (get_chats, get_chat_messages)
 ├── routes.rs            # Router assembly
 └── provider/
     ├── mod.rs           # WebhookProvider trait (verify + parse)
