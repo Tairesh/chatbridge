@@ -119,7 +119,7 @@ async fn process_operator_message(
     text: &str,
     operator_id: Uuid,
     socket: &mut WebSocket,
-    state: &AppState,
+    state: &Arc<AppState>,
 ) -> bool {
     let inbound: OperatorInbound = match serde_json::from_str(text) {
         Ok(v) => v,
@@ -231,11 +231,15 @@ async fn process_operator_message(
                 );
             }
             Ok(Some("telegram")) => {
-                tracing::info!(
-                    channel_id = %chat_info.channel_id,
-                    mid = %inbound.mid,
-                    "TODO: deliver to Telegram API"
-                );
+                if let Some(text) = inbound.text.clone().filter(|t| !t.is_empty()) {
+                    spawn_telegram_delivery(
+                        Arc::clone(state),
+                        chat_info.channel_id,
+                        chat_info.client_id,
+                        operator_id,
+                        text,
+                    );
+                }
             }
             _ => {} // widget — delivered via shared listener
         }
@@ -245,4 +249,60 @@ async fn process_operator_message(
     let ack_id = Uuid::parse_str(&inbound.mid).unwrap_or(Uuid::nil());
     let ack = WsOutbound::Ack { message_id: ack_id };
     send_outbound(socket, &ack).await
+}
+
+fn notify_operator_error(state: &AppState, operator_id: Uuid, reason: String) {
+    let error = WsOutbound::Error { reason };
+    if let Ok(json) = serde_json::to_string(&error) {
+        state.registry.send_to(operator_id, &json);
+    }
+}
+
+async fn deliver_to_telegram(
+    state: &AppState,
+    channel_id: Uuid,
+    client_id: Uuid,
+    text: &str,
+) -> Result<(), String> {
+    let channel = state
+        .cache
+        .get_telegram_channel(&state.db, channel_id)
+        .await
+        .map_err(|e| format!("channel lookup failed: {e}"))?
+        .ok_or_else(|| "telegram channel not found".to_owned())?;
+
+    let client = state
+        .client_cache
+        .get_client_by_uuid(&state.db, client_id)
+        .await
+        .map_err(|e| format!("client lookup failed: {e}"))?
+        .ok_or_else(|| "client not found".to_owned())?;
+
+    let chat_id = client
+        .external_id
+        .ok_or_else(|| "client has no external_id".to_owned())?;
+
+    let message = crate::provider::telegram::OutboundMessage::Text {
+        text: text.to_owned(),
+    };
+    crate::provider::telegram::send(&channel.bot_token, &chat_id, &message).await
+}
+
+fn spawn_telegram_delivery(
+    state: Arc<AppState>,
+    channel_id: Uuid,
+    client_id: Uuid,
+    operator_id: Uuid,
+    text: String,
+) {
+    tokio::spawn(async move {
+        if let Err(reason) = deliver_to_telegram(&state, channel_id, client_id, &text).await {
+            tracing::error!(%channel_id, %operator_id, "telegram delivery failed: {reason}");
+            notify_operator_error(
+                &state,
+                operator_id,
+                format!("Telegram delivery failed: {reason}"),
+            );
+        }
+    });
 }

@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use axum::http::HeaderMap;
 use serde::Deserialize;
@@ -200,6 +200,58 @@ fn build_display_name(user: &TelegramUser) -> String {
     }
 }
 
+static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .expect("failed to build reqwest client")
+});
+
+pub enum OutboundMessage {
+    Text { text: String },
+}
+
+const TELEGRAM_API_BASE: &str = "https://api.telegram.org";
+
+pub async fn send(bot_token: &str, chat_id: &str, message: &OutboundMessage) -> Result<(), String> {
+    send_with_base_url(bot_token, chat_id, message, TELEGRAM_API_BASE).await
+}
+
+async fn send_with_base_url(
+    bot_token: &str,
+    chat_id: &str,
+    message: &OutboundMessage,
+    base_url: &str,
+) -> Result<(), String> {
+    let (method, body) = match message {
+        OutboundMessage::Text { text } => (
+            "sendMessage",
+            serde_json::json!({ "chat_id": chat_id, "text": text }),
+        ),
+    };
+
+    let url = format!("{base_url}/bot{bot_token}/{method}");
+
+    let resp = HTTP_CLIENT
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("HTTP request failed: {e}"))?;
+
+    let json: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("failed to parse response: {e}"))?;
+
+    if json["ok"].as_bool() == Some(true) {
+        Ok(())
+    } else {
+        let desc = json["description"].as_str().unwrap_or("unknown error");
+        Err(desc.to_owned())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -339,5 +391,48 @@ mod tests {
             username: None,
         };
         assert_eq!(build_display_name(&user), "Alice");
+    }
+
+    async fn mock_telegram_api(response: serde_json::Value) -> String {
+        use axum::{Json, Router, routing::post};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let app = Router::new().route(
+            "/bot{token}/sendMessage",
+            post(move || async move { Json(response) }),
+        );
+        listener.set_nonblocking(true).unwrap();
+        let tcp = tokio::net::TcpListener::from_std(listener).unwrap();
+        tokio::spawn(axum::serve(tcp, app).into_future());
+
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn send_text_message_success() {
+        let base_url = mock_telegram_api(serde_json::json!({"ok": true, "result": {}})).await;
+        let msg = OutboundMessage::Text {
+            text: "hello".into(),
+        };
+        let result = send_with_base_url("fake_token", "12345", &msg, &base_url).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn send_text_message_telegram_error() {
+        let base_url = mock_telegram_api(serde_json::json!({
+            "ok": false,
+            "description": "Forbidden: bot was blocked by the user"
+        }))
+        .await;
+        let msg = OutboundMessage::Text {
+            text: "hello".into(),
+        };
+        let result = send_with_base_url("fake_token", "12345", &msg, &base_url).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("blocked by the user"));
     }
 }

@@ -73,7 +73,9 @@ Multi-provider chat bridge for **Instagram**, **Telegram**, and **WebSocket chat
                          │      │  {action, chat_id, mid, text}     │
                          │      ├─ Persist → Postgres messages      │
                          │      ├─ Publish ──▶ Redis incoming_messages
-                         │      └─ Send ACK ──▶ operator            │
+                         │      ├─ Send ACK ──▶ operator            │
+                         │      └─ Telegram? → spawn delivery       │
+                         │         └─ POST Bot API /sendMessage     │
                          │                                          │
     Operator ──────GET───▶ /api/chats                               │
                          │   └─ List active chats with summaries    │
@@ -166,13 +168,13 @@ src/
 │   ├── mod.rs           # Shared handler utilities (ConnectionGuard, send_outbound, resolve_client/operator, WS constants)
 │   ├── webhook.rs       # HTTP webhook handlers (meta_verify, instagram_ingest, telegram_ingest)
 │   ├── widget_ws.rs     # Widget WebSocket handler
-│   ├── operator_ws.rs   # Operator WebSocket handler
+│   ├── operator_ws.rs   # Operator WebSocket handler (async Telegram delivery via Bot API)
 │   └── api.rs           # REST API handlers (get_chats, get_chat_messages)
 ├── routes.rs            # Router assembly
 └── provider/
     ├── mod.rs           # WebhookProvider trait (verify + parse)
     ├── instagram.rs     # HMAC-SHA256 verification, Meta payload parsing, client identity via Graph API
-    └── telegram.rs      # Secret token verification, Telegram Update parsing, client resolution (cache + 24h staleness)
+    └── telegram.rs      # Secret token verification, Telegram Update parsing, client resolution, outbound sendMessage via Bot API
 
 docker/
 ├── Dockerfile           # Multi-stage build
