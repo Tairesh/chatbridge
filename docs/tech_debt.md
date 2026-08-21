@@ -126,15 +126,3 @@ Only the crash case is uncovered.
 **Fix:** a `webhook_registered_at` column marking a channel provisional until `setWebhook` returns,
 with the panel offering to finish or discard provisional channels; or a reconciliation pass on
 startup.
-
-## `WebhookError` is now the error type for all REST endpoints
-
-**Status:** open (found 2026-08-22)
-
-`WebhookError` (`src/error.rs`) started as the webhook ingestion error type and is now returned by
-the chat REST API and the whole channel CRUD surface, including variants (`Conflict`, `BadGateway`)
-that no webhook path produces. The name misleads a reader into thinking `handler/channels.rs`
-handles webhooks.
-
-**Fix:** rename to `AppError`. Purely mechanical but touches every handler and both test files, so
-it was left out of the settings-panel change rather than inflating that diff.

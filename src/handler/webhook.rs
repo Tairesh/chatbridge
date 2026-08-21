@@ -8,7 +8,7 @@ use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::config::AppState;
-use crate::error::WebhookError;
+use crate::error::AppError;
 use crate::pipeline::persist_and_publish;
 use crate::provider::WebhookProvider;
 use crate::provider::instagram::InstagramProvider;
@@ -27,14 +27,14 @@ pub struct VerifyParams {
 pub async fn meta_verify(
     State(state): State<Arc<AppState>>,
     Query(params): Query<VerifyParams>,
-) -> Result<String, WebhookError> {
+) -> Result<String, AppError> {
     if params.hub_mode == "subscribe"
         && params.hub_verify_token == state.config.instagram_verify_token
     {
         tracing::info!("webhook verified, returning challenge");
         Ok(params.hub_challenge)
     } else {
-        Err(WebhookError::Forbidden(
+        Err(AppError::Forbidden(
             "invalid verify token or mode".into(),
         ))
     }
@@ -81,7 +81,7 @@ pub async fn telegram_ingest(
     Path(channel_id): Path<Uuid>,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<StatusCode, WebhookError> {
+) -> Result<StatusCode, AppError> {
     let (provider, bot_secret) = TelegramProvider::load(
         channel_id,
         &state.db,

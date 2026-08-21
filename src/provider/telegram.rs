@@ -6,7 +6,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::cache::{ChannelCache, ClientCache};
-use crate::error::WebhookError;
+use crate::error::AppError;
 use crate::model::{EventKind, NewMessage, ProviderKind};
 use crate::provider::WebhookProvider;
 
@@ -30,33 +30,33 @@ impl TelegramProvider {
         db: &PgPool,
         cache: &Arc<ChannelCache>,
         client_cache: Arc<ClientCache>,
-    ) -> Result<(Self, String), WebhookError> {
+    ) -> Result<(Self, String), AppError> {
         let channel = cache
             .get_channel_by_id(db, channel_id)
             .await?
-            .ok_or_else(|| WebhookError::NotFound(format!("channel {channel_id} not found")))?;
+            .ok_or_else(|| AppError::NotFound(format!("channel {channel_id} not found")))?;
         let config: crate::model::TelegramConfig = serde_json::from_value(channel.config)
-            .map_err(|e| WebhookError::Internal(format!("bad telegram config: {e}")))?;
+            .map_err(|e| AppError::Internal(format!("bad telegram config: {e}")))?;
         Ok((Self::new(channel_id, client_cache), config.bot_secret))
     }
 }
 
 /// Standalone verify for Telegram — checks the secret token header against expected secret.
-pub fn verify_secret_token(headers: &HeaderMap, expected_secret: &str) -> Result<(), WebhookError> {
+pub fn verify_secret_token(headers: &HeaderMap, expected_secret: &str) -> Result<(), AppError> {
     let token = headers
         .get("X-Telegram-Bot-Api-Secret-Token")
         .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| WebhookError::Forbidden("missing X-Telegram-Bot-Api-Secret-Token".into()))?;
+        .ok_or_else(|| AppError::Forbidden("missing X-Telegram-Bot-Api-Secret-Token".into()))?;
 
     if token != expected_secret {
-        return Err(WebhookError::Forbidden("invalid secret token".into()));
+        return Err(AppError::Forbidden("invalid secret token".into()));
     }
 
     Ok(())
 }
 
 impl WebhookProvider for TelegramProvider {
-    fn verify(&self, _headers: &HeaderMap, _body: &[u8]) -> Result<(), WebhookError> {
+    fn verify(&self, _headers: &HeaderMap, _body: &[u8]) -> Result<(), AppError> {
         // Telegram verification is done via verify_secret_token before constructing the provider.
         // This is a no-op since the handler already verified the secret.
         Ok(())
@@ -67,9 +67,9 @@ impl WebhookProvider for TelegramProvider {
         body: &[u8],
         db: &PgPool,
         redis: redis::aio::ConnectionManager,
-    ) -> Result<Vec<NewMessage>, WebhookError> {
+    ) -> Result<Vec<NewMessage>, AppError> {
         let update: TelegramUpdate =
-            serde_json::from_slice(body).map_err(|e| WebhookError::BadRequest(e.to_string()))?;
+            serde_json::from_slice(body).map_err(|e| AppError::BadRequest(e.to_string()))?;
 
         let (event_kind, msg_ref) = if let Some(ref msg) = update.message {
             (EventKind::Message, Some(msg))

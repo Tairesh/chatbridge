@@ -161,7 +161,7 @@ src/
 ├── cache.rs             # In-memory caches (channel, client, operator, chat) with Redis Pub/Sub invalidation; ClientCache dual-keyed by UUID + (provider, external_id)
 ├── config.rs            # AppConfig (env vars) + AppState (config + DB pool + Redis + caches + registry + shutdown token)
 ├── db.rs                # Postgres pool, migrations, single-table channel queries + CRUD, client/operator/chat queries, message persistence
-├── error.rs             # WebhookError → HTTP status mapping
+├── error.rs             # AppError → HTTP status mapping
 ├── jwt.rs               # HS256 JWT sign/verify for WebSocket identity (widget clients + operators)
 ├── registry.rs          # ClientRegistry (tracks active WS connections per client/operator UUID via mpsc channels)
 ├── model.rs             # Sender, NewMessage, IncomingMessage/Edit/Read, ProviderKind, EventKind, WsInbound, OperatorInbound, WsOutbound

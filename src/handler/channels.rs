@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::config::AppState;
 use crate::db::{self, Channel};
-use crate::error::WebhookError;
+use crate::error::AppError;
 use crate::model::{ChannelSpec, ProviderKind, TelegramConfig};
 
 const WIDGET_ID_MAX: usize = 64;
@@ -21,9 +21,9 @@ const WIDGET_ID_MAX: usize = 64;
 /// safe single path segment. A value with spaces, slashes or non-ASCII characters
 /// would create a channel the widget could never connect to — better to refuse it
 /// here than to hand back something that looks fine and silently does not work.
-pub fn validate_widget_id(widget_id: &str) -> Result<(), WebhookError> {
+pub fn validate_widget_id(widget_id: &str) -> Result<(), AppError> {
     if widget_id.is_empty() || widget_id.len() > WIDGET_ID_MAX {
-        return Err(WebhookError::BadRequest(format!(
+        return Err(AppError::BadRequest(format!(
             "widget_id must be 1-{WIDGET_ID_MAX} characters"
         )));
     }
@@ -31,7 +31,7 @@ pub fn validate_widget_id(widget_id: &str) -> Result<(), WebhookError> {
         .bytes()
         .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
     {
-        return Err(WebhookError::BadRequest(
+        return Err(AppError::BadRequest(
             "widget_id may contain only letters, digits, '-' and '_'".into(),
         ));
     }
@@ -40,9 +40,9 @@ pub fn validate_widget_id(widget_id: &str) -> Result<(), WebhookError> {
 
 /// A Telegram bot token is `<numeric bot id>:<secret>`. Checking the shape here
 /// turns an obvious typo into a clear 400 instead of a round trip to Telegram.
-pub fn validate_bot_token(bot_token: &str) -> Result<(), WebhookError> {
+pub fn validate_bot_token(bot_token: &str) -> Result<(), AppError> {
     let malformed =
-        || WebhookError::BadRequest("bot_token must look like <bot_id>:<secret>".to_owned());
+        || AppError::BadRequest("bot_token must look like <bot_id>:<secret>".to_owned());
     let (id, secret) = bot_token.split_once(':').ok_or_else(malformed)?;
     if id.is_empty() || secret.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
         return Err(malformed());
@@ -100,7 +100,7 @@ impl ChannelView {
 /// can show them dimmed with a Restore button rather than lying about the database.
 pub async fn list(
     State(state): State<Arc<AppState>>,
-) -> Result<Json<Vec<ChannelView>>, WebhookError> {
+) -> Result<Json<Vec<ChannelView>>, AppError> {
     let channels = db::list_channels(&state.db).await?;
     let base = &state.config.public_base_url;
     Ok(Json(
@@ -124,7 +124,7 @@ pub struct CreateChannel {
 /// Build the 409 body for a create that collided with the unique index.
 /// Distinguishes a live collision from a soft-deleted one, because the panel
 /// offers "Restore" for the second and only highlights the row for the first.
-async fn conflict(db: &PgPool, provider: ProviderKind, external_key: &str) -> WebhookError {
+async fn conflict(db: &PgPool, provider: ProviderKind, external_key: &str) -> AppError {
     match db::find_channel_by_external_key(db, provider, external_key).await {
         Ok(Some(existing)) => {
             let code = if existing.deleted_at.is_some() {
@@ -132,7 +132,7 @@ async fn conflict(db: &PgPool, provider: ProviderKind, external_key: &str) -> We
             } else {
                 "channel_exists"
             };
-            WebhookError::Conflict(serde_json::json!({
+            AppError::Conflict(serde_json::json!({
                 "error": code,
                 "channel_id": existing.id,
                 "name": existing.name,
@@ -141,8 +141,8 @@ async fn conflict(db: &PgPool, provider: ProviderKind, external_key: &str) -> We
         }
         // The index rejected the insert, so a row must exist. If it does not, the
         // only explanation is a concurrent hard delete, which is not a client error.
-        Ok(None) => WebhookError::Internal("conflicting channel disappeared".into()),
-        Err(e) => WebhookError::from(e),
+        Ok(None) => AppError::Internal("conflicting channel disappeared".into()),
+        Err(e) => AppError::from(e),
     }
 }
 
@@ -156,7 +156,7 @@ async fn insert_or_conflict(
     name: &str,
     external_key: &str,
     config: &serde_json::Value,
-) -> Result<Channel, WebhookError> {
+) -> Result<Channel, AppError> {
     match db::insert_channel(db, id, provider.clone(), name, external_key, config).await {
         Ok(channel) => Ok(channel),
         Err(sqlx::Error::Database(ref e)) if e.is_unique_violation() => {
@@ -176,7 +176,7 @@ async fn invalidate_everywhere(state: &AppState, channel_id: Uuid) {
 pub async fn create(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CreateChannel>,
-) -> Result<(StatusCode, Json<ChannelView>), WebhookError> {
+) -> Result<(StatusCode, Json<ChannelView>), AppError> {
     let channel = match body.spec {
         ChannelSpec::Widget { widget_id } => {
             validate_widget_id(&widget_id)?;
@@ -196,7 +196,7 @@ pub async fn create(
             access_token,
         } => {
             if user_id.trim().is_empty() || access_token.trim().is_empty() {
-                return Err(WebhookError::BadRequest(
+                return Err(AppError::BadRequest(
                     "user_id and access_token must not be empty".into(),
                 ));
             }
@@ -234,13 +234,13 @@ async fn create_telegram(
     state: &AppState,
     name: Option<String>,
     bot_token: String,
-) -> Result<Channel, WebhookError> {
+) -> Result<Channel, AppError> {
     validate_bot_token(&bot_token)?;
 
     // getMe validates the token and is the authoritative source of the bot id.
     let info = crate::provider::telegram::get_me(&state.config.telegram_api_base, &bot_token)
         .await
-        .map_err(WebhookError::BadRequest)?;
+        .map_err(AppError::BadRequest)?;
     let external_key = info.id.to_string();
     let name = name.unwrap_or_else(|| match info.username {
         Some(ref username) => format!("@{username}"),
@@ -288,7 +288,7 @@ async fn create_telegram(
                  with no webhook — re-register it from the settings panel."
             );
         }
-        return Err(WebhookError::BadGateway(format!(
+        return Err(AppError::BadGateway(format!(
             "setWebhook failed: {reason}"
         )));
     }
@@ -314,10 +314,10 @@ pub async fn update(
     State(state): State<Arc<AppState>>,
     Path(channel_id): Path<Uuid>,
     Json(body): Json<UpdateChannel>,
-) -> Result<Json<ChannelView>, WebhookError> {
+) -> Result<Json<ChannelView>, AppError> {
     let existing = db::find_channel_by_id(&state.db, channel_id)
         .await?
-        .ok_or_else(|| WebhookError::NotFound("channel not found".into()))?;
+        .ok_or_else(|| AppError::NotFound("channel not found".into()))?;
 
     let mut new_key: Option<String> = None;
     let mut new_config: Option<serde_json::Value> = None;
@@ -327,7 +327,7 @@ pub async fn update(
     if let Some(spec) = body.spec {
         let provider = spec.provider();
         if provider.to_string() != existing.provider {
-            return Err(WebhookError::BadRequest(format!(
+            return Err(AppError::BadRequest(format!(
                 "channel provider is '{}' and cannot be changed to '{provider}'",
                 existing.provider
             )));
@@ -345,7 +345,7 @@ pub async fn update(
                 access_token,
             } => {
                 if user_id.trim().is_empty() || access_token.trim().is_empty() {
-                    return Err(WebhookError::BadRequest(
+                    return Err(AppError::BadRequest(
                         "user_id and access_token must not be empty".into(),
                     ));
                 }
@@ -370,9 +370,9 @@ pub async fn update(
                 let info =
                     crate::provider::telegram::get_me(&state.config.telegram_api_base, &bot_token)
                         .await
-                        .map_err(WebhookError::BadRequest)?;
+                        .map_err(AppError::BadRequest)?;
                 if info.id.to_string() != existing.external_key {
-                    return Err(WebhookError::BadRequest(
+                    return Err(AppError::BadRequest(
                         "that token belongs to a different bot; create a separate channel \
                          instead, because this channel's chats and messages belong to the \
                          current one"
@@ -381,7 +381,7 @@ pub async fn update(
                 }
 
                 let old: TelegramConfig = serde_json::from_value(existing.config.clone())
-                    .map_err(|e| WebhookError::Internal(format!("bad telegram config: {e}")))?;
+                    .map_err(|e| AppError::Internal(format!("bad telegram config: {e}")))?;
 
                 // Best effort: drop the replaced token's webhook. A token that was
                 // already revoked fails here, which must not fail the edit.
@@ -415,7 +415,7 @@ pub async fn update(
     } else if body.restore && existing.provider == "telegram" {
         // Restoring without a new spec still needs the webhook back: DELETE removed it.
         let cfg: TelegramConfig = serde_json::from_value(existing.config.clone())
-            .map_err(|e| WebhookError::Internal(format!("bad telegram config: {e}")))?;
+            .map_err(|e| AppError::Internal(format!("bad telegram config: {e}")))?;
         register = Some((cfg.bot_token, cfg.bot_secret));
     }
 
@@ -430,13 +430,13 @@ pub async fn update(
     .await
     {
         Ok(Some(channel)) => channel,
-        Ok(None) => return Err(WebhookError::NotFound("channel not found".into())),
+        Ok(None) => return Err(AppError::NotFound("channel not found".into())),
         // Same rule as create: the unique index arbitrates, no pre-check SELECT.
         Err(sqlx::Error::Database(ref e)) if e.is_unique_violation() => {
             let provider = existing
                 .provider
                 .parse::<ProviderKind>()
-                .map_err(WebhookError::Internal)?;
+                .map_err(AppError::Internal)?;
             let key = new_key.as_deref().unwrap_or(&existing.external_key);
             return Err(conflict(&state.db, provider, key).await);
         }
@@ -466,7 +466,7 @@ pub async fn update(
             // already deleted, so the honest end state is "new config, no webhook",
             // which the status check surfaces and "Re-register" fixes.
             invalidate_everywhere(&state, updated.id).await;
-            return Err(WebhookError::BadGateway(format!(
+            return Err(AppError::BadGateway(format!(
                 "setWebhook failed: {reason}"
             )));
         }
@@ -486,7 +486,7 @@ pub async fn update(
 pub async fn delete(
     State(state): State<Arc<AppState>>,
     Path(channel_id): Path<Uuid>,
-) -> Result<StatusCode, WebhookError> {
+) -> Result<StatusCode, AppError> {
     let Some(channel) = db::soft_delete_channel(&state.db, channel_id).await? else {
         return Ok(StatusCode::NO_CONTENT);
     };
@@ -538,18 +538,18 @@ impl WebhookStatus {
 async fn telegram_channel(
     state: &AppState,
     channel_id: Uuid,
-) -> Result<(Channel, TelegramConfig), WebhookError> {
+) -> Result<(Channel, TelegramConfig), AppError> {
     let channel = db::find_live_channel_by_id(&state.db, channel_id)
         .await?
-        .ok_or_else(|| WebhookError::NotFound("channel not found".into()))?;
+        .ok_or_else(|| AppError::NotFound("channel not found".into()))?;
     if channel.provider != "telegram" {
-        return Err(WebhookError::BadRequest(format!(
+        return Err(AppError::BadRequest(format!(
             "channel provider is '{}'; only telegram channels have a webhook",
             channel.provider
         )));
     }
     let config = serde_json::from_value(channel.config.clone())
-        .map_err(|e| WebhookError::Internal(format!("bad telegram config: {e}")))?;
+        .map_err(|e| AppError::Internal(format!("bad telegram config: {e}")))?;
     Ok((channel, config))
 }
 
@@ -557,13 +557,13 @@ async fn status_of(
     state: &AppState,
     channel: &Channel,
     config: &TelegramConfig,
-) -> Result<WebhookStatus, WebhookError> {
+) -> Result<WebhookStatus, AppError> {
     let info = crate::provider::telegram::get_webhook_info(
         &state.config.telegram_api_base,
         &config.bot_token,
     )
     .await
-    .map_err(|e| WebhookError::BadGateway(format!("getWebhookInfo failed: {e}")))?;
+    .map_err(|e| AppError::BadGateway(format!("getWebhookInfo failed: {e}")))?;
 
     let expected_url = endpoint_for(
         &state.config.public_base_url,
@@ -588,7 +588,7 @@ async fn status_of(
 pub async fn webhook_status(
     State(state): State<Arc<AppState>>,
     Path(channel_id): Path<Uuid>,
-) -> Result<Json<WebhookStatus>, WebhookError> {
+) -> Result<Json<WebhookStatus>, AppError> {
     let (channel, config) = telegram_channel(&state, channel_id).await?;
     Ok(Json(status_of(&state, &channel, &config).await?))
 }
@@ -599,7 +599,7 @@ pub async fn webhook_status(
 pub async fn webhook_register(
     State(state): State<Arc<AppState>>,
     Path(channel_id): Path<Uuid>,
-) -> Result<Json<WebhookStatus>, WebhookError> {
+) -> Result<Json<WebhookStatus>, AppError> {
     let (channel, config) = telegram_channel(&state, channel_id).await?;
     let url = endpoint_for(
         &state.config.public_base_url,
@@ -614,7 +614,7 @@ pub async fn webhook_register(
         &config.bot_secret,
     )
     .await
-    .map_err(|e| WebhookError::BadGateway(format!("setWebhook failed: {e}")))?;
+    .map_err(|e| AppError::BadGateway(format!("setWebhook failed: {e}")))?;
 
     Ok(Json(status_of(&state, &channel, &config).await?))
 }

@@ -7,7 +7,7 @@ use tokio::time::timeout;
 use uuid::Uuid;
 
 use crate::config::AppState;
-use crate::error::WebhookError;
+use crate::error::AppError;
 use crate::model::{
     EventKind, IncomingEvent, IncomingRead, NewMessage, OperatorInbound, ProviderKind, WsOutbound,
 };
@@ -22,7 +22,7 @@ pub async fn operator_ws(
     State(state): State<Arc<AppState>>,
     Query(params): Query<WsTokenParams>,
     ws: WebSocketUpgrade,
-) -> Result<impl IntoResponse, WebhookError> {
+) -> Result<impl IntoResponse, AppError> {
     let (operator_id, new_token) = resolve_operator(
         params.token.as_deref(),
         &state.config.widget_jwt_secret,
@@ -31,7 +31,7 @@ pub async fn operator_ws(
     .await
     .map_err(|e| {
         tracing::error!("db error resolving operator: {e}");
-        WebhookError::Internal("internal server error".into())
+        AppError::Internal("internal server error".into())
     })?;
 
     Ok(ws.on_upgrade(move |socket| handle_operator_socket(socket, operator_id, new_token, state)))

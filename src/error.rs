@@ -2,7 +2,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 
 #[derive(Debug, thiserror::Error)]
-pub enum WebhookError {
+pub enum AppError {
     #[error("forbidden: {0}")]
     Forbidden(String),
 
@@ -26,29 +26,29 @@ pub enum WebhookError {
     Internal(String),
 }
 
-impl IntoResponse for WebhookError {
+impl IntoResponse for AppError {
     fn into_response(self) -> axum::response::Response {
         // Conflict is the only variant with a structured body.
-        if let WebhookError::Conflict(body) = self {
+        if let AppError::Conflict(body) = self {
             return (StatusCode::CONFLICT, axum::Json(body)).into_response();
         }
 
         let status = match &self {
-            WebhookError::Forbidden(_) => StatusCode::FORBIDDEN,
-            WebhookError::BadRequest(_) => StatusCode::BAD_REQUEST,
-            WebhookError::NotFound(_) => StatusCode::NOT_FOUND,
-            WebhookError::BadGateway(_) => StatusCode::BAD_GATEWAY,
-            WebhookError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
-            WebhookError::Conflict(_) => unreachable!("handled above"),
+            AppError::Forbidden(_) => StatusCode::FORBIDDEN,
+            AppError::BadRequest(_) => StatusCode::BAD_REQUEST,
+            AppError::NotFound(_) => StatusCode::NOT_FOUND,
+            AppError::BadGateway(_) => StatusCode::BAD_GATEWAY,
+            AppError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            AppError::Conflict(_) => unreachable!("handled above"),
         };
         (status, self.to_string()).into_response()
     }
 }
 
-impl From<sqlx::Error> for WebhookError {
+impl From<sqlx::Error> for AppError {
     fn from(e: sqlx::Error) -> Self {
         tracing::error!("database error: {e}");
-        WebhookError::Internal("internal server error".into())
+        AppError::Internal("internal server error".into())
     }
 }
 
@@ -59,7 +59,7 @@ mod tests {
 
     #[tokio::test]
     async fn conflict_responds_409_with_a_json_body() {
-        let err = WebhookError::Conflict(serde_json::json!({
+        let err = AppError::Conflict(serde_json::json!({
             "error": "channel_deleted",
             "channel_id": "550e8400-e29b-41d4-a716-446655440000"
         }));
@@ -74,7 +74,7 @@ mod tests {
 
     #[test]
     fn bad_gateway_responds_502() {
-        let err = WebhookError::BadGateway("setWebhook failed: timeout".into());
+        let err = AppError::BadGateway("setWebhook failed: timeout".into());
         assert_eq!(err.into_response().status(), StatusCode::BAD_GATEWAY);
     }
 }

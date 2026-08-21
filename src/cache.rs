@@ -5,7 +5,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::db::{self, Channel, ChatInfo, Client};
-use crate::error::WebhookError;
+use crate::error::AppError;
 use crate::model::ProviderKind;
 
 /// In-memory channel cache with read-through to Postgres.
@@ -53,7 +53,7 @@ impl ChannelCache {
         &self,
         pool: &PgPool,
         channel_id: Uuid,
-    ) -> Result<Option<Channel>, WebhookError> {
+    ) -> Result<Option<Channel>, AppError> {
         if let Some(cached) = self.by_id.read().unwrap().get(&channel_id) {
             return Ok(Some(cached.clone()));
         }
@@ -72,7 +72,7 @@ impl ChannelCache {
         pool: &PgPool,
         provider: ProviderKind,
         external_key: &str,
-    ) -> Result<Option<Channel>, WebhookError> {
+    ) -> Result<Option<Channel>, AppError> {
         let key = (provider.clone(), external_key.to_owned());
         if let Some(&uuid) = self.ext_index.read().unwrap().get(&key)
             && let Some(cached) = self.by_id.read().unwrap().get(&uuid)

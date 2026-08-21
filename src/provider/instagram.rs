@@ -8,7 +8,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::cache::{ChannelCache, ClientCache};
-use crate::error::WebhookError;
+use crate::error::AppError;
 use crate::model::{EventKind, NewMessage, ProviderKind};
 use crate::provider::WebhookProvider;
 
@@ -42,22 +42,22 @@ impl InstagramProvider {
 }
 
 impl WebhookProvider for InstagramProvider {
-    fn verify(&self, headers: &HeaderMap, body: &[u8]) -> Result<(), WebhookError> {
+    fn verify(&self, headers: &HeaderMap, body: &[u8]) -> Result<(), AppError> {
         let signature = headers
             .get("X-Hub-Signature-256")
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("sha256="))
-            .ok_or_else(|| WebhookError::Forbidden("missing X-Hub-Signature-256".into()))?;
+            .ok_or_else(|| AppError::Forbidden("missing X-Hub-Signature-256".into()))?;
 
         let mut mac = Hmac::<Sha256>::new_from_slice(self.app_secret.as_bytes())
-            .map_err(|e| WebhookError::Internal(e.to_string()))?;
+            .map_err(|e| AppError::Internal(e.to_string()))?;
         mac.update(body);
 
         let sig_bytes = hex::decode(signature)
-            .map_err(|_| WebhookError::Forbidden("invalid signature hex".into()))?;
+            .map_err(|_| AppError::Forbidden("invalid signature hex".into()))?;
 
         mac.verify_slice(&sig_bytes)
-            .map_err(|_| WebhookError::Forbidden("signature mismatch".into()))?;
+            .map_err(|_| AppError::Forbidden("signature mismatch".into()))?;
 
         Ok(())
     }
@@ -67,12 +67,12 @@ impl WebhookProvider for InstagramProvider {
         body: &[u8],
         db: &PgPool,
         redis: redis::aio::ConnectionManager,
-    ) -> Result<Vec<NewMessage>, WebhookError> {
+    ) -> Result<Vec<NewMessage>, AppError> {
         let payload: MetaWebhookPayload =
-            serde_json::from_slice(body).map_err(|e| WebhookError::BadRequest(e.to_string()))?;
+            serde_json::from_slice(body).map_err(|e| AppError::BadRequest(e.to_string()))?;
 
         if payload.object != "instagram" {
-            return Err(WebhookError::BadRequest(format!(
+            return Err(AppError::BadRequest(format!(
                 "unexpected object: {}",
                 payload.object
             )));
