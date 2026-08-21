@@ -33,13 +33,11 @@ fn drop_query(query: &str, id: Uuid) {
 
 /// RAII guard that deletes a test row on drop, even if the test panics.
 pub struct TestChannel {
-    pub table: &'static str,
     pub id: Uuid,
 }
 
 impl Drop for TestChannel {
     fn drop(&mut self) {
-        let table = self.table;
         let id = self.id;
         let db_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
         std::thread::scope(|s| {
@@ -62,7 +60,6 @@ impl Drop for TestChannel {
                     for (client_id,) in &client_ids {
                         let _ = sqlx::query("DELETE FROM clients WHERE id = $1").bind(client_id).execute(&pool).await;
                     }
-                    let _ = sqlx::query(&format!("DELETE FROM {} WHERE id = $1", table)).bind(id).execute(&pool).await;
                     let _ = sqlx::query("DELETE FROM channels WHERE id = $1").bind(id).execute(&pool).await;
                 });
             });

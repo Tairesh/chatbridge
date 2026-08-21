@@ -104,9 +104,9 @@ Multi-provider chat bridge for **Instagram**, **Telegram**, and **WebSocket chat
                             │  :5432   │      │   :6379   │
                             └─────────┘      └───────────┘
                          channels             pub/sub channels:
-                         instagram_channels   incoming_messages
-                         telegram_channels    cache_invalidation
-                         widget_channels
+                         clients              incoming_messages
+                         operators            cache_invalidation
+                         chats
                          clients
                          operators
                          chats
@@ -160,7 +160,7 @@ src/
 ├── lib.rs               # Public module re-exports
 ├── cache.rs             # In-memory caches (channel, client, operator, chat) with Redis Pub/Sub invalidation; ClientCache dual-keyed by UUID + (provider, external_id)
 ├── config.rs            # AppConfig (env vars) + AppState (config + DB pool + Redis + caches + registry + shutdown token)
-├── db.rs                # Postgres pool, migrations, channel/client/operator/chat queries, message persistence
+├── db.rs                # Postgres pool, migrations, single-table channel queries + CRUD, client/operator/chat queries, message persistence
 ├── error.rs             # WebhookError → HTTP status mapping
 ├── jwt.rs               # HS256 JWT sign/verify for WebSocket identity (widget clients + operators)
 ├── registry.rs          # ClientRegistry (tracks active WS connections per client/operator UUID via mpsc channels)
@@ -172,12 +172,13 @@ src/
 │   ├── webhook.rs       # HTTP webhook handlers (meta_verify, instagram_ingest, telegram_ingest)
 │   ├── widget_ws.rs     # Widget WebSocket handler
 │   ├── operator_ws.rs   # Operator WebSocket handler (async Telegram delivery via Bot API)
-│   └── api.rs           # REST API handlers (get_chats, get_chat_messages)
+│   ├── api.rs           # REST API handlers (get_chats, get_chat_messages)
+│   └── channels.rs      # Channel CRUD for the settings panel (list/create/update/delete, webhook status)
 ├── routes.rs            # Router assembly
 └── provider/
     ├── mod.rs           # WebhookProvider trait (verify + parse)
     ├── instagram.rs     # HMAC-SHA256 verification, Meta payload parsing, client identity via Graph API
-    └── telegram.rs      # Secret token verification, Telegram Update parsing, client resolution, outbound sendMessage via Bot API
+    └── telegram.rs      # Secret token verification, Telegram Update parsing, client resolution, Bot API calls (sendMessage, getMe, setWebhook, deleteWebhook, getWebhookInfo)
 
 docker/
 ├── Dockerfile           # Multi-stage build
@@ -218,6 +219,8 @@ export INSTAGRAM_VERIFY_TOKEN=your_token
 export INSTAGRAM_APP_SECRET=your_secret
 export DATABASE_URL=postgres://chatbridge:chatbridge@localhost:5432/chatbridge
 export REDIS_URL=redis://localhost:6379
+export WIDGET_JWT_SECRET=your-jwt-secret-here-at-least-32-bytes
+export PUBLIC_BASE_URL=https://your-public-host
 
 # Build and run
 cargo build
@@ -235,6 +238,8 @@ Migrations run automatically on startup.
 | `DATABASE_URL` | yes | — | Postgres connection string |
 | `REDIS_URL` | yes | — | Redis connection string |
 | `WIDGET_JWT_SECRET` | yes | — | HMAC-SHA256 secret for WebSocket JWTs (widget clients + operators) |
+| `PUBLIC_BASE_URL` | yes | — | Public origin of this deployment, no trailing slash. Builds Telegram webhook URLs and the `endpoint` field of a channel |
+| `TELEGRAM_API_BASE` | no | `https://api.telegram.org` | Telegram Bot API origin. Point it at a fake Bot API for local work |
 
 ## Testing
 
@@ -269,6 +274,11 @@ Integration tests cover:
 - Telegram client reuse (same client_id across messages from same user)
 - Channel cache (read-through, per-channel invalidation, Redis Pub/Sub eviction, cross-channel isolation)
 - Client cache invalidation via Redis Pub/Sub
+- Channel CRUD (create widget/instagram/telegram, 409 on a live and on a deleted identity,
+  `setWebhook` rollback, provider change rejected, token rotation vs different bot, soft delete
+  idempotency, deleted channel invisible to the hot path and absent from the operator inbox)
+- Webhook status (match, hijacked URL, delivery errors, re-register, non-telegram and deleted
+  channels rejected)
 
 Test data cleanup uses RAII drop guards (`TestChannel`, `TestClient`, `TestChat`, `TestMessage`, `TestOperator`) in `tests/common/` to ensure rows are deleted even if a test panics.
 

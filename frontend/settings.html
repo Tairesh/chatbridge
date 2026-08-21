@@ -1,0 +1,509 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Channel Settings</title>
+  <link rel="stylesheet" href="style.css">
+  <style>
+    #page { max-width: 900px; margin: 0 auto; padding: 24px 16px 48px; }
+
+    .card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 24px; }
+    .card h2 { font-size: 15px; font-weight: 600; margin-bottom: 12px; }
+
+    .form-row { margin-bottom: 12px; }
+    .form-row label { display: block; font-size: 12px; font-weight: 600; color: var(--text-muted); margin-bottom: 4px; }
+    .form-row .input { width: 100%; }
+    .hint { font-size: 12px; color: var(--text-faint); margin-top: 4px; }
+
+    .banner { padding: 10px 12px; border-radius: 6px; font-size: 13px; margin-bottom: 12px; background: #fef2f2; color: var(--danger); border: 1px solid #fca5a5; }
+    .banner .btn { margin-left: 8px; }
+
+    .channel { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 12px 16px; margin-bottom: 8px; }
+    .channel.deleted { opacity: 0.55; }
+    .channel.highlight { border-color: var(--accent); box-shadow: 0 0 0 2px #dbeafe; }
+    .channel-head { display: flex; align-items: center; gap: 8px; cursor: pointer; }
+    .channel-name { font-weight: 600; font-size: 14px; }
+    .channel-deleted { font-size: 12px; color: var(--danger); margin-left: auto; }
+    .channel-meta { margin-top: 6px; font-size: 12px; color: var(--text-muted); display: grid; gap: 2px; }
+    .channel-meta .k { display: inline-block; min-width: 72px; color: var(--text-faint); }
+
+    .channel-body { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border); }
+    .channel-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+    .webhook-status { margin-top: 10px; padding: 8px 10px; border-radius: 6px; font-size: 12px; }
+    .webhook-ok { background: #ecfdf5; color: var(--ok); border: 1px solid #6ee7b7; }
+    .webhook-warn { background: #fffbeb; color: var(--warn); border: 1px solid #fcd34d; }
+    .webhook-bad { background: #fef2f2; color: var(--danger); border: 1px solid #fca5a5; }
+  </style>
+</head>
+<body>
+  <div class="topbar">
+    <span>Channel Settings</span>
+    <a href="operator.html">&larr; Chats</a>
+  </div>
+
+  <div id="page">
+    <section id="create-section" class="card">
+      <h2>Add a channel</h2>
+
+      <div class="form-row">
+        <label for="create-provider">Provider</label>
+        <select id="create-provider" class="input">
+          <option value="widget">Widget</option>
+          <option value="telegram">Telegram</option>
+          <option value="instagram">Instagram</option>
+        </select>
+      </div>
+
+      <div class="form-row" data-provider="widget">
+        <label for="create-widget-id">widget_id</label>
+        <input id="create-widget-id" class="input" placeholder="acme-support" />
+        <p class="hint">Letters, digits, <code>-</code> and <code>_</code>, up to 64 characters.
+          It becomes part of the widget's WebSocket URL, so it cannot contain spaces or slashes.</p>
+      </div>
+
+      <div class="form-row" data-provider="telegram">
+        <label for="create-bot-token">Bot token</label>
+        <input id="create-bot-token" class="input" placeholder="123456789:AA..." />
+        <p class="hint">From BotFather. The token is verified and the webhook registered automatically.</p>
+      </div>
+
+      <div class="form-row" data-provider="widget telegram">
+        <label for="create-name">Name (optional)</label>
+        <input id="create-name" class="input"
+               placeholder="defaults to the widget_id, or the bot's @username" />
+      </div>
+
+      <div class="form-row" data-provider="instagram">
+        <button class="btn" disabled>Log in with Instagram (coming soon)</button>
+        <p class="hint">Instagram channels cannot be created here yet. An existing Instagram
+          channel can still be edited in the list below.</p>
+      </div>
+
+      <div id="create-error" class="banner" hidden></div>
+
+      <div class="form-row" data-provider="widget telegram">
+        <button id="create-submit" class="btn">Create channel</button>
+      </div>
+    </section>
+
+    <section>
+      <div id="channel-list"></div>
+    </section>
+  </div>
+
+  <script>
+    const BASE_URL = location.origin;
+
+    let channels = [];
+    let expandedId = null;
+
+    // ── Loading and rendering ────────────────────────────────────
+
+    async function loadChannels() {
+      try {
+        const resp = await fetch(`${BASE_URL}/api/channels`);
+        if (!resp.ok) throw new Error(await resp.text());
+        channels = await resp.json();
+        renderList();
+      } catch (e) {
+        showBanner('create-error', `Failed to load channels: ${e}`);
+      }
+    }
+
+    function renderList() {
+      const list = document.getElementById('channel-list');
+      list.innerHTML = '';
+      if (!channels.length) {
+        list.innerHTML = '<p class="hint">No channels yet.</p>';
+        return;
+      }
+      // The API already sorts live channels before deleted ones.
+      for (const ch of channels) list.appendChild(renderRow(ch));
+    }
+
+    function renderRow(ch) {
+      const row = document.createElement('div');
+      row.className = 'channel' + (ch.deleted_at ? ' deleted' : '');
+      row.dataset.channelId = ch.id;
+      row.innerHTML = `
+        <div class="channel-head">
+          <span class="provider-badge provider-${escapeAttr(ch.provider)}">${escapeHtml(ch.provider)}</span>
+          <span class="channel-name">${escapeHtml(ch.name)}</span>
+          ${ch.deleted_at ? `<span class="channel-deleted">deleted ${formatDate(ch.deleted_at)}</span>` : ''}
+        </div>
+        <div class="channel-meta">
+          <div><span class="k">identity</span>${escapeHtml(ch.external_key)}</div>
+          <div><span class="k">endpoint</span>${escapeHtml(ch.endpoint)}</div>
+          <div><span class="k">created</span>${formatDate(ch.created_at)}</div>
+        </div>
+      `;
+      row.appendChild(renderBody(ch));
+      row.querySelector('.channel-head').addEventListener('click', () => {
+        expandedId = expandedId === ch.id ? null : ch.id;
+        renderList();
+      });
+      if (expandedId === ch.id) row.querySelector('.channel-body').hidden = false;
+      return row;
+    }
+
+    function renderBody(ch) {
+      const body = document.createElement('div');
+      body.className = 'channel-body';
+      body.hidden = true;
+
+      // Secrets are shown in plain text on purpose — the panel exists to edit them.
+      // See docs/tech_debt.md for why that is acceptable today.
+      let fields = '';
+      if (ch.provider === 'widget') {
+        fields = field(ch.id, 'widget_id', 'widget_id', ch.external_key);
+      } else if (ch.provider === 'telegram') {
+        fields = field(ch.id, 'bot_token', 'Bot token', ch.config.bot_token || '');
+      } else {
+        fields =
+          field(ch.id, 'user_id', 'user_id', ch.external_key) +
+          field(ch.id, 'access_token', 'Access token', ch.config.access_token || '');
+      }
+
+      const restoreNote = ch.deleted_at
+        ? `<p class="hint">Restoring keeps this channel's id and its whole message history.
+             Check the values above first — a Telegram token may have been regenerated since.</p>`
+        : '';
+
+      const widgetWarning =
+        ch.provider === 'widget' && !ch.deleted_at
+          ? `<p class="hint">Changing the widget_id breaks any embed already installed on a site.</p>`
+          : '';
+
+      body.innerHTML = `
+        ${field(ch.id, 'name', 'Name', ch.name)}
+        ${fields}
+        ${widgetWarning}
+        ${restoreNote}
+        <div class="banner" id="err-${ch.id}" hidden></div>
+        <div class="channel-actions"></div>
+        <div id="webhook-${ch.id}"></div>
+      `;
+
+      const actions = body.querySelector('.channel-actions');
+      if (ch.deleted_at) {
+        actions.appendChild(button('Restore', 'btn', () => saveChannel(ch, true)));
+      } else {
+        actions.appendChild(button('Save', 'btn', () => saveChannel(ch, false)));
+        if (ch.provider === 'telegram') {
+          actions.appendChild(
+            button('Check webhook', 'btn btn-secondary', () => checkWebhook(ch, 'GET'))
+          );
+          actions.appendChild(
+            button('Re-register', 'btn btn-secondary', () => checkWebhook(ch, 'POST'))
+          );
+        }
+        actions.appendChild(button('Delete', 'btn btn-danger', () => deleteChannel(ch)));
+      }
+      return body;
+    }
+
+    function field(channelId, key, label, value) {
+      const inputId = `f-${channelId}-${key}`;
+      return `
+        <div class="form-row">
+          <label for="${inputId}">${escapeHtml(label)}</label>
+          <input id="${inputId}" class="input" data-key="${key}" value="${escapeAttr(value)}" />
+        </div>
+      `;
+    }
+
+    function button(label, className, onClick) {
+      const el = document.createElement('button');
+      el.className = className;
+      el.textContent = label;
+      el.addEventListener('click', onClick);
+      return el;
+    }
+
+    function readField(channelId, key) {
+      return document.getElementById(`f-${channelId}-${key}`).value.trim();
+    }
+
+    function highlightRow(channelId) {
+      for (const el of document.querySelectorAll('.channel.highlight')) {
+        el.classList.remove('highlight');
+      }
+      const row = document.querySelector(`.channel[data-channel-id="${channelId}"]`);
+      if (row) {
+        row.classList.add('highlight');
+        row.scrollIntoView({ block: 'center' });
+      }
+    }
+
+    // ── Creation ─────────────────────────────────────────────────
+
+    function syncCreateForm() {
+      const provider = document.getElementById('create-provider').value;
+      for (const el of document.querySelectorAll('#create-section [data-provider]')) {
+        el.hidden = !el.dataset.provider.split(' ').includes(provider);
+      }
+      hideBanner('create-error');
+    }
+
+    function readCreateBody() {
+      const provider = document.getElementById('create-provider').value;
+      const body = { provider };
+      if (provider === 'widget') {
+        body.widget_id = document.getElementById('create-widget-id').value.trim();
+      } else if (provider === 'telegram') {
+        body.bot_token = document.getElementById('create-bot-token').value.trim();
+      }
+      const name = document.getElementById('create-name').value.trim();
+      if (name) body.name = name;
+      return body;
+    }
+
+    async function submitCreate() {
+      const body = readCreateBody();
+      const button = document.getElementById('create-submit');
+      button.disabled = true;
+      try {
+        const resp = await fetch(`${BASE_URL}/api/channels`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        if (resp.status === 409) {
+          // Reload BEFORE handling: renderList() rebuilds #channel-list from
+          // scratch, which would drop the .highlight class handleConflict adds.
+          const conflict = await resp.json();
+          await loadChannels();
+          handleConflict(conflict, body);
+          return;
+        }
+        if (!resp.ok) {
+          showBanner('create-error', await resp.text());
+          return;
+        }
+        for (const id of ['create-widget-id', 'create-bot-token', 'create-name']) {
+          document.getElementById(id).value = '';
+        }
+        hideBanner('create-error');
+        await loadChannels();
+      } catch (e) {
+        showBanner('create-error', String(e));
+      } finally {
+        button.disabled = false;
+      }
+    }
+
+    /**
+     * A 409 is a prompt, not a dead end. `channel_exists` points at the live row;
+     * `channel_deleted` offers to restore, reusing the values just typed.
+     */
+    function handleConflict(body, submitted) {
+      if (body.error === 'channel_deleted') {
+        const el = document.getElementById('create-error');
+        el.innerHTML =
+          `A channel with this identity ("${escapeHtml(body.name)}") was deleted on ` +
+          `${formatDate(body.deleted_at)}. Restoring keeps its id and its whole history, ` +
+          `and applies the values you just entered.`;
+        el.hidden = false;
+        el.appendChild(
+          button('Restore it', 'btn', () => {
+            const patch = { restore: true, spec: specOf(submitted) };
+            if (submitted.name) patch.name = submitted.name;
+            patchChannel(body.channel_id, patch, 'create-error');
+          })
+        );
+      } else {
+        showBanner('create-error', `A channel with this identity already exists: "${body.name}".`);
+      }
+      highlightRow(body.channel_id);
+    }
+
+    // ── Editing, deleting, restoring ─────────────────────────────
+
+    /**
+     * One request covers rename, edit and restore. Restore always carries the
+     * fields currently in the form, because the stored config may be stale — a
+     * Telegram token can be regenerated in BotFather while the channel is deleted.
+     */
+    async function saveChannel(ch, restore) {
+      const patch = { name: readField(ch.id, 'name') };
+      if (restore) patch.restore = true;
+
+      // Attach a spec only when one is actually needed. For telegram a spec costs
+      // getMe + setWebhook (+ deleteWebhook on a token change), so sending one on
+      // every Save would make a pure rename three Telegram round trips.
+      const spec = specFromForm(ch);
+      if (restore || specChanged(ch, spec)) patch.spec = spec;
+
+      await patchChannel(ch.id, patch);
+    }
+
+    function specFromForm(ch) {
+      if (ch.provider === 'widget') {
+        return { provider: 'widget', widget_id: readField(ch.id, 'widget_id') };
+      }
+      if (ch.provider === 'telegram') {
+        return { provider: 'telegram', bot_token: readField(ch.id, 'bot_token') };
+      }
+      return {
+        provider: 'instagram',
+        user_id: readField(ch.id, 'user_id'),
+        access_token: readField(ch.id, 'access_token'),
+      };
+    }
+
+    function specChanged(ch, spec) {
+      if (ch.provider === 'widget') return spec.widget_id !== ch.external_key;
+      if (ch.provider === 'telegram') return spec.bot_token !== (ch.config.bot_token || '');
+      return (
+        spec.user_id !== ch.external_key ||
+        spec.access_token !== (ch.config.access_token || '')
+      );
+    }
+
+    /**
+     * `bannerId` is a parameter because the caller is not always the channel's own
+     * row: the restore prompt lives in #create-error, and that row's own banner is
+     * inside a collapsed .channel-body, where the operator would never see it.
+     */
+    async function patchChannel(channelId, patch, bannerId = `err-${channelId}`) {
+      try {
+        const resp = await fetch(`${BASE_URL}/api/channels/${channelId}`, {
+          method: 'PATCH',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(patch),
+        });
+        if (resp.status === 409) {
+          const body = await resp.json();
+          showBanner(bannerId, `That identity is taken by "${body.name}".`);
+          highlightRow(body.channel_id);
+          return;
+        }
+        if (!resp.ok) {
+          showBanner(bannerId, await resp.text());
+          return;
+        }
+        expandedId = channelId;
+        await loadChannels();
+      } catch (e) {
+        showBanner(bannerId, String(e));
+      }
+    }
+
+    async function deleteChannel(ch) {
+      const confirmed = confirm(
+        `Delete "${ch.name}"?\n\nIts message history is kept and it can be restored later. ` +
+          `Its open conversations leave the operator inbox` +
+          (ch.provider === 'telegram' ? ` and its Telegram webhook is removed.` : `.`)
+      );
+      if (!confirmed) return;
+      try {
+        const resp = await fetch(`${BASE_URL}/api/channels/${ch.id}`, { method: 'DELETE' });
+        if (!resp.ok) {
+          showBanner(`err-${ch.id}`, await resp.text());
+          return;
+        }
+        expandedId = null;
+        await loadChannels();
+      } catch (e) {
+        showBanner(`err-${ch.id}`, String(e));
+      }
+    }
+
+    // ── Webhook status ───────────────────────────────────────────
+
+    /**
+     * `GET` reports, `POST` re-registers and reports in the same response.
+     * Never called automatically on page load: N telegram channels would be N
+     * Telegram round trips per render, tying this page to Telegram's uptime and
+     * rate limits for information nobody reads on most visits.
+     */
+    async function checkWebhook(ch, method) {
+      const target = document.getElementById(`webhook-${ch.id}`);
+      target.innerHTML = '<div class="webhook-status">Checking…</div>';
+      try {
+        const resp = await fetch(`${BASE_URL}/api/channels/${ch.id}/webhook`, { method });
+        if (!resp.ok) {
+          target.innerHTML =
+            `<div class="webhook-status webhook-bad">${escapeHtml(await resp.text())}</div>`;
+          return;
+        }
+        target.innerHTML = renderWebhookStatus(await resp.json());
+      } catch (e) {
+        target.innerHTML = `<div class="webhook-status webhook-bad">${escapeHtml(String(e))}</div>`;
+      }
+    }
+
+    function renderWebhookStatus(status) {
+      if (status.matches && !status.last_error_message) {
+        return `<div class="webhook-status webhook-ok">Webhook active.
+                  ${status.pending_update_count} pending updates.</div>`;
+      }
+      if (status.matches) {
+        // Telegram's own report of failures delivering to us.
+        return `<div class="webhook-status webhook-warn">Active, but Telegram reports delivery
+                  errors: ${escapeHtml(status.last_error_message)}
+                  (${status.pending_update_count} pending updates).</div>`;
+      }
+      if (!status.registered_url) {
+        return `<div class="webhook-status webhook-bad">No webhook registered.
+                  Press "Re-register".</div>`;
+      }
+      return `<div class="webhook-status webhook-bad">Webhook points elsewhere:
+                ${escapeHtml(status.registered_url)}<br>Expected:
+                ${escapeHtml(status.expected_url)}<br>Press "Re-register" to take it back.</div>`;
+    }
+
+    // ── Helpers ──────────────────────────────────────────────────
+
+    /** Strip the display name, leaving a bare ChannelSpec for the API. */
+    function specOf(body) {
+      const { name, ...spec } = body;
+      return spec;
+    }
+
+    // Both tolerate a missing element: a row's banner only exists once the list
+    // has rendered, and an error can arrive before that.
+    function showBanner(id, message) {
+      const el = document.getElementById(id);
+      if (!el) return;
+      el.textContent = message;
+      el.hidden = false;
+    }
+
+    function hideBanner(id) {
+      const el = document.getElementById(id);
+      if (!el) return;
+      el.textContent = '';
+      el.hidden = true;
+    }
+
+    function formatDate(isoString) {
+      if (!isoString) return '';
+      return new Date(isoString).toLocaleString();
+    }
+
+    function escapeHtml(str) {
+      const div = document.createElement('div');
+      div.textContent = str ?? '';
+      return div.innerHTML;
+    }
+
+    /**
+     * escapeHtml covers text nodes: it escapes & < > but NOT quotes. Attribute
+     * values need those too — a channel name is free-form operator input, and a
+     * double quote in it would break out of value="…".
+     */
+    function escapeAttr(str) {
+      return escapeHtml(str).replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+    }
+
+    // ── Init ─────────────────────────────────────────────────────
+
+    document.getElementById('create-provider').addEventListener('change', syncCreateForm);
+    document.getElementById('create-submit').addEventListener('click', submitCreate);
+    syncCreateForm();
+    loadChannels();
+  </script>
+</body>
+</html>

@@ -25,6 +25,13 @@ pub struct AppConfig {
     pub instagram_app_secret: String,
     pub redis_url: String,
     pub widget_jwt_secret: String,
+    /// Public origin of this deployment, without a trailing slash. Used to build
+    /// webhook URLs for `setWebhook` and the `endpoint` field of a channel.
+    pub public_base_url: String,
+    /// Telegram Bot API origin. Overridable so a local run can point at a fake
+    /// Bot API. Integration tests do not use this path — they build `AppConfig`
+    /// directly and pass their mock's URL in.
+    pub telegram_api_base: String,
 }
 
 impl AppConfig {
@@ -37,6 +44,12 @@ impl AppConfig {
             redis_url: std::env::var("REDIS_URL").expect("REDIS_URL must be set"),
             widget_jwt_secret: std::env::var("WIDGET_JWT_SECRET")
                 .expect("WIDGET_JWT_SECRET must be set"),
+            public_base_url: std::env::var("PUBLIC_BASE_URL")
+                .expect("PUBLIC_BASE_URL must be set")
+                .trim_end_matches('/')
+                .to_owned(),
+            telegram_api_base: std::env::var("TELEGRAM_API_BASE")
+                .unwrap_or_else(|_| "https://api.telegram.org".into()),
         }
     }
 }

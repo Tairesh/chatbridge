@@ -23,7 +23,11 @@ pub async fn widget_ws(
     Query(params): Query<WsTokenParams>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    let channel = match state.cache.get_widget_channel(&state.db, &widget_id).await {
+    let channel = match state
+        .cache
+        .get_channel_by_external_key(&state.db, ProviderKind::Widget, &widget_id)
+        .await
+    {
         Ok(Some(ch)) => ch,
         Ok(None) => {
             tracing::warn!(widget_id = %widget_id, "unknown widget_id");

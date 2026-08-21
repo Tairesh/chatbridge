@@ -4,12 +4,11 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Operator Dashboard</title>
+  <link rel="stylesheet" href="style.css">
   <style>
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    body { font-family: system-ui, sans-serif; display: flex; height: 100vh; background: #f0f2f5; }
+    body { display: flex; height: 100vh; }
 
     #sidebar { width: 360px; background: #fff; border-right: 1px solid #e5e7eb; display: flex; flex-direction: column; }
-    #sidebar-header { padding: 16px; background: #1e293b; color: #fff; font-weight: 600; font-size: 18px; display: flex; justify-content: space-between; align-items: center; }
     #ws-status { font-size: 12px; font-weight: 400; opacity: 0.85; }
     #chat-list { flex: 1; overflow-y: auto; }
     .chat-item { padding: 12px 16px; border-bottom: 1px solid #f3f4f6; cursor: pointer; transition: background 0.15s; }
@@ -18,10 +17,6 @@
     .chat-client { font-weight: 600; font-size: 14px; color: #1f2937; display: flex; align-items: center; gap: 6px; }
     .chat-preview { font-size: 13px; color: #6b7280; margin-top: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .chat-time { font-size: 11px; color: #9ca3af; margin-top: 2px; }
-    .provider-badge { font-size: 10px; font-weight: 600; padding: 1px 6px; border-radius: 4px; text-transform: uppercase; }
-    .provider-widget { background: #dbeafe; color: #1d4ed8; }
-    .provider-instagram { background: #fce7f3; color: #be185d; }
-    .provider-telegram { background: #d1fae5; color: #047857; }
 
     #main { flex: 1; display: flex; flex-direction: column; }
     #main-header { padding: 16px; background: #fff; border-bottom: 1px solid #e5e7eb; font-weight: 600; font-size: 16px; color: #374151; }
@@ -38,17 +33,17 @@
     #empty-state { flex: 1; display: flex; align-items: center; justify-content: center; color: #9ca3af; font-size: 16px; }
 
     #compose { padding: 12px 16px; background: #fff; border-top: 1px solid #e5e7eb; display: none; gap: 8px; }
-    #compose-input { flex: 1; padding: 8px 12px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 14px; outline: none; }
-    #compose-input:focus { border-color: #2563eb; }
-    #compose-send { padding: 8px 16px; background: #2563eb; color: #fff; border: none; border-radius: 6px; cursor: pointer; font-size: 14px; }
-    #compose-send:hover { background: #1d4ed8; }
+    #compose-input { flex: 1; }
   </style>
 </head>
 <body>
   <div id="sidebar">
-    <div id="sidebar-header">
-      Chats
-      <span id="ws-status">Connecting...</span>
+    <div id="sidebar-header" class="topbar">
+      <span>Chats</span>
+      <span>
+        <a href="settings.html">Settings</a>
+        <span id="ws-status">Connecting...</span>
+      </span>
     </div>
     <div id="chat-list"></div>
   </div>
@@ -57,8 +52,8 @@
     <div id="empty-state">Select a chat from the sidebar to view messages</div>
     <div id="messages" style="display:none"></div>
     <div id="compose">
-      <input type="text" id="compose-input" placeholder="Type a message..." />
-      <button id="compose-send">Send</button>
+      <input type="text" id="compose-input" class="input" placeholder="Type a message..." />
+      <button id="compose-send" class="btn">Send</button>
     </div>
   </div>
 

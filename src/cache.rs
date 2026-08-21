@@ -4,17 +4,20 @@ use std::sync::RwLock;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::db::{self, ChatInfo, Client, InstagramChannel, TelegramChannel, WidgetChannel};
+use crate::db::{self, Channel, ChatInfo, Client};
 use crate::error::WebhookError;
 use crate::model::ProviderKind;
 
 /// In-memory channel cache with read-through to Postgres.
-/// Invalidated via Redis Pub/Sub on the `cache_invalidation` topic.
-/// Only caches positive lookups — misses always hit the database.
+/// Invalidated via Redis Pub/Sub on the `cache_invalidation` topic and directly
+/// by every channel CRUD mutation.
+/// Only caches positive lookups of live channels — misses always hit the database.
+///
+/// Dual-keyed like `ClientCache`: a primary store by UUID plus a secondary index
+/// from the provider's identity to that UUID.
 pub struct ChannelCache {
-    instagram: RwLock<HashMap<String, InstagramChannel>>,
-    telegram: RwLock<HashMap<Uuid, TelegramChannel>>,
-    widget: RwLock<HashMap<String, WidgetChannel>>,
+    by_id: RwLock<HashMap<Uuid, Channel>>,
+    ext_index: RwLock<HashMap<(ProviderKind, String), Uuid>>,
 }
 
 impl Default for ChannelCache {
@@ -26,80 +29,71 @@ impl Default for ChannelCache {
 impl ChannelCache {
     pub fn new() -> Self {
         Self {
-            instagram: RwLock::new(HashMap::new()),
-            telegram: RwLock::new(HashMap::new()),
-            widget: RwLock::new(HashMap::new()),
+            by_id: RwLock::new(HashMap::new()),
+            ext_index: RwLock::new(HashMap::new()),
         }
     }
 
-    pub async fn get_instagram_channel(
-        &self,
-        pool: &PgPool,
-        user_id: &str,
-    ) -> Result<Option<InstagramChannel>, WebhookError> {
-        if let Some(cached) = self.instagram.read().unwrap().get(user_id) {
-            return Ok(Some(cached.clone()));
-        }
-
-        let channel = db::find_instagram_channel_by_user_id(pool, user_id).await?;
-        if let Some(ref ch) = channel {
-            self.instagram
+    /// Insert a channel into both the primary store and the secondary index.
+    fn insert(&self, channel: &Channel) {
+        self.by_id
+            .write()
+            .unwrap()
+            .insert(channel.id, channel.clone());
+        if let Ok(provider) = channel.provider.parse::<ProviderKind>() {
+            self.ext_index
                 .write()
                 .unwrap()
-                .insert(user_id.to_owned(), ch.clone());
+                .insert((provider, channel.external_key.clone()), channel.id);
         }
-        Ok(channel)
     }
 
-    pub async fn get_telegram_channel(
+    /// Read-through lookup by channel UUID.
+    pub async fn get_channel_by_id(
         &self,
         pool: &PgPool,
         channel_id: Uuid,
-    ) -> Result<Option<TelegramChannel>, WebhookError> {
-        if let Some(cached) = self.telegram.read().unwrap().get(&channel_id) {
+    ) -> Result<Option<Channel>, WebhookError> {
+        if let Some(cached) = self.by_id.read().unwrap().get(&channel_id) {
             return Ok(Some(cached.clone()));
         }
 
-        let channel = db::find_telegram_channel_by_id(pool, channel_id).await?;
+        let channel = db::find_live_channel_by_id(pool, channel_id).await?;
         if let Some(ref ch) = channel {
-            self.telegram
-                .write()
-                .unwrap()
-                .insert(channel_id, ch.clone());
+            self.insert(ch);
         }
         Ok(channel)
     }
 
-    pub async fn get_widget_channel(
+    /// Read-through lookup by the provider's identity for the channel.
+    /// Resolves the UUID via the secondary index, then reads the primary store.
+    pub async fn get_channel_by_external_key(
         &self,
         pool: &PgPool,
-        widget_id: &str,
-    ) -> Result<Option<WidgetChannel>, WebhookError> {
-        if let Some(cached) = self.widget.read().unwrap().get(widget_id) {
+        provider: ProviderKind,
+        external_key: &str,
+    ) -> Result<Option<Channel>, WebhookError> {
+        let key = (provider.clone(), external_key.to_owned());
+        if let Some(&uuid) = self.ext_index.read().unwrap().get(&key)
+            && let Some(cached) = self.by_id.read().unwrap().get(&uuid)
+        {
             return Ok(Some(cached.clone()));
         }
 
-        let channel = db::find_widget_channel_by_widget_id(pool, widget_id).await?;
+        let channel = db::find_live_channel_by_external_key(pool, provider, external_key).await?;
         if let Some(ref ch) = channel {
-            self.widget
-                .write()
-                .unwrap()
-                .insert(widget_id.to_owned(), ch.clone());
+            self.insert(ch);
         }
         Ok(channel)
     }
 
-    /// Evict a single channel from the cache (all provider maps).
+    /// Evict a channel by UUID from both maps.
     pub fn invalidate(&self, channel_id: Uuid) {
-        self.instagram
+        self.by_id.write().unwrap().remove(&channel_id);
+        self.ext_index
             .write()
             .unwrap()
-            .retain(|_, v| v.id != channel_id);
-        self.telegram.write().unwrap().remove(&channel_id);
-        self.widget
-            .write()
-            .unwrap()
-            .retain(|_, v| v.id != channel_id);
+            .retain(|_, v| *v != channel_id);
     }
 }
 

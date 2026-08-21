@@ -266,10 +266,13 @@ async fn deliver_to_telegram(
 ) -> Result<(), String> {
     let channel = state
         .cache
-        .get_telegram_channel(&state.db, channel_id)
+        .get_channel_by_id(&state.db, channel_id)
         .await
         .map_err(|e| format!("channel lookup failed: {e}"))?
         .ok_or_else(|| "telegram channel not found".to_owned())?;
+
+    let config: crate::model::TelegramConfig =
+        serde_json::from_value(channel.config).map_err(|e| format!("bad telegram config: {e}"))?;
 
     let client = state
         .client_cache
@@ -285,7 +288,13 @@ async fn deliver_to_telegram(
     let message = crate::provider::telegram::OutboundMessage::Text {
         text: text.to_owned(),
     };
-    crate::provider::telegram::send(&channel.bot_token, &chat_id, &message).await
+    crate::provider::telegram::send(
+        &state.config.telegram_api_base,
+        &config.bot_token,
+        &chat_id,
+        &message,
+    )
+    .await
 }
 
 fn spawn_telegram_delivery(

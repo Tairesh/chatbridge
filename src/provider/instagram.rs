@@ -93,17 +93,29 @@ impl WebhookProvider for InstagramProvider {
                     continue;
                 };
 
-                let Some(channel) = self.cache.get_instagram_channel(db, recipient_id).await?
+                let Some(channel) = self
+                    .cache
+                    .get_channel_by_external_key(db, ProviderKind::Instagram, recipient_id)
+                    .await?
                 else {
                     tracing::warn!(?recipient_id, "no channel found for instagram event");
                     continue;
                 };
 
+                let config: crate::model::InstagramConfig =
+                    match serde_json::from_value(channel.config.clone()) {
+                        Ok(cfg) => cfg,
+                        Err(e) => {
+                            tracing::error!(channel_id = %channel.id, "bad instagram config: {e}");
+                            continue;
+                        }
+                    };
+
                 let client_id = resolve_instagram_client(
                     db,
                     &self.client_cache,
                     event.sender.as_ref(),
-                    &channel,
+                    &config.access_token,
                     redis.clone(),
                 )
                 .await;
@@ -149,15 +161,13 @@ fn classify_event(event: &MessagingEvent) -> (EventKind, Option<&String>) {
     (EventKind::Unknown, None)
 }
 
-use crate::db::InstagramChannel;
-
 /// Look up or create a client from the sender field, spawning a background
 /// task to fetch the Instagram profile and upsert the client row.
 async fn resolve_instagram_client(
     db: &PgPool,
     client_cache: &ClientCache,
     sender: Option<&Participant>,
-    channel: &InstagramChannel,
+    access_token: &str,
     redis: redis::aio::ConnectionManager,
 ) -> Option<Uuid> {
     let sid = sender?.id.as_str();
@@ -168,13 +178,13 @@ async fn resolve_instagram_client(
         Ok(Some(client)) => {
             let age = chrono::Utc::now() - client.updated_at;
             if age > chrono::TimeDelta::hours(24) {
-                spawn_instagram_upsert(db.clone(), client.id, sid, channel, redis);
+                spawn_instagram_upsert(db.clone(), client.id, sid, access_token, redis);
             }
             Some(client.id)
         }
         Ok(None) => {
             let client_id = Uuid::new_v4();
-            spawn_instagram_upsert(db.clone(), client_id, sid, channel, redis);
+            spawn_instagram_upsert(db.clone(), client_id, sid, access_token, redis);
             Some(client_id)
         }
         Err(e) => {
@@ -188,11 +198,11 @@ fn spawn_instagram_upsert(
     db: PgPool,
     client_id: Uuid,
     sid: &str,
-    channel: &InstagramChannel,
+    access_token: &str,
     redis: redis::aio::ConnectionManager,
 ) {
     let sid = sid.to_owned();
-    let token = channel.access_token.clone();
+    let token = access_token.to_owned();
     tokio::spawn(fetch_and_upsert_instagram_client(
         db, client_id, sid, token, redis,
     ));

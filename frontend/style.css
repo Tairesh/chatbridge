@@ -1,0 +1,82 @@
+/* Shared styles for the operator dashboard and the settings panel.
+   Page-specific layout stays in its own page.
+
+   Deliberately NOT used by widget.html: that page is embedded into third-party
+   sites, where an admin stylesheet has no business. */
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+:root {
+  --bg: #f0f2f5;
+  --surface: #fff;
+  --border: #e5e7eb;
+  --border-strong: #d1d5db;
+  --text: #1f2937;
+  --text-muted: #6b7280;
+  --text-faint: #9ca3af;
+  --header: #1e293b;
+  --accent: #2563eb;
+  --accent-hover: #1d4ed8;
+  --ok: #047857;
+  --warn: #b45309;
+  --danger: #b91c1c;
+}
+
+body {
+  font-family: system-ui, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+}
+
+.topbar {
+  padding: 16px;
+  background: var(--header);
+  color: #fff;
+  font-weight: 600;
+  font-size: 18px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.topbar a { color: #cbd5e1; font-size: 13px; font-weight: 400; text-decoration: none; }
+.topbar a:hover { color: #fff; }
+
+.provider-badge {
+  font-size: 10px;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 4px;
+  text-transform: uppercase;
+}
+.provider-widget { background: #dbeafe; color: #1d4ed8; }
+.provider-instagram { background: #fce7f3; color: #be185d; }
+.provider-telegram { background: #d1fae5; color: #047857; }
+
+.input {
+  padding: 8px 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  font-size: 14px;
+  font-family: inherit;
+  outline: none;
+}
+.input:focus { border-color: var(--accent); }
+
+.btn {
+  padding: 8px 16px;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 14px;
+  font-family: inherit;
+  background: var(--accent);
+  color: #fff;
+}
+.btn:hover { background: var(--accent-hover); }
+.btn:disabled { background: #cbd5e1; cursor: not-allowed; }
+
+.btn-secondary { background: var(--surface); color: var(--text); border: 1px solid var(--border-strong); }
+.btn-secondary:hover { background: #f9fafb; }
+
+.btn-danger { background: var(--surface); color: var(--danger); border: 1px solid #fca5a5; }
+.btn-danger:hover { background: #fef2f2; }

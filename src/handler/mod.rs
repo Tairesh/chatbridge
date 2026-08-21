@@ -1,4 +1,5 @@
 pub mod api;
+pub mod channels;
 pub mod operator_ws;
 pub mod webhook;
 pub mod widget_ws;

@@ -32,10 +32,12 @@ impl TelegramProvider {
         client_cache: Arc<ClientCache>,
     ) -> Result<(Self, String), WebhookError> {
         let channel = cache
-            .get_telegram_channel(db, channel_id)
+            .get_channel_by_id(db, channel_id)
             .await?
             .ok_or_else(|| WebhookError::NotFound(format!("channel {channel_id} not found")))?;
-        Ok((Self::new(channel_id, client_cache), channel.bot_secret))
+        let config: crate::model::TelegramConfig = serde_json::from_value(channel.config)
+            .map_err(|e| WebhookError::Internal(format!("bad telegram config: {e}")))?;
+        Ok((Self::new(channel_id, client_cache), config.bot_secret))
     }
 }
 
@@ -211,30 +213,19 @@ pub enum OutboundMessage {
     Text { text: String },
 }
 
-const TELEGRAM_API_BASE: &str = "https://api.telegram.org";
-
-pub async fn send(bot_token: &str, chat_id: &str, message: &OutboundMessage) -> Result<(), String> {
-    send_with_base_url(bot_token, chat_id, message, TELEGRAM_API_BASE).await
-}
-
-async fn send_with_base_url(
-    bot_token: &str,
-    chat_id: &str,
-    message: &OutboundMessage,
-    base_url: &str,
-) -> Result<(), String> {
-    let (method, body) = match message {
-        OutboundMessage::Text { text } => (
-            "sendMessage",
-            serde_json::json!({ "chat_id": chat_id, "text": text }),
-        ),
+/// Call a Bot API method and return its `result` field.
+///
+/// `body: None` issues a GET, which is what the read-only methods want.
+/// A Telegram-level failure (`ok: false`) is surfaced as its `description`
+/// verbatim, so an operator reads "HTTPS url must be provided" rather than a
+/// generic error.
+async fn call(url: &str, body: Option<serde_json::Value>) -> Result<serde_json::Value, String> {
+    let request = match body {
+        Some(ref b) => HTTP_CLIENT.post(url).json(b),
+        None => HTTP_CLIENT.get(url),
     };
 
-    let url = format!("{base_url}/bot{bot_token}/{method}");
-
-    let resp = HTTP_CLIENT
-        .post(&url)
-        .json(&body)
+    let resp = request
         .send()
         .await
         .map_err(|e| format!("HTTP request failed: {e}"))?;
@@ -245,11 +236,82 @@ async fn send_with_base_url(
         .map_err(|e| format!("failed to parse response: {e}"))?;
 
     if json["ok"].as_bool() == Some(true) {
-        Ok(())
+        Ok(json["result"].clone())
     } else {
-        let desc = json["description"].as_str().unwrap_or("unknown error");
-        Err(desc.to_owned())
+        Err(json["description"]
+            .as_str()
+            .unwrap_or("unknown error")
+            .to_owned())
     }
+}
+
+/// Result of `getMe` — the authoritative source of a bot's numeric id.
+#[derive(Debug, Deserialize)]
+pub struct BotInfo {
+    pub id: i64,
+    pub username: Option<String>,
+}
+
+pub async fn get_me(base_url: &str, bot_token: &str) -> Result<BotInfo, String> {
+    let json = call(&format!("{base_url}/bot{bot_token}/getMe"), None).await?;
+    serde_json::from_value(json).map_err(|e| format!("unexpected getMe response: {e}"))
+}
+
+/// Telegram keeps exactly one webhook per bot; this overwrites any previous one.
+pub async fn set_webhook(
+    base_url: &str,
+    bot_token: &str,
+    url: &str,
+    secret: &str,
+) -> Result<(), String> {
+    call(
+        &format!("{base_url}/bot{bot_token}/setWebhook"),
+        Some(serde_json::json!({ "url": url, "secret_token": secret })),
+    )
+    .await?;
+    Ok(())
+}
+
+pub async fn delete_webhook(base_url: &str, bot_token: &str) -> Result<(), String> {
+    call(
+        &format!("{base_url}/bot{bot_token}/deleteWebhook"),
+        Some(serde_json::json!({})),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Telegram's own view of the webhook, including its report of failures
+/// delivering *to us* (`last_error_message`).
+#[derive(Debug, Deserialize)]
+pub struct WebhookInfo {
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub pending_update_count: i64,
+    pub last_error_date: Option<i64>,
+    pub last_error_message: Option<String>,
+}
+
+pub async fn get_webhook_info(base_url: &str, bot_token: &str) -> Result<WebhookInfo, String> {
+    let json = call(&format!("{base_url}/bot{bot_token}/getWebhookInfo"), None).await?;
+    serde_json::from_value(json).map_err(|e| format!("unexpected getWebhookInfo response: {e}"))
+}
+
+pub async fn send(
+    base_url: &str,
+    bot_token: &str,
+    chat_id: &str,
+    message: &OutboundMessage,
+) -> Result<(), String> {
+    let (method, body) = match message {
+        OutboundMessage::Text { text } => (
+            "sendMessage",
+            serde_json::json!({ "chat_id": chat_id, "text": text }),
+        ),
+    };
+    call(&format!("{base_url}/bot{bot_token}/{method}"), Some(body)).await?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -393,46 +455,147 @@ mod tests {
         assert_eq!(build_display_name(&user), "Alice");
     }
 
-    async fn mock_telegram_api(response: serde_json::Value) -> String {
-        use axum::{Json, Router, routing::post};
-        use std::net::TcpListener;
+    /// Spawn a fake Bot API that answers every `/bot<token>/<method>` with the JSON
+    /// registered for `<method>`, falling back to `{"ok":true,"result":{}}`.
+    async fn mock_bot_api(responses: serde_json::Value) -> String {
+        use axum::extract::Path;
+        use axum::routing::any;
+        use axum::{Json, Router};
 
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-
+        let responses = Arc::new(responses);
         let app = Router::new().route(
-            "/bot{token}/sendMessage",
-            post(move || async move { Json(response) }),
+            "/bot{token}/{method}",
+            any(move |Path((_token, method)): Path<(String, String)>| {
+                let responses = responses.clone();
+                async move {
+                    let body = responses
+                        .get(method.as_str())
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!({"ok": true, "result": {}}));
+                    Json(body)
+                }
+            }),
         );
-        listener.set_nonblocking(true).unwrap();
-        let tcp = tokio::net::TcpListener::from_std(listener).unwrap();
-        tokio::spawn(axum::serve(tcp, app).into_future());
 
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
         format!("http://{addr}")
     }
 
     #[tokio::test]
     async fn send_text_message_success() {
-        let base_url = mock_telegram_api(serde_json::json!({"ok": true, "result": {}})).await;
-        let msg = OutboundMessage::Text {
-            text: "hello".into(),
-        };
-        let result = send_with_base_url("fake_token", "12345", &msg, &base_url).await;
-        assert!(result.is_ok());
-    }
-
-    #[tokio::test]
-    async fn send_text_message_telegram_error() {
-        let base_url = mock_telegram_api(serde_json::json!({
-            "ok": false,
-            "description": "Forbidden: bot was blocked by the user"
+        let base = mock_bot_api(serde_json::json!({
+            "sendMessage": {"ok": true, "result": {}}
         }))
         .await;
         let msg = OutboundMessage::Text {
             text: "hello".into(),
         };
-        let result = send_with_base_url("fake_token", "12345", &msg, &base_url).await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("blocked by the user"));
+        assert!(send(&base, "fake_token", "12345", &msg).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn send_text_message_telegram_error() {
+        let base = mock_bot_api(serde_json::json!({
+            "sendMessage": {"ok": false, "description": "Forbidden: bot was blocked by the user"}
+        }))
+        .await;
+        let msg = OutboundMessage::Text {
+            text: "hello".into(),
+        };
+        let err = send(&base, "fake_token", "12345", &msg).await.unwrap_err();
+        assert!(err.contains("blocked by the user"));
+    }
+
+    #[tokio::test]
+    async fn get_me_returns_bot_id_and_username() {
+        let base = mock_bot_api(serde_json::json!({
+            "getMe": {"ok": true, "result": {"id": 123456789, "is_bot": true,
+                                             "first_name": "Acme", "username": "acme_bot"}}
+        }))
+        .await;
+        let info = get_me(&base, "123456789:AA").await.unwrap();
+        assert_eq!(info.id, 123456789);
+        assert_eq!(info.username.as_deref(), Some("acme_bot"));
+    }
+
+    #[tokio::test]
+    async fn get_me_surfaces_telegram_description() {
+        let base = mock_bot_api(serde_json::json!({
+            "getMe": {"ok": false, "description": "Unauthorized"}
+        }))
+        .await;
+        let err = get_me(&base, "bad").await.unwrap_err();
+        assert_eq!(err, "Unauthorized");
+    }
+
+    #[tokio::test]
+    async fn set_webhook_success_and_failure() {
+        let ok = mock_bot_api(serde_json::json!({
+            "setWebhook": {"ok": true, "result": true}
+        }))
+        .await;
+        assert!(
+            set_webhook(
+                &ok,
+                "tok",
+                "https://example.com/webhook/telegram/x",
+                "s3cr3t"
+            )
+            .await
+            .is_ok()
+        );
+
+        let bad = mock_bot_api(serde_json::json!({
+            "setWebhook": {"ok": false, "description": "bad webhook: HTTPS url must be provided"}
+        }))
+        .await;
+        let err = set_webhook(&bad, "tok", "http://insecure/x", "s3cr3t")
+            .await
+            .unwrap_err();
+        assert!(err.contains("HTTPS url must be provided"));
+    }
+
+    #[tokio::test]
+    async fn delete_webhook_success() {
+        let base = mock_bot_api(serde_json::json!({
+            "deleteWebhook": {"ok": true, "result": true}
+        }))
+        .await;
+        assert!(delete_webhook(&base, "tok").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn get_webhook_info_parses_all_fields() {
+        let base = mock_bot_api(serde_json::json!({
+            "getWebhookInfo": {"ok": true, "result": {
+                "url": "https://example.com/webhook/telegram/abc",
+                "has_custom_certificate": false,
+                "pending_update_count": 7,
+                "last_error_date": 1700000000,
+                "last_error_message": "wrong response from webhook: 404"
+            }}
+        }))
+        .await;
+        let info = get_webhook_info(&base, "tok").await.unwrap();
+        assert_eq!(info.url, "https://example.com/webhook/telegram/abc");
+        assert_eq!(info.pending_update_count, 7);
+        assert_eq!(info.last_error_date, Some(1700000000));
+        assert!(info.last_error_message.unwrap().contains("404"));
+    }
+
+    #[tokio::test]
+    async fn get_webhook_info_handles_unregistered_webhook() {
+        // Telegram reports "no webhook" as an empty url with the other fields absent.
+        let base = mock_bot_api(serde_json::json!({
+            "getWebhookInfo": {"ok": true, "result": {"url": "", "pending_update_count": 0}}
+        }))
+        .await;
+        let info = get_webhook_info(&base, "tok").await.unwrap();
+        assert_eq!(info.url, "");
+        assert!(info.last_error_message.is_none());
     }
 }

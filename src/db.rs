@@ -22,60 +22,162 @@ pub async fn run_migrations(pool: &PgPool) {
         .expect("failed to run migrations");
 }
 
-#[derive(Debug, Clone, FromRow)]
-pub struct InstagramChannel {
+/// A row of `channels`. `config` is the provider-specific settings blob; it
+/// carries no provider tag, so read it by matching on `provider`.
+#[derive(Debug, Clone, Serialize, FromRow)]
+pub struct Channel {
     pub id: Uuid,
-    pub user_id: String,
-    pub access_token: String,
+    pub provider: String,
+    pub name: String,
+    pub external_key: String,
+    pub config: serde_json::Value,
+    pub deleted_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
 }
 
-pub async fn find_instagram_channel_by_user_id(
-    pool: &PgPool,
-    user_id: &str,
-) -> Result<Option<InstagramChannel>, sqlx::Error> {
-    sqlx::query_as::<_, InstagramChannel>(
-        "SELECT id, user_id, access_token FROM instagram_channels WHERE user_id = $1",
-    )
-    .bind(user_id)
-    .fetch_optional(pool)
-    .await
-}
+const CHANNEL_COLUMNS: &str = "id, provider, name, external_key, config, deleted_at, created_at";
 
-#[derive(Debug, Clone, FromRow)]
-pub struct TelegramChannel {
-    pub id: Uuid,
-    pub bot_token: String,
-    pub bot_secret: String,
-}
-
-pub async fn find_telegram_channel_by_id(
+/// Hot path: a channel that is not deleted. Used by the webhook and WS handlers.
+pub async fn find_live_channel_by_id(
     pool: &PgPool,
     channel_id: Uuid,
-) -> Result<Option<TelegramChannel>, sqlx::Error> {
-    sqlx::query_as::<_, TelegramChannel>(
-        "SELECT id, bot_token, bot_secret FROM telegram_channels WHERE id = $1",
-    )
+) -> Result<Option<Channel>, sqlx::Error> {
+    sqlx::query_as::<_, Channel>(&format!(
+        "SELECT {CHANNEL_COLUMNS} FROM channels WHERE id = $1 AND deleted_at IS NULL"
+    ))
     .bind(channel_id)
     .fetch_optional(pool)
     .await
 }
 
-#[derive(Debug, Clone, FromRow)]
-pub struct WidgetChannel {
-    pub id: Uuid,
-    pub widget_id: String,
-}
-
-pub async fn find_widget_channel_by_widget_id(
+/// Hot path: route an inbound event to a channel by the provider's identity.
+pub async fn find_live_channel_by_external_key(
     pool: &PgPool,
-    widget_id: &str,
-) -> Result<Option<WidgetChannel>, sqlx::Error> {
-    sqlx::query_as::<_, WidgetChannel>(
-        "SELECT id, widget_id FROM widget_channels WHERE widget_id = $1",
-    )
-    .bind(widget_id)
+    provider: ProviderKind,
+    external_key: &str,
+) -> Result<Option<Channel>, sqlx::Error> {
+    sqlx::query_as::<_, Channel>(&format!(
+        "SELECT {CHANNEL_COLUMNS} FROM channels
+         WHERE provider = $1 AND external_key = $2 AND deleted_at IS NULL"
+    ))
+    .bind(provider.to_string())
+    .bind(external_key)
     .fetch_optional(pool)
     .await
+}
+
+/// Any state, including soft-deleted. For CRUD and for resolving a 409 body.
+pub async fn find_channel_by_id(
+    pool: &PgPool,
+    channel_id: Uuid,
+) -> Result<Option<Channel>, sqlx::Error> {
+    sqlx::query_as::<_, Channel>(&format!(
+        "SELECT {CHANNEL_COLUMNS} FROM channels WHERE id = $1"
+    ))
+    .bind(channel_id)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Any state, including soft-deleted. Resolves which channel a unique
+/// violation collided with.
+pub async fn find_channel_by_external_key(
+    pool: &PgPool,
+    provider: ProviderKind,
+    external_key: &str,
+) -> Result<Option<Channel>, sqlx::Error> {
+    sqlx::query_as::<_, Channel>(&format!(
+        "SELECT {CHANNEL_COLUMNS} FROM channels WHERE provider = $1 AND external_key = $2"
+    ))
+    .bind(provider.to_string())
+    .bind(external_key)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Every channel, live ones first. Deleted channels are listed too — the
+/// settings panel shows them dimmed rather than pretending they are gone.
+pub async fn list_channels(pool: &PgPool) -> Result<Vec<Channel>, sqlx::Error> {
+    sqlx::query_as::<_, Channel>(&format!(
+        "SELECT {CHANNEL_COLUMNS} FROM channels
+         ORDER BY deleted_at NULLS FIRST, created_at DESC"
+    ))
+    .fetch_all(pool)
+    .await
+}
+
+/// The caller supplies the id so that it can build the webhook URL before the
+/// row exists.
+pub async fn insert_channel(
+    pool: &PgPool,
+    id: Uuid,
+    provider: ProviderKind,
+    name: &str,
+    external_key: &str,
+    config: &serde_json::Value,
+) -> Result<Channel, sqlx::Error> {
+    sqlx::query_as::<_, Channel>(&format!(
+        "INSERT INTO channels (id, provider, name, external_key, config)
+         VALUES ($1, $2, $3, $4, $5)
+         RETURNING {CHANNEL_COLUMNS}"
+    ))
+    .bind(id)
+    .bind(provider.to_string())
+    .bind(name)
+    .bind(external_key)
+    .bind(config)
+    .fetch_one(pool)
+    .await
+}
+
+/// `None` arguments leave their column untouched. `restore` clears `deleted_at`.
+pub async fn update_channel(
+    pool: &PgPool,
+    id: Uuid,
+    name: Option<&str>,
+    external_key: Option<&str>,
+    config: Option<&serde_json::Value>,
+    restore: bool,
+) -> Result<Option<Channel>, sqlx::Error> {
+    sqlx::query_as::<_, Channel>(&format!(
+        "UPDATE channels SET
+             name         = COALESCE($2, name),
+             external_key = COALESCE($3, external_key),
+             config       = COALESCE($4, config),
+             deleted_at   = CASE WHEN $5 THEN NULL ELSE deleted_at END
+         WHERE id = $1
+         RETURNING {CHANNEL_COLUMNS}"
+    ))
+    .bind(id)
+    .bind(name)
+    .bind(external_key)
+    .bind(config)
+    .bind(restore)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn soft_delete_channel(pool: &PgPool, id: Uuid) -> Result<Option<Channel>, sqlx::Error> {
+    sqlx::query_as::<_, Channel>(&format!(
+        "UPDATE channels SET deleted_at = COALESCE(deleted_at, now())
+         WHERE id = $1
+         RETURNING {CHANNEL_COLUMNS}"
+    ))
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Physically remove a channel row. This exists for exactly ONE caller: rolling
+/// back a create whose `setWebhook` failed. It is safe there and only there,
+/// because the row is milliseconds old, so no `chats` or `messages` row can
+/// reference it yet. Everything a user can reach uses `soft_delete_channel`.
+pub async fn hard_delete_channel(pool: &PgPool, id: Uuid) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM channels WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 pub async fn create_client(pool: &PgPool) -> Result<Uuid, sqlx::Error> {
@@ -325,6 +427,7 @@ pub async fn list_active_chats(pool: &PgPool) -> Result<Vec<ChatSummary>, sqlx::
              END AS last_message_sender_name
          FROM chats c
          JOIN clients cl ON cl.id = c.client_id
+         JOIN channels ch ON ch.id = c.channel_id
          LEFT JOIN LATERAL (
              SELECT m.text, m.created_at, m.sender_type, m.sender_id
              FROM messages m
@@ -334,7 +437,7 @@ pub async fn list_active_chats(pool: &PgPool) -> Result<Vec<ChatSummary>, sqlx::
          ) lm ON true
          LEFT JOIN operators op ON lm.sender_type = 'operator' AND op.id = lm.sender_id
          LEFT JOIN clients scl ON lm.sender_type = 'client' AND scl.id = lm.sender_id
-         WHERE c.status = 'new'
+         WHERE c.status = 'new' AND ch.deleted_at IS NULL
          ORDER BY COALESCE(lm.created_at, c.created_at) DESC",
     )
     .fetch_all(pool)

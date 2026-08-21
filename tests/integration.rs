@@ -24,66 +24,56 @@ const TEST_VERIFY_TOKEN: &str = "test_verify_token";
 const TEST_APP_SECRET: &str = "test_app_secret";
 const TEST_JWT_SECRET: &str = "test-jwt-secret-at-least-32-bytes!!";
 
-async fn insert_test_instagram_channel(pool: &PgPool) -> (TestChannel, String) {
+/// Insert a channel row. `config` is the provider-specific settings blob.
+async fn insert_test_channel(
+    pool: &PgPool,
+    provider: &str,
+    external_key: &str,
+    config: serde_json::Value,
+) -> TestChannel {
     let channel_id = Uuid::new_v4();
-    let user_id = format!("test_{channel_id}");
-    sqlx::query("INSERT INTO channels (id, provider) VALUES ($1, 'instagram')")
-        .bind(channel_id)
-        .execute(pool)
-        .await
-        .unwrap();
-    sqlx::query("INSERT INTO instagram_channels (id, user_id, access_token) VALUES ($1, $2, $3)")
-        .bind(channel_id)
-        .bind(&user_id)
-        .bind("test_token")
-        .execute(pool)
-        .await
-        .unwrap();
-    let guard = TestChannel {
-        table: "instagram_channels",
-        id: channel_id,
-    };
+    sqlx::query(
+        "INSERT INTO channels (id, provider, name, external_key, config)
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(channel_id)
+    .bind(provider)
+    .bind(format!("{provider}:{external_key}"))
+    .bind(external_key)
+    .bind(config)
+    .execute(pool)
+    .await
+    .unwrap();
+    TestChannel { id: channel_id }
+}
+
+async fn insert_test_instagram_channel(pool: &PgPool) -> (TestChannel, String) {
+    let user_id = format!("test_{}", Uuid::new_v4());
+    let guard = insert_test_channel(
+        pool,
+        "instagram",
+        &user_id,
+        serde_json::json!({"access_token": "test_token"}),
+    )
+    .await;
     (guard, user_id)
 }
 
 async fn insert_test_telegram_channel(pool: &PgPool, bot_secret: &str) -> TestChannel {
-    let channel_id = Uuid::new_v4();
-    let bot_token = format!("test:{channel_id}");
-    sqlx::query("INSERT INTO channels (id, provider) VALUES ($1, 'telegram')")
-        .bind(channel_id)
-        .execute(pool)
-        .await
-        .unwrap();
-    sqlx::query("INSERT INTO telegram_channels (id, bot_token, bot_secret) VALUES ($1, $2, $3)")
-        .bind(channel_id)
-        .bind(&bot_token)
-        .bind(bot_secret)
-        .execute(pool)
-        .await
-        .unwrap();
-    TestChannel {
-        table: "telegram_channels",
-        id: channel_id,
-    }
+    // external_key is the numeric bot id, matching the runtime convention.
+    let bot_id = (Uuid::new_v4().as_u128() as u64).to_string();
+    let bot_token = format!("{bot_id}:test");
+    insert_test_channel(
+        pool,
+        "telegram",
+        &bot_id,
+        serde_json::json!({"bot_token": bot_token, "bot_secret": bot_secret}),
+    )
+    .await
 }
 
 async fn insert_test_widget_channel(pool: &PgPool, widget_id: &str) -> TestChannel {
-    let channel_id = Uuid::new_v4();
-    sqlx::query("INSERT INTO channels (id, provider) VALUES ($1, 'widget')")
-        .bind(channel_id)
-        .execute(pool)
-        .await
-        .unwrap();
-    sqlx::query("INSERT INTO widget_channels (id, widget_id) VALUES ($1, $2)")
-        .bind(channel_id)
-        .bind(widget_id)
-        .execute(pool)
-        .await
-        .unwrap();
-    TestChannel {
-        table: "widget_channels",
-        id: channel_id,
-    }
+    insert_test_channel(pool, "widget", widget_id, serde_json::json!({})).await
 }
 
 async fn insert_test_client(pool: &PgPool, name: &str) -> TestClient {
@@ -166,7 +156,19 @@ async fn setup_redis() -> redis::aio::ConnectionManager {
         .expect("failed to connect to Redis")
 }
 
+const TEST_PUBLIC_BASE_URL: &str = "https://test.example.com";
+
+/// Port 1 is never listening and needs no DNS lookup, so any Telegram call made
+/// by a test that forgot to pass a mock fails instantly and locally instead of
+/// reaching out to the real Bot API. The test suite must make zero outbound
+/// requests. A test that needs Telegram calls `build_state_with(db, mock_url)`.
+const NO_TELEGRAM: &str = "http://127.0.0.1:1";
+
 async fn build_state(db: PgPool) -> Arc<AppState> {
+    build_state_with(db, NO_TELEGRAM.into()).await
+}
+
+async fn build_state_with(db: PgPool, telegram_api_base: String) -> Arc<AppState> {
     let redis = setup_redis().await;
     Arc::new(AppState {
         config: AppConfig {
@@ -174,6 +176,8 @@ async fn build_state(db: PgPool) -> Arc<AppState> {
             instagram_app_secret: TEST_APP_SECRET.into(),
             redis_url: "redis://localhost:6379".into(),
             widget_jwt_secret: TEST_JWT_SECRET.into(),
+            public_base_url: TEST_PUBLIC_BASE_URL.into(),
+            telegram_api_base,
         },
         db,
         redis,
@@ -1044,85 +1048,7 @@ async fn ws_invalid_mid_returns_error() {
 // --- Cache + invalidation tests ---
 
 #[tokio::test]
-async fn cache_instagram_lookup_and_invalidation() {
-    let pool = setup_pool().await;
-    let (guard, user_id) = insert_test_instagram_channel(&pool).await;
-
-    let cache = Arc::new(ChannelCache::new());
-
-    // First lookup — cache miss, loads from DB
-    let ch = cache
-        .get_instagram_channel(&pool, &user_id)
-        .await
-        .unwrap()
-        .expect("channel should exist");
-    assert_eq!(ch.id, guard.id);
-
-    // Delete from DB — cache should still return the channel
-    sqlx::query("DELETE FROM instagram_channels WHERE id = $1")
-        .bind(guard.id)
-        .execute(&pool)
-        .await
-        .unwrap();
-    let cached = cache
-        .get_instagram_channel(&pool, &user_id)
-        .await
-        .unwrap()
-        .expect("should be served from cache");
-    assert_eq!(cached.id, guard.id);
-
-    // Invalidate the specific channel
-    cache.invalidate(guard.id);
-
-    // Now cache is empty, lookup goes to DB — channel is gone
-    let after = cache.get_instagram_channel(&pool, &user_id).await.unwrap();
-    assert!(
-        after.is_none(),
-        "should be None after invalidation + DB delete"
-    );
-}
-
-#[tokio::test]
-async fn cache_telegram_lookup_and_invalidation() {
-    let pool = setup_pool().await;
-    let bot_secret = "cache_test_secret";
-    let guard = insert_test_telegram_channel(&pool, bot_secret).await;
-
-    let cache = Arc::new(ChannelCache::new());
-
-    // First lookup — cache miss, loads from DB
-    let ch = cache
-        .get_telegram_channel(&pool, guard.id)
-        .await
-        .unwrap()
-        .expect("channel should exist");
-    assert_eq!(ch.bot_secret, bot_secret);
-
-    // Delete from DB
-    sqlx::query("DELETE FROM telegram_channels WHERE id = $1")
-        .bind(guard.id)
-        .execute(&pool)
-        .await
-        .unwrap();
-    let cached = cache
-        .get_telegram_channel(&pool, guard.id)
-        .await
-        .unwrap()
-        .expect("should be served from cache");
-    assert_eq!(cached.bot_secret, bot_secret);
-
-    // Invalidate
-    cache.invalidate(guard.id);
-
-    let after = cache.get_telegram_channel(&pool, guard.id).await.unwrap();
-    assert!(
-        after.is_none(),
-        "should be None after invalidation + DB delete"
-    );
-}
-
-#[tokio::test]
-async fn cache_widget_lookup_and_invalidation() {
+async fn cache_lookup_by_external_key_and_invalidation() {
     let pool = setup_pool().await;
     let widget_id = format!("cache_test_{}", Uuid::new_v4());
     let guard = insert_test_widget_channel(&pool, &widget_id).await;
@@ -1131,32 +1057,99 @@ async fn cache_widget_lookup_and_invalidation() {
 
     // First lookup — cache miss, loads from DB
     let ch = cache
-        .get_widget_channel(&pool, &widget_id)
+        .get_channel_by_external_key(&pool, ProviderKind::Widget, &widget_id)
         .await
         .unwrap()
         .expect("channel should exist");
     assert_eq!(ch.id, guard.id);
 
-    // Delete from DB
-    sqlx::query("DELETE FROM widget_channels WHERE id = $1")
+    // Delete from DB — a cached entry must still be served
+    sqlx::query("DELETE FROM channels WHERE id = $1")
         .bind(guard.id)
         .execute(&pool)
         .await
         .unwrap();
     let cached = cache
-        .get_widget_channel(&pool, &widget_id)
+        .get_channel_by_external_key(&pool, ProviderKind::Widget, &widget_id)
         .await
         .unwrap()
         .expect("should be served from cache");
     assert_eq!(cached.id, guard.id);
 
-    // Invalidate
     cache.invalidate(guard.id);
 
-    let after = cache.get_widget_channel(&pool, &widget_id).await.unwrap();
+    let after = cache
+        .get_channel_by_external_key(&pool, ProviderKind::Widget, &widget_id)
+        .await
+        .unwrap();
+    assert!(after.is_none(), "None after invalidation + DB delete");
+}
+
+#[tokio::test]
+async fn cache_lookup_by_id_and_invalidation() {
+    let pool = setup_pool().await;
+    let guard = insert_test_telegram_channel(&pool, "cache_secret").await;
+
+    let cache = Arc::new(ChannelCache::new());
+
+    let ch = cache
+        .get_channel_by_id(&pool, guard.id)
+        .await
+        .unwrap()
+        .expect("channel should exist");
+    assert_eq!(ch.id, guard.id);
+    assert_eq!(ch.config["bot_secret"], "cache_secret");
+
+    sqlx::query("DELETE FROM channels WHERE id = $1")
+        .bind(guard.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let cached = cache
+        .get_channel_by_id(&pool, guard.id)
+        .await
+        .unwrap()
+        .expect("should be served from cache");
+    assert_eq!(cached.id, guard.id);
+
+    cache.invalidate(guard.id);
     assert!(
-        after.is_none(),
-        "should be None after invalidation + DB delete"
+        cache
+            .get_channel_by_id(&pool, guard.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn cache_invalidate_by_id_clears_the_external_key_index() {
+    let pool = setup_pool().await;
+    let widget_id = format!("cache_test_{}", Uuid::new_v4());
+    let guard = insert_test_widget_channel(&pool, &widget_id).await;
+
+    let cache = Arc::new(ChannelCache::new());
+    // Warm both maps through the key lookup, then evict by id only.
+    cache
+        .get_channel_by_external_key(&pool, ProviderKind::Widget, &widget_id)
+        .await
+        .unwrap()
+        .expect("channel should exist");
+
+    sqlx::query("DELETE FROM channels WHERE id = $1")
+        .bind(guard.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    cache.invalidate(guard.id);
+
+    assert!(
+        cache
+            .get_channel_by_external_key(&pool, ProviderKind::Widget, &widget_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "invalidating by id must also drop the secondary index entry"
     );
 }
 
@@ -1171,11 +1164,11 @@ async fn cache_invalidation_via_redis_pubsub() {
 
     // Populate cache
     let ch = cache
-        .get_telegram_channel(&pool, guard.id)
+        .get_channel_by_id(&pool, guard.id)
         .await
         .unwrap()
         .expect("channel should exist");
-    assert_eq!(ch.bot_secret, bot_secret);
+    assert_eq!(ch.config["bot_secret"], bot_secret);
 
     // Start invalidation listener
     chatbridge::cache::spawn_invalidation_listener(
@@ -1188,7 +1181,7 @@ async fn cache_invalidation_via_redis_pubsub() {
     .await;
 
     // Delete from DB so we can detect cache eviction
-    sqlx::query("DELETE FROM telegram_channels WHERE id = $1")
+    sqlx::query("DELETE FROM channels WHERE id = $1")
         .bind(guard.id)
         .execute(&pool)
         .await
@@ -1208,7 +1201,7 @@ async fn cache_invalidation_via_redis_pubsub() {
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
     // Cache should be evicted, DB is empty → None
-    let after = cache.get_telegram_channel(&pool, guard.id).await.unwrap();
+    let after = cache.get_channel_by_id(&pool, guard.id).await.unwrap();
     assert!(
         after.is_none(),
         "should be None after Redis pubsub invalidation"
@@ -1225,12 +1218,12 @@ async fn cache_invalidation_does_not_affect_other_channels() {
 
     // Populate both
     cache
-        .get_telegram_channel(&pool, guard_a.id)
+        .get_channel_by_id(&pool, guard_a.id)
         .await
         .unwrap()
         .unwrap();
     cache
-        .get_telegram_channel(&pool, guard_b.id)
+        .get_channel_by_id(&pool, guard_b.id)
         .await
         .unwrap()
         .unwrap();
@@ -1239,17 +1232,17 @@ async fn cache_invalidation_does_not_affect_other_channels() {
     cache.invalidate(guard_a.id);
 
     // B should still be cached even if we delete it from DB
-    sqlx::query("DELETE FROM telegram_channels WHERE id = $1")
+    sqlx::query("DELETE FROM channels WHERE id = $1")
         .bind(guard_b.id)
         .execute(&pool)
         .await
         .unwrap();
     let b = cache
-        .get_telegram_channel(&pool, guard_b.id)
+        .get_channel_by_id(&pool, guard_b.id)
         .await
         .unwrap()
         .expect("channel B should still be cached");
-    assert_eq!(b.bot_secret, "secret_b");
+    assert_eq!(b.config["bot_secret"], "secret_b");
 }
 
 #[tokio::test]
@@ -2874,4 +2867,1338 @@ async fn ws_new_client_receives_no_chat_event() {
     );
 
     ws.close(None).await.unwrap();
+}
+
+// --- Channel CRUD queries ---
+
+#[tokio::test]
+async fn channel_insert_and_find_live() {
+    let pool = setup_pool().await;
+    let id = Uuid::new_v4();
+    let key = format!("chan_{}", Uuid::new_v4());
+    let created = chatbridge::db::insert_channel(
+        &pool,
+        id,
+        ProviderKind::Widget,
+        "My widget",
+        &key,
+        &serde_json::json!({}),
+    )
+    .await
+    .unwrap();
+    let _guard = TestChannel { id };
+
+    assert_eq!(created.id, id);
+    assert_eq!(created.provider, "widget");
+    assert_eq!(created.name, "My widget");
+    assert_eq!(created.external_key, key);
+    assert!(created.deleted_at.is_none());
+
+    let by_id = chatbridge::db::find_live_channel_by_id(&pool, id)
+        .await
+        .unwrap()
+        .expect("live channel by id");
+    assert_eq!(by_id.external_key, key);
+
+    let by_key =
+        chatbridge::db::find_live_channel_by_external_key(&pool, ProviderKind::Widget, &key)
+            .await
+            .unwrap()
+            .expect("live channel by key");
+    assert_eq!(by_key.id, id);
+}
+
+#[tokio::test]
+async fn channel_soft_delete_hides_from_live_queries_only() {
+    let pool = setup_pool().await;
+    let key = format!("chan_{}", Uuid::new_v4());
+    let guard = insert_test_channel(&pool, "widget", &key, serde_json::json!({})).await;
+
+    let deleted = chatbridge::db::soft_delete_channel(&pool, guard.id)
+        .await
+        .unwrap()
+        .expect("row returned");
+    assert!(deleted.deleted_at.is_some());
+
+    assert!(
+        chatbridge::db::find_live_channel_by_id(&pool, guard.id)
+            .await
+            .unwrap()
+            .is_none(),
+        "soft-deleted channel must be invisible to the live query"
+    );
+    assert!(
+        chatbridge::db::find_live_channel_by_external_key(&pool, ProviderKind::Widget, &key)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        chatbridge::db::find_channel_by_id(&pool, guard.id)
+            .await
+            .unwrap()
+            .is_some(),
+        "the any-state query must still see it"
+    );
+    assert!(
+        chatbridge::db::find_channel_by_external_key(&pool, ProviderKind::Widget, &key)
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn channel_insert_duplicate_external_key_is_unique_violation() {
+    let pool = setup_pool().await;
+    let key = format!("chan_{}", Uuid::new_v4());
+    let _guard = insert_test_channel(&pool, "widget", &key, serde_json::json!({})).await;
+
+    let err = chatbridge::db::insert_channel(
+        &pool,
+        Uuid::new_v4(),
+        ProviderKind::Widget,
+        "dup",
+        &key,
+        &serde_json::json!({}),
+    )
+    .await
+    .expect_err("second insert on the same identity must fail");
+
+    match err {
+        sqlx::Error::Database(ref e) => assert!(e.is_unique_violation()),
+        other => panic!("expected a unique violation, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn channel_insert_duplicate_key_conflicts_even_when_deleted() {
+    let pool = setup_pool().await;
+    let key = format!("chan_{}", Uuid::new_v4());
+    let guard = insert_test_channel(&pool, "widget", &key, serde_json::json!({})).await;
+    chatbridge::db::soft_delete_channel(&pool, guard.id)
+        .await
+        .unwrap();
+
+    let err = chatbridge::db::insert_channel(
+        &pool,
+        Uuid::new_v4(),
+        ProviderKind::Widget,
+        "dup",
+        &key,
+        &serde_json::json!({}),
+    )
+    .await
+    .expect_err("the identity stays taken after a soft delete");
+
+    match err {
+        sqlx::Error::Database(ref e) => assert!(e.is_unique_violation()),
+        other => panic!("expected a unique violation, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn channel_update_renames_restores_and_rewrites_config() {
+    let pool = setup_pool().await;
+    let key = format!("chan_{}", Uuid::new_v4());
+    let guard = insert_test_channel(
+        &pool,
+        "telegram",
+        &key,
+        serde_json::json!({"bot_token": "old"}),
+    )
+    .await;
+    chatbridge::db::soft_delete_channel(&pool, guard.id)
+        .await
+        .unwrap();
+
+    let updated = chatbridge::db::update_channel(
+        &pool,
+        guard.id,
+        Some("Renamed"),
+        None,
+        Some(&serde_json::json!({"bot_token": "new"})),
+        true,
+    )
+    .await
+    .unwrap()
+    .expect("row returned");
+
+    assert_eq!(updated.name, "Renamed");
+    assert!(updated.deleted_at.is_none(), "restore clears deleted_at");
+    assert_eq!(updated.config["bot_token"], "new");
+}
+
+#[tokio::test]
+async fn channel_update_leaves_untouched_fields_alone() {
+    let pool = setup_pool().await;
+    let key = format!("chan_{}", Uuid::new_v4());
+    let guard = insert_test_channel(&pool, "widget", &key, serde_json::json!({"keep": true})).await;
+
+    let updated =
+        chatbridge::db::update_channel(&pool, guard.id, Some("Only a rename"), None, None, false)
+            .await
+            .unwrap()
+            .expect("row returned");
+
+    assert_eq!(updated.name, "Only a rename");
+    assert_eq!(updated.external_key, key, "external_key untouched");
+    assert_eq!(updated.config["keep"], true, "config untouched");
+}
+
+#[tokio::test]
+async fn channel_list_puts_live_channels_first() {
+    let pool = setup_pool().await;
+    let live_key = format!("chan_live_{}", Uuid::new_v4());
+    let dead_key = format!("chan_dead_{}", Uuid::new_v4());
+    let live = insert_test_channel(&pool, "widget", &live_key, serde_json::json!({})).await;
+    let dead = insert_test_channel(&pool, "widget", &dead_key, serde_json::json!({})).await;
+    chatbridge::db::soft_delete_channel(&pool, dead.id)
+        .await
+        .unwrap();
+
+    let all = chatbridge::db::list_channels(&pool).await.unwrap();
+    let live_pos = all
+        .iter()
+        .position(|c| c.id == live.id)
+        .expect("live listed");
+    let dead_pos = all
+        .iter()
+        .position(|c| c.id == dead.id)
+        .expect("deleted listed");
+    assert!(
+        live_pos < dead_pos,
+        "live channels must sort before deleted ones"
+    );
+}
+
+#[tokio::test]
+async fn channel_hard_delete_removes_the_row() {
+    let pool = setup_pool().await;
+    let key = format!("chan_{}", Uuid::new_v4());
+    let guard = insert_test_channel(&pool, "widget", &key, serde_json::json!({})).await;
+
+    chatbridge::db::hard_delete_channel(&pool, guard.id)
+        .await
+        .unwrap();
+
+    assert!(
+        chatbridge::db::find_channel_by_id(&pool, guard.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    // The identity is free again, which is the whole point of the create rollback.
+    let reused = insert_test_channel(&pool, "widget", &key, serde_json::json!({})).await;
+    assert_ne!(reused.id, guard.id);
+}
+
+// --- Channel REST API ---
+
+#[tokio::test]
+async fn get_channels_lists_live_and_deleted_with_endpoints() {
+    let pool = setup_pool().await;
+    let widget_id = format!("api_{}", Uuid::new_v4());
+    let live = insert_test_widget_channel(&pool, &widget_id).await;
+    let dead_id = format!("api_dead_{}", Uuid::new_v4());
+    let dead = insert_test_widget_channel(&pool, &dead_id).await;
+    chatbridge::db::soft_delete_channel(&pool, dead.id)
+        .await
+        .unwrap();
+
+    let state = build_state(pool.clone()).await;
+    let app = routes::build(state);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/channels")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let list: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+
+    let live_row = list
+        .iter()
+        .find(|c| c["id"] == live.id.to_string())
+        .expect("live channel listed");
+    assert_eq!(live_row["provider"], "widget");
+    assert_eq!(live_row["external_key"], widget_id);
+    assert_eq!(live_row["deleted_at"], serde_json::Value::Null);
+    assert_eq!(
+        live_row["endpoint"],
+        format!("wss://test.example.com/ws/{widget_id}")
+    );
+
+    let dead_row = list
+        .iter()
+        .find(|c| c["id"] == dead.id.to_string())
+        .expect("deleted channel is listed too, not hidden");
+    assert!(dead_row["deleted_at"].is_string());
+}
+
+#[tokio::test]
+async fn get_channels_returns_telegram_secrets_in_full() {
+    let pool = setup_pool().await;
+    let guard = insert_test_telegram_channel(&pool, "api_secret").await;
+
+    let state = build_state(pool.clone()).await;
+    let app = routes::build(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/channels")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let list: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+
+    let row = list
+        .iter()
+        .find(|c| c["id"] == guard.id.to_string())
+        .expect("channel listed");
+    // Deliberate: the panel shows and edits keys. See docs/tech_debt.md.
+    assert_eq!(row["config"]["bot_secret"], "api_secret");
+    assert!(row["config"]["bot_token"].as_str().unwrap().contains(':'));
+    assert_eq!(
+        row["endpoint"],
+        format!("https://test.example.com/webhook/telegram/{}", guard.id)
+    );
+}
+
+async fn post_json(
+    state: Arc<AppState>,
+    uri: &str,
+    body: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    request_json(state, "POST", uri, Some(body)).await
+}
+
+async fn request_json(
+    state: Arc<AppState>,
+    method: &str,
+    uri: &str,
+    body: Option<serde_json::Value>,
+) -> (StatusCode, serde_json::Value) {
+    let app = routes::build(state);
+    let builder = Request::builder().method(method).uri(uri);
+    let request = match body {
+        Some(b) => builder
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&b).unwrap()))
+            .unwrap(),
+        None => builder.body(Body::empty()).unwrap(),
+    };
+    let resp = app.oneshot(request).await.unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    (status, json)
+}
+
+#[tokio::test]
+async fn post_channel_creates_a_widget_channel() {
+    let pool = setup_pool().await;
+    let widget_id = format!("api_{}", Uuid::new_v4());
+    let state = build_state(pool.clone()).await;
+
+    let (status, body) = post_json(
+        state,
+        "/api/channels",
+        serde_json::json!({"provider": "widget", "widget_id": widget_id, "name": "Acme site"}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::CREATED);
+    let id: Uuid = body["id"].as_str().unwrap().parse().unwrap();
+    let _guard = TestChannel { id };
+
+    assert_eq!(body["provider"], "widget");
+    assert_eq!(body["name"], "Acme site");
+    assert_eq!(body["external_key"], widget_id);
+    assert_eq!(body["config"], serde_json::json!({}));
+    assert_eq!(
+        body["endpoint"],
+        format!("wss://test.example.com/ws/{widget_id}")
+    );
+
+    let stored = chatbridge::db::find_live_channel_by_id(&pool, id)
+        .await
+        .unwrap();
+    assert!(stored.is_some(), "row persisted");
+}
+
+#[tokio::test]
+async fn post_channel_defaults_widget_name_to_the_widget_id() {
+    let pool = setup_pool().await;
+    let widget_id = format!("api_{}", Uuid::new_v4());
+    let state = build_state(pool.clone()).await;
+
+    let (status, body) = post_json(
+        state,
+        "/api/channels",
+        serde_json::json!({"provider": "widget", "widget_id": widget_id}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::CREATED);
+    let _guard = TestChannel {
+        id: body["id"].as_str().unwrap().parse().unwrap(),
+    };
+    assert_eq!(body["name"], widget_id);
+}
+
+#[tokio::test]
+async fn post_channel_rejects_a_widget_id_that_breaks_the_route() {
+    let pool = setup_pool().await;
+    let state = build_state(pool).await;
+
+    let (status, _) = post_json(
+        state,
+        "/api/channels",
+        serde_json::json!({"provider": "widget", "widget_id": "has spaces/and-slash"}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn post_channel_duplicate_widget_id_conflicts_with_channel_exists() {
+    let pool = setup_pool().await;
+    let widget_id = format!("api_{}", Uuid::new_v4());
+    let existing = insert_test_widget_channel(&pool, &widget_id).await;
+    let state = build_state(pool.clone()).await;
+
+    let (status, body) = post_json(
+        state,
+        "/api/channels",
+        serde_json::json!({"provider": "widget", "widget_id": widget_id}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"], "channel_exists");
+    assert_eq!(body["channel_id"], existing.id.to_string());
+    assert_eq!(body["deleted_at"], serde_json::Value::Null);
+}
+
+#[tokio::test]
+async fn post_channel_on_a_deleted_identity_conflicts_with_channel_deleted() {
+    let pool = setup_pool().await;
+    let widget_id = format!("api_{}", Uuid::new_v4());
+    let existing = insert_test_widget_channel(&pool, &widget_id).await;
+    chatbridge::db::soft_delete_channel(&pool, existing.id)
+        .await
+        .unwrap();
+    let state = build_state(pool.clone()).await;
+
+    let (status, body) = post_json(
+        state,
+        "/api/channels",
+        serde_json::json!({"provider": "widget", "widget_id": widget_id}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"], "channel_deleted");
+    assert_eq!(body["channel_id"], existing.id.to_string());
+    assert!(
+        body["deleted_at"].is_string(),
+        "the panel shows when it was deleted"
+    );
+}
+
+#[tokio::test]
+async fn post_channel_creates_an_instagram_channel() {
+    let pool = setup_pool().await;
+    let user_id = format!("178414{}", Uuid::new_v4().as_u128() as u32);
+    let state = build_state(pool.clone()).await;
+
+    let (status, body) = post_json(
+        state,
+        "/api/channels",
+        serde_json::json!({
+            "provider": "instagram", "user_id": user_id, "access_token": "IGQ_token"
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::CREATED);
+    let _guard = TestChannel {
+        id: body["id"].as_str().unwrap().parse().unwrap(),
+    };
+    assert_eq!(body["provider"], "instagram");
+    assert_eq!(body["external_key"], user_id);
+    assert_eq!(body["config"]["access_token"], "IGQ_token");
+    assert_eq!(
+        body["endpoint"],
+        "https://test.example.com/webhook/instagram"
+    );
+}
+
+#[tokio::test]
+async fn post_channel_rejects_an_empty_instagram_token() {
+    let pool = setup_pool().await;
+    let state = build_state(pool).await;
+
+    let (status, _) = post_json(
+        state,
+        "/api/channels",
+        serde_json::json!({"provider": "instagram", "user_id": "17841", "access_token": "  "}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// Spawn a fake Bot API that answers `/bot<token>/<method>` from `responses`,
+/// defaulting to `{"ok":true,"result":{}}`.
+async fn spawn_mock_telegram(responses: serde_json::Value) -> String {
+    use axum::Router;
+    use axum::extract::Path;
+    use axum::routing::any;
+
+    let responses = Arc::new(responses);
+    let app = Router::new().route(
+        "/bot{token}/{method}",
+        any(move |Path((_token, method)): Path<(String, String)>| {
+            let responses = responses.clone();
+            async move {
+                let body = responses
+                    .get(method.as_str())
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({"ok": true, "result": {}}));
+                axum::Json(body)
+            }
+        }),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
+fn get_me_ok(bot_id: i64) -> serde_json::Value {
+    serde_json::json!({"ok": true, "result": {
+        "id": bot_id, "is_bot": true, "first_name": "Acme", "username": "acme_bot"
+    }})
+}
+
+#[tokio::test]
+async fn post_telegram_channel_registers_the_webhook_and_stores_a_secret() {
+    let pool = setup_pool().await;
+    let bot_id = (Uuid::new_v4().as_u128() as u32) as i64;
+    let api = spawn_mock_telegram(serde_json::json!({
+        "getMe": get_me_ok(bot_id),
+        "setWebhook": {"ok": true, "result": true},
+    }))
+    .await;
+    let state = build_state_with(pool.clone(), api).await;
+
+    let (status, body) = post_json(
+        state,
+        "/api/channels",
+        serde_json::json!({"provider": "telegram", "bot_token": format!("{bot_id}:AAtoken")}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::CREATED);
+    let id: Uuid = body["id"].as_str().unwrap().parse().unwrap();
+    let _guard = TestChannel { id };
+
+    // external_key is the bot id from getMe, not a parsed token prefix.
+    assert_eq!(body["external_key"], bot_id.to_string());
+    // The name defaults to the bot's @username.
+    assert_eq!(body["name"], "@acme_bot");
+    assert_eq!(body["config"]["bot_token"], format!("{bot_id}:AAtoken"));
+    let secret = body["config"]["bot_secret"].as_str().unwrap();
+    assert_eq!(secret.len(), 32, "32 hex chars from a v4 UUID");
+    assert!(secret.bytes().all(|b| b.is_ascii_alphanumeric()));
+    assert_eq!(
+        body["endpoint"],
+        format!("https://test.example.com/webhook/telegram/{id}")
+    );
+}
+
+#[tokio::test]
+async fn post_telegram_channel_rejects_a_token_telegram_refuses() {
+    let pool = setup_pool().await;
+    let api = spawn_mock_telegram(serde_json::json!({
+        "getMe": {"ok": false, "description": "Unauthorized"},
+    }))
+    .await;
+    let state = build_state_with(pool.clone(), api).await;
+
+    let (status, _) = post_json(
+        state,
+        "/api/channels",
+        serde_json::json!({"provider": "telegram", "bot_token": "123456789:AAbad"}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn post_telegram_channel_rejects_a_malformed_token_without_calling_telegram() {
+    let pool = setup_pool().await;
+    // getMe is wired to fail loudly: reaching it would mean validation was skipped.
+    let api = spawn_mock_telegram(serde_json::json!({
+        "getMe": {"ok": false, "description": "should never be called"},
+    }))
+    .await;
+    let state = build_state_with(pool, api).await;
+
+    let (status, _) = post_json(
+        state,
+        "/api/channels",
+        serde_json::json!({"provider": "telegram", "bot_token": "not-a-token"}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn post_telegram_channel_rolls_the_row_back_when_set_webhook_fails() {
+    let pool = setup_pool().await;
+    let bot_id = (Uuid::new_v4().as_u128() as u32) as i64;
+    let api = spawn_mock_telegram(serde_json::json!({
+        "getMe": get_me_ok(bot_id),
+        "setWebhook": {"ok": false, "description": "bad webhook: HTTPS url must be provided"},
+    }))
+    .await;
+    let state = build_state_with(pool.clone(), api).await;
+
+    let (status, _) = post_json(
+        state.clone(),
+        "/api/channels",
+        serde_json::json!({"provider": "telegram", "bot_token": format!("{bot_id}:AAtoken")}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+
+    // The rollback is a HARD delete, so the identity is free and a retry is a
+    // clean create rather than a 409 on a channel that never worked.
+    let leftover = chatbridge::db::find_channel_by_external_key(
+        &pool,
+        ProviderKind::Telegram,
+        &bot_id.to_string(),
+    )
+    .await
+    .unwrap();
+    assert!(leftover.is_none(), "no row may survive a failed setWebhook");
+}
+
+#[tokio::test]
+async fn post_telegram_channel_conflicts_before_touching_the_webhook() {
+    let pool = setup_pool().await;
+    let bot_id = (Uuid::new_v4().as_u128() as u32) as i64;
+    let existing = insert_test_channel(
+        &pool,
+        "telegram",
+        &bot_id.to_string(),
+        serde_json::json!({"bot_token": format!("{bot_id}:AAold"), "bot_secret": "old_secret"}),
+    )
+    .await;
+
+    // setWebhook is wired to fail: if the handler called it, the test would see 502
+    // instead of 409, which is exactly the webhook-hijack ordering bug.
+    let api = spawn_mock_telegram(serde_json::json!({
+        "getMe": get_me_ok(bot_id),
+        "setWebhook": {"ok": false, "description": "must not be reached"},
+    }))
+    .await;
+    let state = build_state_with(pool.clone(), api).await;
+
+    let (status, body) = post_json(
+        state,
+        "/api/channels",
+        serde_json::json!({"provider": "telegram", "bot_token": format!("{bot_id}:AAnew")}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"], "channel_exists");
+    assert_eq!(body["channel_id"], existing.id.to_string());
+
+    // The live channel's stored secret is untouched.
+    let stored = chatbridge::db::find_channel_by_id(&pool, existing.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.config["bot_secret"], "old_secret");
+}
+
+#[tokio::test]
+async fn patch_channel_renames_without_contacting_the_provider() {
+    let pool = setup_pool().await;
+    let guard = insert_test_telegram_channel(&pool, "patch_secret").await;
+    // getMe fails loudly: a plain rename must not call Telegram at all.
+    let api = spawn_mock_telegram(serde_json::json!({
+        "getMe": {"ok": false, "description": "must not be reached"},
+    }))
+    .await;
+    let state = build_state_with(pool.clone(), api).await;
+
+    let (status, body) = request_json(
+        state,
+        "PATCH",
+        &format!("/api/channels/{}", guard.id),
+        Some(serde_json::json!({"name": "Renamed"})),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["name"], "Renamed");
+    assert_eq!(
+        body["config"]["bot_secret"], "patch_secret",
+        "config untouched"
+    );
+}
+
+#[tokio::test]
+async fn patch_channel_unknown_id_returns_404() {
+    let pool = setup_pool().await;
+    let state = build_state(pool).await;
+
+    let (status, _) = request_json(
+        state,
+        "PATCH",
+        &format!("/api/channels/{}", Uuid::new_v4()),
+        Some(serde_json::json!({"name": "x"})),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn patch_channel_cannot_change_the_provider() {
+    let pool = setup_pool().await;
+    let widget_id = format!("api_{}", Uuid::new_v4());
+    let guard = insert_test_widget_channel(&pool, &widget_id).await;
+    let state = build_state(pool.clone()).await;
+
+    let (status, _) = request_json(
+        state,
+        "PATCH",
+        &format!("/api/channels/{}", guard.id),
+        Some(serde_json::json!({
+            "spec": {"provider": "telegram", "bot_token": "123456789:AA"}
+        })),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn patch_channel_moves_a_widget_id_and_conflicts_when_taken() {
+    let pool = setup_pool().await;
+    let first = format!("api_a_{}", Uuid::new_v4());
+    let second = format!("api_b_{}", Uuid::new_v4());
+    let moving = insert_test_widget_channel(&pool, &first).await;
+    let blocker = insert_test_widget_channel(&pool, &second).await;
+    let state = build_state(pool.clone()).await;
+
+    // Free key — accepted, and the endpoint follows the new key.
+    let free = format!("api_c_{}", Uuid::new_v4());
+    let (status, body) = request_json(
+        state.clone(),
+        "PATCH",
+        &format!("/api/channels/{}", moving.id),
+        Some(serde_json::json!({"spec": {"provider": "widget", "widget_id": free}})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["external_key"], free);
+    assert_eq!(
+        body["endpoint"],
+        format!("wss://test.example.com/ws/{free}")
+    );
+
+    // Taken key — 409 naming the blocking channel.
+    let (status, body) = request_json(
+        state,
+        "PATCH",
+        &format!("/api/channels/{}", moving.id),
+        Some(serde_json::json!({"spec": {"provider": "widget", "widget_id": second}})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"], "channel_exists");
+    assert_eq!(body["channel_id"], blocker.id.to_string());
+}
+
+#[tokio::test]
+async fn patch_channel_rotates_a_telegram_token_for_the_same_bot() {
+    let pool = setup_pool().await;
+    let bot_id = (Uuid::new_v4().as_u128() as u32) as i64;
+    let guard = insert_test_channel(
+        &pool,
+        "telegram",
+        &bot_id.to_string(),
+        serde_json::json!({"bot_token": format!("{bot_id}:AAold"), "bot_secret": "kept_secret"}),
+    )
+    .await;
+    let api = spawn_mock_telegram(serde_json::json!({
+        "getMe": get_me_ok(bot_id),
+        "setWebhook": {"ok": true, "result": true},
+        "deleteWebhook": {"ok": true, "result": true},
+    }))
+    .await;
+    let state = build_state_with(pool.clone(), api).await;
+
+    let (status, body) = request_json(
+        state,
+        "PATCH",
+        &format!("/api/channels/{}", guard.id),
+        Some(serde_json::json!({
+            "spec": {"provider": "telegram", "bot_token": format!("{bot_id}:AAnew")}
+        })),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["config"]["bot_token"], format!("{bot_id}:AAnew"));
+    assert_eq!(
+        body["config"]["bot_secret"], "kept_secret",
+        "the webhook secret survives a token rotation"
+    );
+}
+
+#[tokio::test]
+async fn patch_channel_refuses_a_token_belonging_to_another_bot() {
+    let pool = setup_pool().await;
+    let bot_id = (Uuid::new_v4().as_u128() as u32) as i64;
+    let other_bot_id = bot_id + 1;
+    let guard = insert_test_channel(
+        &pool,
+        "telegram",
+        &bot_id.to_string(),
+        serde_json::json!({"bot_token": format!("{bot_id}:AAold"), "bot_secret": "s"}),
+    )
+    .await;
+    let api = spawn_mock_telegram(serde_json::json!({"getMe": get_me_ok(other_bot_id)})).await;
+    let state = build_state_with(pool.clone(), api).await;
+
+    let (status, _) = request_json(
+        state,
+        "PATCH",
+        &format!("/api/channels/{}", guard.id),
+        Some(serde_json::json!({
+            "spec": {"provider": "telegram", "bot_token": format!("{other_bot_id}:AAother")}
+        })),
+    )
+    .await;
+
+    // Repointing a channel at a different bot is not an edit: chats and messages
+    // hang off this channel id.
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn patch_channel_restores_and_rewrites_the_submitted_fields() {
+    let pool = setup_pool().await;
+    let bot_id = (Uuid::new_v4().as_u128() as u32) as i64;
+    let guard = insert_test_channel(
+        &pool,
+        "telegram",
+        &bot_id.to_string(),
+        serde_json::json!({"bot_token": format!("{bot_id}:AAdead"), "bot_secret": "old"}),
+    )
+    .await;
+    chatbridge::db::soft_delete_channel(&pool, guard.id)
+        .await
+        .unwrap();
+
+    let api = spawn_mock_telegram(serde_json::json!({
+        "getMe": get_me_ok(bot_id),
+        "setWebhook": {"ok": true, "result": true},
+        "deleteWebhook": {"ok": true, "result": true},
+    }))
+    .await;
+    let state = build_state_with(pool.clone(), api).await;
+
+    let (status, body) = request_json(
+        state,
+        "PATCH",
+        &format!("/api/channels/{}", guard.id),
+        Some(serde_json::json!({
+            "restore": true,
+            "spec": {"provider": "telegram", "bot_token": format!("{bot_id}:AAfresh")}
+        })),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["deleted_at"], serde_json::Value::Null);
+    assert_eq!(
+        body["config"]["bot_token"],
+        format!("{bot_id}:AAfresh"),
+        "restore writes the freshly entered token, not the dead one"
+    );
+    assert_eq!(body["id"], guard.id.to_string(), "the original id is kept");
+}
+
+#[tokio::test]
+async fn patch_channel_returns_502_when_set_webhook_fails() {
+    let pool = setup_pool().await;
+    let bot_id = (Uuid::new_v4().as_u128() as u32) as i64;
+    let guard = insert_test_channel(
+        &pool,
+        "telegram",
+        &bot_id.to_string(),
+        serde_json::json!({"bot_token": format!("{bot_id}:AAold"), "bot_secret": "s"}),
+    )
+    .await;
+    let api = spawn_mock_telegram(serde_json::json!({
+        "getMe": get_me_ok(bot_id),
+        "setWebhook": {"ok": false, "description": "bad webhook"},
+        "deleteWebhook": {"ok": true, "result": true},
+    }))
+    .await;
+    let state = build_state_with(pool.clone(), api).await;
+
+    let (status, _) = request_json(
+        state,
+        "PATCH",
+        &format!("/api/channels/{}", guard.id),
+        Some(serde_json::json!({
+            "spec": {"provider": "telegram", "bot_token": format!("{bot_id}:AAnew")}
+        })),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+}
+
+#[tokio::test]
+async fn patch_channel_drops_the_cache_even_when_set_webhook_fails() {
+    let pool = setup_pool().await;
+    let bot_id = (Uuid::new_v4().as_u128() as u32) as i64;
+    let guard = insert_test_channel(
+        &pool,
+        "telegram",
+        &bot_id.to_string(),
+        serde_json::json!({"bot_token": format!("{bot_id}:AAold"), "bot_secret": "s"}),
+    )
+    .await;
+    let api = spawn_mock_telegram(serde_json::json!({
+        "getMe": get_me_ok(bot_id),
+        "setWebhook": {"ok": false, "description": "bad webhook"},
+        "deleteWebhook": {"ok": true, "result": true},
+    }))
+    .await;
+    let state = build_state_with(pool.clone(), api).await;
+
+    // Warm the cache with the pre-PATCH config.
+    state
+        .cache
+        .get_channel_by_id(&pool, guard.id)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let (status, _) = request_json(
+        state.clone(),
+        "PATCH",
+        &format!("/api/channels/{}", guard.id),
+        Some(serde_json::json!({
+            "spec": {"provider": "telegram", "bot_token": format!("{bot_id}:AAnew")}
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+
+    // The UPDATE committed before setWebhook failed, so the cache must not keep
+    // serving the old config — the webhook handler verifies secrets against it.
+    let cached = state
+        .cache
+        .get_channel_by_id(&pool, guard.id)
+        .await
+        .unwrap()
+        .expect("channel still live");
+    assert_eq!(cached.config["bot_token"], format!("{bot_id}:AAnew"));
+}
+
+#[tokio::test]
+async fn patch_channel_does_not_arm_the_webhook_of_a_channel_that_stays_deleted() {
+    let pool = setup_pool().await;
+    let bot_id = (Uuid::new_v4().as_u128() as u32) as i64;
+    let guard = insert_test_channel(
+        &pool,
+        "telegram",
+        &bot_id.to_string(),
+        serde_json::json!({"bot_token": format!("{bot_id}:AAold"), "bot_secret": "s"}),
+    )
+    .await;
+    chatbridge::db::soft_delete_channel(&pool, guard.id)
+        .await
+        .unwrap();
+
+    // setWebhook is wired to fail: reaching it would turn this into a 502.
+    let api = spawn_mock_telegram(serde_json::json!({
+        "getMe": get_me_ok(bot_id),
+        "setWebhook": {"ok": false, "description": "must not be reached"},
+        "deleteWebhook": {"ok": true, "result": true},
+    }))
+    .await;
+    let state = build_state_with(pool.clone(), api).await;
+
+    let (status, body) = request_json(
+        state,
+        "PATCH",
+        &format!("/api/channels/{}", guard.id),
+        Some(serde_json::json!({
+            "spec": {"provider": "telegram", "bot_token": format!("{bot_id}:AAnew")}
+        })),
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "editing a deleted channel is allowed"
+    );
+    assert!(body["deleted_at"].is_string(), "and it stays deleted");
+    assert_eq!(body["config"]["bot_token"], format!("{bot_id}:AAnew"));
+}
+
+#[tokio::test]
+async fn patch_channel_preserves_instagram_refresh_time() {
+    let pool = setup_pool().await;
+    let user_id = format!("178414{}", Uuid::new_v4().as_u128() as u32);
+    let guard = insert_test_channel(
+        &pool,
+        "instagram",
+        &user_id,
+        serde_json::json!({"access_token": "old", "refresh_time": "2026-03-14T00:00:00+00:00"}),
+    )
+    .await;
+    let state = build_state(pool.clone()).await;
+
+    let (status, body) = request_json(
+        state,
+        "PATCH",
+        &format!("/api/channels/{}", guard.id),
+        Some(serde_json::json!({
+            "spec": {"provider": "instagram", "user_id": user_id, "access_token": "new"}
+        })),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["config"]["access_token"], "new");
+    assert_eq!(
+        body["config"]["refresh_time"], "2026-03-14T00:00:00+00:00",
+        "a field the form never shows must survive a Save"
+    );
+}
+
+#[tokio::test]
+async fn delete_channel_soft_deletes_and_is_idempotent() {
+    let pool = setup_pool().await;
+    let widget_id = format!("api_{}", Uuid::new_v4());
+    let guard = insert_test_widget_channel(&pool, &widget_id).await;
+    let state = build_state(pool.clone()).await;
+
+    let (status, _) = request_json(
+        state.clone(),
+        "DELETE",
+        &format!("/api/channels/{}", guard.id),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let row = chatbridge::db::find_channel_by_id(&pool, guard.id)
+        .await
+        .unwrap()
+        .expect("the row survives — history is kept");
+    let first_deleted_at = row.deleted_at.expect("deleted_at set");
+
+    // A repeat delete answers 204 as well and does not move the timestamp.
+    let (status, _) = request_json(
+        state,
+        "DELETE",
+        &format!("/api/channels/{}", guard.id),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let again = chatbridge::db::find_channel_by_id(&pool, guard.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(again.deleted_at, Some(first_deleted_at));
+}
+
+#[tokio::test]
+async fn delete_channel_unknown_id_is_still_204() {
+    let pool = setup_pool().await;
+    let state = build_state(pool).await;
+    let (status, _) = request_json(
+        state,
+        "DELETE",
+        &format!("/api/channels/{}", Uuid::new_v4()),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn delete_channel_succeeds_even_when_delete_webhook_fails() {
+    let pool = setup_pool().await;
+    let guard = insert_test_telegram_channel(&pool, "del_secret").await;
+    // A revoked token makes deleteWebhook fail; the channel must still be deletable.
+    let api = spawn_mock_telegram(serde_json::json!({
+        "deleteWebhook": {"ok": false, "description": "Unauthorized"},
+    }))
+    .await;
+    let state = build_state_with(pool.clone(), api).await;
+
+    let (status, _) = request_json(
+        state,
+        "DELETE",
+        &format!("/api/channels/{}", guard.id),
+        None,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let row = chatbridge::db::find_channel_by_id(&pool, guard.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(row.deleted_at.is_some());
+}
+
+#[tokio::test]
+async fn deleted_channel_is_invisible_to_the_hot_path() {
+    let pool = setup_pool().await;
+    let widget_id = format!("api_{}", Uuid::new_v4());
+    let guard = insert_test_widget_channel(&pool, &widget_id).await;
+    let state = build_state(pool.clone()).await;
+
+    let (status, _) = request_json(
+        state.clone(),
+        "DELETE",
+        &format!("/api/channels/{}", guard.id),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // The handler invalidated the cache, so the next read-through misses the DB filter.
+    assert!(
+        state
+            .cache
+            .get_channel_by_external_key(&pool, ProviderKind::Widget, &widget_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // And the widget cannot connect any more.
+    let addr = spawn_app(state).await;
+    let url = format!("ws://{addr}/ws/{widget_id}");
+    assert!(
+        tokio_tungstenite::connect_async(&url).await.is_err(),
+        "a deleted widget channel must refuse the upgrade"
+    );
+}
+
+#[tokio::test]
+async fn list_active_chats_excludes_chats_of_a_deleted_channel() {
+    let pool = setup_pool().await;
+    let widget_id = format!("api_{}", Uuid::new_v4());
+    let channel = insert_test_widget_channel(&pool, &widget_id).await;
+    let client = insert_test_client(&pool, "Deleted Channel Customer").await;
+    let chat_id = chatbridge::db::find_or_create_chat(&pool, client.id, channel.id)
+        .await
+        .unwrap();
+    let _chat = TestChat { id: chat_id };
+
+    let before = chatbridge::db::list_active_chats(&pool).await.unwrap();
+    assert!(
+        before.iter().any(|c| c.chat_id == chat_id),
+        "the chat is in the inbox while the channel is live"
+    );
+
+    chatbridge::db::soft_delete_channel(&pool, channel.id)
+        .await
+        .unwrap();
+
+    let after = chatbridge::db::list_active_chats(&pool).await.unwrap();
+    assert!(
+        !after.iter().any(|c| c.chat_id == chat_id),
+        "a deleted channel's chats must leave the inbox — they are unanswerable"
+    );
+}
+
+#[tokio::test]
+async fn get_webhook_status_reports_a_match() {
+    let pool = setup_pool().await;
+    let bot_id = (Uuid::new_v4().as_u128() as u32) as i64;
+    let guard = insert_test_channel(
+        &pool,
+        "telegram",
+        &bot_id.to_string(),
+        serde_json::json!({"bot_token": format!("{bot_id}:AA"), "bot_secret": "s"}),
+    )
+    .await;
+    let expected = format!("https://test.example.com/webhook/telegram/{}", guard.id);
+    let api = spawn_mock_telegram(serde_json::json!({
+        "getWebhookInfo": {"ok": true, "result": {
+            "url": expected, "pending_update_count": 0
+        }},
+    }))
+    .await;
+    let state = build_state_with(pool.clone(), api).await;
+
+    let (status, body) = request_json(
+        state,
+        "GET",
+        &format!("/api/channels/{}/webhook", guard.id),
+        None,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["matches"], true);
+    assert_eq!(body["registered_url"], expected);
+    assert_eq!(body["expected_url"], expected);
+    assert_eq!(body["last_error_message"], serde_json::Value::Null);
+}
+
+#[tokio::test]
+async fn get_webhook_status_reports_a_hijacked_webhook_and_delivery_errors() {
+    let pool = setup_pool().await;
+    let bot_id = (Uuid::new_v4().as_u128() as u32) as i64;
+    let guard = insert_test_channel(
+        &pool,
+        "telegram",
+        &bot_id.to_string(),
+        serde_json::json!({"bot_token": format!("{bot_id}:AA"), "bot_secret": "s"}),
+    )
+    .await;
+    let api = spawn_mock_telegram(serde_json::json!({
+        "getWebhookInfo": {"ok": true, "result": {
+            "url": "https://someone-else.example.com/webhook/telegram/other",
+            "pending_update_count": 12,
+            "last_error_date": 1700000000,
+            "last_error_message": "wrong response from webhook: 404"
+        }},
+    }))
+    .await;
+    let state = build_state_with(pool.clone(), api).await;
+
+    let (status, body) = request_json(
+        state,
+        "GET",
+        &format!("/api/channels/{}/webhook", guard.id),
+        None,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["matches"], false);
+    assert_eq!(body["pending_update_count"], 12);
+    assert!(body["last_error_message"].as_str().unwrap().contains("404"));
+}
+
+#[tokio::test]
+async fn post_webhook_reregisters_and_returns_the_fresh_status() {
+    let pool = setup_pool().await;
+    let bot_id = (Uuid::new_v4().as_u128() as u32) as i64;
+    let guard = insert_test_channel(
+        &pool,
+        "telegram",
+        &bot_id.to_string(),
+        serde_json::json!({"bot_token": format!("{bot_id}:AA"), "bot_secret": "s"}),
+    )
+    .await;
+    let expected = format!("https://test.example.com/webhook/telegram/{}", guard.id);
+    let api = spawn_mock_telegram(serde_json::json!({
+        "setWebhook": {"ok": true, "result": true},
+        "getWebhookInfo": {"ok": true, "result": {
+            "url": expected, "pending_update_count": 0
+        }},
+    }))
+    .await;
+    let state = build_state_with(pool.clone(), api).await;
+
+    let (status, body) = request_json(
+        state,
+        "POST",
+        &format!("/api/channels/{}/webhook", guard.id),
+        None,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["matches"], true,
+        "re-register then report in one round trip"
+    );
+}
+
+#[tokio::test]
+async fn webhook_status_rejects_non_telegram_and_deleted_channels() {
+    let pool = setup_pool().await;
+    let widget_id = format!("api_{}", Uuid::new_v4());
+    let widget = insert_test_widget_channel(&pool, &widget_id).await;
+    let deleted = insert_test_telegram_channel(&pool, "s").await;
+    chatbridge::db::soft_delete_channel(&pool, deleted.id)
+        .await
+        .unwrap();
+    let state = build_state(pool.clone()).await;
+
+    let (status, _) = request_json(
+        state.clone(),
+        "GET",
+        &format!("/api/channels/{}/webhook", widget.id),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "only telegram has a webhook"
+    );
+
+    let (status, _) = request_json(
+        state,
+        "GET",
+        &format!("/api/channels/{}/webhook", deleted.id),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a deleted channel has no webhook to manage; restore it instead"
+    );
 }

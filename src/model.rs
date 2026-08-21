@@ -8,6 +8,60 @@ pub enum ProviderKind {
     Widget,
 }
 
+/// Stored contents of `channels.config` for a telegram channel.
+///
+/// These structs deliberately carry no provider tag: `channels.provider` is the
+/// single source of truth, so read a config by matching on that column and then
+/// deserializing into the matching struct.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TelegramConfig {
+    pub bot_token: String,
+    pub bot_secret: String,
+}
+
+/// Stored contents of `channels.config` for an instagram channel.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstagramConfig {
+    pub access_token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_time: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Stored contents of `channels.config` for a widget channel. A widget channel
+/// is fully described by its `external_key`, so there is nothing to store.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WidgetConfig {}
+
+/// Wire format for creating or editing a channel: the body of
+/// `POST /api/channels` and the `spec` field of `PATCH /api/channels/{id}`.
+///
+/// Tagged on the wire (unlike the stored configs) so one endpoint can accept
+/// every provider, following the same style as `IncomingEvent` and `WsOutbound`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "provider", rename_all = "snake_case")]
+pub enum ChannelSpec {
+    Widget {
+        widget_id: String,
+    },
+    Telegram {
+        bot_token: String,
+    },
+    Instagram {
+        user_id: String,
+        access_token: String,
+    },
+}
+
+impl ChannelSpec {
+    pub fn provider(&self) -> ProviderKind {
+        match self {
+            ChannelSpec::Widget { .. } => ProviderKind::Widget,
+            ChannelSpec::Telegram { .. } => ProviderKind::Telegram,
+            ChannelSpec::Instagram { .. } => ProviderKind::Instagram,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum EventKind {
     Message,
@@ -389,5 +443,117 @@ mod tests {
         let msg: OperatorInbound = serde_json::from_str(&json).unwrap();
         assert_eq!(msg.action, WsActionKind::Read);
         assert_eq!(msg.text, None);
+    }
+
+    #[test]
+    fn channel_spec_deserializes_each_provider() {
+        let widget: ChannelSpec =
+            serde_json::from_value(serde_json::json!({"provider": "widget", "widget_id": "acme"}))
+                .unwrap();
+        assert_eq!(widget.provider(), ProviderKind::Widget);
+
+        let telegram: ChannelSpec = serde_json::from_value(
+            serde_json::json!({"provider": "telegram", "bot_token": "123:AA"}),
+        )
+        .unwrap();
+        assert_eq!(telegram.provider(), ProviderKind::Telegram);
+
+        let instagram: ChannelSpec = serde_json::from_value(serde_json::json!({
+            "provider": "instagram", "user_id": "17841", "access_token": "tok"
+        }))
+        .unwrap();
+        assert_eq!(instagram.provider(), ProviderKind::Instagram);
+    }
+
+    #[test]
+    fn channel_spec_serializes_with_the_provider_tag() {
+        // The frontend hand-builds these objects, so the tag name and field names
+        // are a contract in both directions, not just on the way in.
+        let widget = ChannelSpec::Widget {
+            widget_id: "acme".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&widget).unwrap(),
+            serde_json::json!({"provider": "widget", "widget_id": "acme"})
+        );
+
+        let telegram = ChannelSpec::Telegram {
+            bot_token: "123:AA".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&telegram).unwrap(),
+            serde_json::json!({"provider": "telegram", "bot_token": "123:AA"})
+        );
+
+        let instagram = ChannelSpec::Instagram {
+            user_id: "17841".into(),
+            access_token: "tok".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&instagram).unwrap(),
+            serde_json::json!({"provider": "instagram", "user_id": "17841", "access_token": "tok"})
+        );
+    }
+
+    #[test]
+    fn channel_spec_rejects_unknown_provider_and_missing_fields() {
+        assert!(
+            serde_json::from_value::<ChannelSpec>(
+                serde_json::json!({"provider": "whatsapp", "phone": "1"})
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<ChannelSpec>(serde_json::json!({"provider": "widget"}))
+                .is_err()
+        );
+        assert!(
+            serde_json::from_value::<ChannelSpec>(
+                serde_json::json!({"provider": "instagram", "user_id": "1"})
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn telegram_config_round_trips_through_json() {
+        let value = serde_json::json!({"bot_token": "123:AA", "bot_secret": "s3cr3t"});
+        let cfg: TelegramConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(cfg.bot_token, "123:AA");
+        assert_eq!(cfg.bot_secret, "s3cr3t");
+
+        let back = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(back["bot_token"], "123:AA");
+        assert_eq!(back["bot_secret"], "s3cr3t");
+    }
+
+    #[test]
+    fn telegram_config_missing_secret_fails() {
+        let value = serde_json::json!({"bot_token": "123:AA"});
+        assert!(serde_json::from_value::<TelegramConfig>(value).is_err());
+    }
+
+    #[test]
+    fn instagram_config_accepts_absent_refresh_time() {
+        let value = serde_json::json!({"access_token": "tok"});
+        let cfg: InstagramConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(cfg.access_token, "tok");
+        assert!(cfg.refresh_time.is_none());
+    }
+
+    #[test]
+    fn instagram_config_parses_refresh_time() {
+        let value = serde_json::json!({
+            "access_token": "tok",
+            "refresh_time": "2026-03-14T00:00:00+00:00"
+        });
+        let cfg: InstagramConfig = serde_json::from_value(value).unwrap();
+        assert!(cfg.refresh_time.is_some());
+    }
+
+    #[test]
+    fn widget_config_parses_empty_object() {
+        let cfg: WidgetConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(serde_json::to_value(&cfg).unwrap(), serde_json::json!({}));
     }
 }
