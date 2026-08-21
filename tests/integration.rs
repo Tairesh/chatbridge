@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use chrono::{DateTime, Utc};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use sqlx::PgPool;
@@ -16,7 +17,7 @@ use chatbridge::config::{AppConfig, AppState};
 use chatbridge::model::ProviderKind;
 use chatbridge::registry::ClientRegistry;
 use chatbridge::routes;
-use common::{TestChannel, TestClient, TestOperator};
+use common::{TestChannel, TestChat, TestClient, TestOperator};
 use tokio_util::sync::CancellationToken;
 
 const TEST_VERIFY_TOKEN: &str = "test_verify_token";
@@ -83,6 +84,40 @@ async fn insert_test_widget_channel(pool: &PgPool, widget_id: &str) -> TestChann
         table: "widget_channels",
         id: channel_id,
     }
+}
+
+async fn insert_test_client(pool: &PgPool, name: &str) -> TestClient {
+    let id = Uuid::new_v4();
+    sqlx::query("INSERT INTO clients (id, provider, name) VALUES ($1, 'widget', $2)")
+        .bind(id)
+        .bind(name)
+        .execute(pool)
+        .await
+        .unwrap();
+    TestClient { id }
+}
+
+async fn insert_test_chat(
+    pool: &PgPool,
+    client_id: Uuid,
+    channel_id: Uuid,
+    status: &str,
+    created_at: DateTime<Utc>,
+) -> TestChat {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO chats (id, client_id, channel_id, status, created_at)
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(id)
+    .bind(client_id)
+    .bind(channel_id)
+    .bind(status)
+    .bind(created_at)
+    .execute(pool)
+    .await
+    .unwrap();
+    TestChat { id }
 }
 
 // --- Test helpers ---
@@ -1400,8 +1435,17 @@ async fn ws_multi_tab_same_token_both_work() {
     ws2.send(tungstenite::Message::Text(msg2.to_string().into()))
         .await
         .unwrap();
-    let resp2 = ws2.next().await.unwrap().unwrap();
-    let ack2: serde_json::Value = serde_json::from_str(resp2.to_text().unwrap()).unwrap();
+    // This tab may or may not receive a connect-time chat event: the handshake
+    // completes before the server task runs find_last_chat, so whether a chat
+    // exists by then depends on how tab 1's message interleaves.
+    let ack2 = loop {
+        let resp2 = ws2.next().await.unwrap().unwrap();
+        let frame: serde_json::Value = serde_json::from_str(resp2.to_text().unwrap()).unwrap();
+        if frame["action"] == "chat" {
+            continue;
+        }
+        break frame;
+    };
     assert_eq!(ack2["action"], "ack");
 
     ws1.close(None).await.unwrap();
@@ -2635,4 +2679,199 @@ async fn operator_read_receipt_reaches_widget() {
 
     widget_ws.close(None).await.unwrap();
     op_ws.close(None).await.unwrap();
+}
+
+// --- find_last_chat ---
+
+#[tokio::test]
+async fn find_last_chat_returns_closed_chat() {
+    let pool = setup_pool().await;
+    let widget_id = format!("test_widget_{}", Uuid::new_v4());
+    let channel = insert_test_widget_channel(&pool, &widget_id).await;
+    let client = insert_test_client(&pool, "Archived Client").await;
+    let chat = insert_test_chat(&pool, client.id, channel.id, "closed", Utc::now()).await;
+
+    let found = chatbridge::db::find_last_chat(&pool, client.id, channel.id)
+        .await
+        .unwrap()
+        .expect("a closed chat must still be returned");
+
+    assert_eq!(found.id, chat.id);
+    assert_eq!(found.status, "closed");
+}
+
+#[tokio::test]
+async fn find_last_chat_returns_newest_of_several() {
+    let pool = setup_pool().await;
+    let widget_id = format!("test_widget_{}", Uuid::new_v4());
+    let channel = insert_test_widget_channel(&pool, &widget_id).await;
+    let client = insert_test_client(&pool, "Returning Client").await;
+
+    // Two 'new' chats are impossible — idx_chats_active forbids them.
+    let old = insert_test_chat(
+        &pool,
+        client.id,
+        channel.id,
+        "closed",
+        Utc::now() - chrono::Duration::hours(2),
+    )
+    .await;
+    let recent = insert_test_chat(&pool, client.id, channel.id, "new", Utc::now()).await;
+
+    let found = chatbridge::db::find_last_chat(&pool, client.id, channel.id)
+        .await
+        .unwrap()
+        .expect("chat should exist");
+
+    assert_eq!(found.id, recent.id);
+    assert_ne!(found.id, old.id);
+    assert_eq!(found.status, "new");
+}
+
+#[tokio::test]
+async fn find_last_chat_returns_none_when_no_chats() {
+    let pool = setup_pool().await;
+    let widget_id = format!("test_widget_{}", Uuid::new_v4());
+    let channel = insert_test_widget_channel(&pool, &widget_id).await;
+    let client = insert_test_client(&pool, "Fresh Client").await;
+
+    let found = chatbridge::db::find_last_chat(&pool, client.id, channel.id)
+        .await
+        .unwrap();
+
+    assert!(found.is_none(), "a client with no chats yields None");
+}
+
+// --- get_chat_messages sender_name ---
+
+#[tokio::test]
+async fn get_chat_messages_includes_sender_name() {
+    let pool = setup_pool().await;
+    let widget_id = format!("test_widget_{}", Uuid::new_v4());
+    let channel = insert_test_widget_channel(&pool, &widget_id).await;
+    let client = insert_test_client(&pool, "Named Client").await;
+    let chat = insert_test_chat(&pool, client.id, channel.id, "new", Utc::now()).await;
+
+    let operator_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO operators (id, name) VALUES ($1, 'Named Operator')")
+        .bind(operator_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let _operator = TestOperator { id: operator_id };
+
+    sqlx::query(
+        "INSERT INTO messages (chat_id, external_message_id, channel_id, sender_id, sender_type, text, raw)
+         VALUES ($1, $2, $3, $4, 'client', 'from the client', '{}'::jsonb)",
+    )
+    .bind(chat.id)
+    .bind(format!("widget:{}", Uuid::new_v4()))
+    .bind(channel.id)
+    .bind(client.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO messages (chat_id, external_message_id, channel_id, sender_id, sender_type, text, raw, created_at)
+         VALUES ($1, $2, $3, $4, 'operator', 'from the operator', '{}'::jsonb, now() + interval '1 second')",
+    )
+    .bind(chat.id)
+    .bind(format!("operator:{}", Uuid::new_v4()))
+    .bind(channel.id)
+    .bind(operator_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let messages = chatbridge::db::get_chat_messages(&pool, chat.id)
+        .await
+        .unwrap();
+
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0].sender_type, "client");
+    assert_eq!(messages[0].sender_name.as_deref(), Some("Named Client"));
+    assert_eq!(messages[1].sender_type, "operator");
+    assert_eq!(messages[1].sender_name.as_deref(), Some("Named Operator"));
+}
+
+#[tokio::test]
+async fn ws_returning_client_receives_chat_event() {
+    let pool = setup_pool().await;
+    let widget_id = format!("test_widget_{}", Uuid::new_v4());
+    let channel = insert_test_widget_channel(&pool, &widget_id).await;
+
+    let state = build_state(pool.clone()).await;
+    let addr = spawn_app(state).await;
+
+    // First connect: new client, gets auth, sends one message so a chat is created.
+    let (mut ws1, token, _client) = ws_connect(addr, &widget_id).await;
+    let mid = Uuid::new_v4();
+    let msg = serde_json::json!({"action": "send", "mid": mid.to_string(), "text": "first"});
+    ws1.send(tungstenite::Message::Text(msg.to_string().into()))
+        .await
+        .unwrap();
+    let ack = ws1.next().await.unwrap().unwrap();
+    let ack: serde_json::Value = serde_json::from_str(ack.to_text().unwrap()).unwrap();
+    assert_eq!(
+        ack["action"], "ack",
+        "message must be persisted before reconnect"
+    );
+    ws1.close(None).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Reconnect with the token: no auth, first frame is the chat event.
+    let url = format!(
+        "ws://{addr}/ws/{widget_id}?token={}",
+        urlencoding::encode(&token)
+    );
+    let (mut ws2, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    // Timeout, not a bare await: with no chat event the server stays silent for the
+    // full 300s idle period, and a hung test is far less useful than a failed one.
+    let resp = tokio::time::timeout(std::time::Duration::from_secs(5), ws2.next())
+        .await
+        .expect("no frame within 5s — the server sent nothing on connect")
+        .unwrap()
+        .unwrap();
+    let event: serde_json::Value = serde_json::from_str(resp.to_text().unwrap()).unwrap();
+
+    assert_eq!(event["action"], "chat");
+    assert_eq!(event["status"], "new");
+    let chat_id: Uuid = event["chat_id"].as_str().unwrap().parse().unwrap();
+    let (chat_channel,): (Uuid,) = sqlx::query_as("SELECT channel_id FROM chats WHERE id = $1")
+        .bind(chat_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(chat_channel, channel.id, "chat must belong to this channel");
+
+    ws2.close(None).await.unwrap();
+}
+
+#[tokio::test]
+async fn ws_new_client_receives_no_chat_event() {
+    let pool = setup_pool().await;
+    let widget_id = format!("test_widget_{}", Uuid::new_v4());
+    let _guard = insert_test_widget_channel(&pool, &widget_id).await;
+
+    let state = build_state(pool.clone()).await;
+    let addr = spawn_app(state).await;
+
+    // ws_connect already asserts the first frame is auth. A client with no chat must
+    // get nothing after it, so the next frame is the ack for the message we send.
+    let (mut ws, _token, _client) = ws_connect(addr, &widget_id).await;
+    let mid = Uuid::new_v4();
+    let msg = serde_json::json!({"action": "send", "mid": mid.to_string(), "text": "hello"});
+    ws.send(tungstenite::Message::Text(msg.to_string().into()))
+        .await
+        .unwrap();
+
+    let resp = ws.next().await.unwrap().unwrap();
+    let event: serde_json::Value = serde_json::from_str(resp.to_text().unwrap()).unwrap();
+    assert_eq!(
+        event["action"], "ack",
+        "a client with no chat must not receive a chat event"
+    );
+
+    ws.close(None).await.unwrap();
 }

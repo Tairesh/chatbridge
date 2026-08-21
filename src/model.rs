@@ -170,6 +170,13 @@ pub enum WsOutbound {
     Ack {
         message_id: Uuid,
     },
+    /// Sent once on connect when the client already has a chat, so the frontend
+    /// can fetch its history. `status` is the raw `chats.status` value; anything
+    /// other than "new" means the chat is archived and read-only.
+    Chat {
+        chat_id: Uuid,
+        status: String,
+    },
     Error {
         reason: String,
     },
@@ -284,6 +291,19 @@ mod tests {
         let json = serde_json::to_value(&msg).unwrap();
         assert_eq!(json["action"], "ack");
         assert_eq!(json["message_id"], TEST_UUID);
+    }
+
+    #[test]
+    fn ws_outbound_chat_serializes_correctly() {
+        let chat_id: Uuid = TEST_UUID.parse().unwrap();
+        let msg = WsOutbound::Chat {
+            chat_id,
+            status: "new".into(),
+        };
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json["action"], "chat");
+        assert_eq!(json["chat_id"], TEST_UUID);
+        assert_eq!(json["status"], "new");
     }
 
     #[test]

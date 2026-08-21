@@ -89,6 +89,25 @@ async fn handle_widget_socket(
         }
     }
 
+    // Tell the client which chat they belong to so the widget can load its history.
+    // A brand-new client has no chat yet — find_or_create_chat only runs from
+    // persist_and_publish on their first message — so nothing is sent for them.
+    match crate::db::find_last_chat(&state.db, client_id, channel_id).await {
+        Ok(Some(chat)) => {
+            let event = WsOutbound::Chat {
+                chat_id: chat.id,
+                status: chat.status,
+            };
+            if !send_outbound(&mut socket, &event).await {
+                tracing::warn!(%channel_id, %client_id, "chat event send failed, disconnecting");
+                return;
+            }
+        }
+        Ok(None) => {}
+        // History is not worth killing a working socket over.
+        Err(e) => tracing::error!(%channel_id, %client_id, "find_last_chat failed: {e}"),
+    }
+
     loop {
         tokio::select! {
             msg = receiver.recv() => {

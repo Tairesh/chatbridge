@@ -189,6 +189,33 @@ pub async fn find_or_create_chat(
     }
 }
 
+/// The client's most recent chat on a channel, whatever its status.
+///
+/// Unlike `find_or_create_chat` this does NOT filter on `status = 'new'`: a client
+/// returning to a closed conversation should still see its history. Creates nothing.
+#[derive(Debug, Clone, FromRow)]
+pub struct LastChat {
+    pub id: Uuid,
+    pub status: String,
+}
+
+pub async fn find_last_chat(
+    pool: &PgPool,
+    client_id: Uuid,
+    channel_id: Uuid,
+) -> Result<Option<LastChat>, sqlx::Error> {
+    sqlx::query_as::<_, LastChat>(
+        "SELECT id, status FROM chats
+         WHERE client_id = $1 AND channel_id = $2
+         ORDER BY created_at DESC
+         LIMIT 1",
+    )
+    .bind(client_id)
+    .bind(channel_id)
+    .fetch_optional(pool)
+    .await
+}
+
 // ── DB return types (decoupled from model event structs) ────────────
 
 #[derive(Debug, Clone, FromRow)]
@@ -320,6 +347,7 @@ pub struct ChatMessage {
     pub external_message_id: String,
     pub sender_id: Option<Uuid>,
     pub sender_type: String,
+    pub sender_name: Option<String>,
     pub text: Option<String>,
     pub status: String,
     pub edited_at: Option<DateTime<Utc>>,
@@ -339,10 +367,17 @@ pub async fn get_chat_messages(
     chat_id: Uuid,
 ) -> Result<Vec<ChatMessage>, sqlx::Error> {
     sqlx::query_as::<_, ChatMessage>(
-        "SELECT id, external_message_id, sender_id, sender_type, text, status, edited_at, created_at
-         FROM messages
-         WHERE chat_id = $1
-         ORDER BY created_at ASC
+        "SELECT m.id, m.external_message_id, m.sender_id, m.sender_type,
+                CASE
+                    WHEN m.sender_type = 'operator' THEN op.name
+                    ELSE cl.name
+                END AS sender_name,
+                m.text, m.status, m.edited_at, m.created_at
+         FROM messages m
+         LEFT JOIN operators op ON m.sender_type = 'operator' AND op.id = m.sender_id
+         LEFT JOIN clients   cl ON m.sender_type = 'client'   AND cl.id = m.sender_id
+         WHERE m.chat_id = $1
+         ORDER BY m.created_at ASC
          LIMIT 100",
     )
     .bind(chat_id)

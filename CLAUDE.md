@@ -4,14 +4,19 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Build & Run
 
-- **Build:** `cargo build`
-- **Run:** `cargo run` (requires env vars below)
-- **Lint:** `cargo clippy`
-- **Format:** `cargo fmt`
-- **Unit tests (no DB):** `cargo test --lib`
-- **All tests (needs Postgres + Redis):** `DATABASE_URL=postgres://chatbridge:chatbridge@localhost:5432/chatbridge REDIS_URL=redis://localhost:6379 cargo test`
-- **Run single test:** `cargo test <test_name>` or `cargo test --test <file_name>` for a specific test file
-- **Docker (full stack):** `docker compose up --build`
+Use the `justfile` — `just test` starts the Postgres and Redis containers and injects
+`DATABASE_URL` / `REDIS_URL` itself, so never spell those out by hand.
+
+- **Build:** `just build`
+- **Run:** `just run` (requires env vars below)
+- **Lint:** `just lint`
+- **Format:** `just fmt` (`just fmt-check` to verify without writing)
+- **Unit tests (no DB):** `just test-unit`
+- **All tests (starts Postgres + Redis, sets env):** `just test`
+- **Run single test:** `just test-one <test_name>`
+- **Full gate (fmt + lint + test):** `just check`
+- **Docker (full stack):** `just up` (`just upd` detached, `just down` to stop)
+- `just --list` shows every recipe.
 
 ## Gotchas
 
@@ -65,3 +70,4 @@ Tables: `channels`, `instagram_channels`, `telegram_channels`, `widget_channels`
 
 - Design specs: `docs/superpowers/specs/`
 - Implementation plans: `docs/superpowers/plans/`
+- Known gaps & shortcuts: `docs/tech_debt.md` — record debt when you find it, do not defer

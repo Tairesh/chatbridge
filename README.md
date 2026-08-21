@@ -48,6 +48,8 @@ Multi-provider chat bridge for **Instagram**, **Telegram**, and **WebSocket chat
                          │   │  (in-memory cache → DB)              │
                          │   ├─ Upgrade to WebSocket                │
                          │   ├─ JWT auth (issue or verify)          │
+                         │   ├─ Send chat event if a chat exists    │
+                         │   │  {action, chat_id, status}           │
                          │   ├─ Register in ClientRegistry (mpsc)   │
                          │   │                                      │
                          │   └─ Message loop (select!):             │
@@ -81,7 +83,8 @@ Multi-provider chat bridge for **Instagram**, **Telegram**, and **WebSocket chat
                          │   └─ List active chats with summaries    │
                          │                                          │
     Operator ──────GET───▶ /api/chats/{chat_id}                     │
-                         │   └─ Chat message history                │
+                         │   └─ Chat message history (also used by  │
+                         │      the widget to load its own history) │
                          │                                          │
   Instagram/Meta ──GET───▶ /webhook/instagram                       │
                          │   └─ Subscription verification           │
@@ -238,17 +241,17 @@ Migrations run automatically on startup.
 ### Unit tests (no database needed)
 
 ```bash
-cargo test --lib
+just test-unit
 ```
 
-Covers HMAC verification, secret token validation, event classification, payload deserialization, WebSocket message types, UUID mid validation, and TelegramUser/display name building.
+Covers HMAC verification, secret token validation, event classification, payload deserialization, WebSocket message types, UUID mid validation, TelegramUser/display name building, and the chat-history WebSocket event.
 
 ### All tests (unit + integration)
 
-Requires running Postgres and Redis (e.g. via `docker compose up -d postgres redis`):
+Requires Docker; `just test` starts Postgres and Redis and injects `DATABASE_URL` / `REDIS_URL`:
 
 ```bash
-DATABASE_URL=postgres://chatbridge:chatbridge@localhost:5432/chatbridge REDIS_URL=redis://localhost:6379 cargo test
+just test
 ```
 
 Integration tests cover:
@@ -260,6 +263,7 @@ Integration tests cover:
 - Operator WebSocket (connect, send message to widget client, edit reaches widget client)
 - Read receipt forwarding (widget read → operator, operator read → widget)
 - Operator REST API (list chats, chat messages, unknown chat → 404)
+- Widget chat history (`find_last_chat` returns a closed chat, the newest of several, or None; `sender_name` resolution; chat event on reconnect and its absence for new clients)
 - Redis pub/sub verification for all three providers
 - Client identity upsert (create, update, conflict handling)
 - Telegram client reuse (same client_id across messages from same user)
@@ -271,6 +275,8 @@ Test data cleanup uses RAII drop guards (`TestChannel`, `TestClient`, `TestChat`
 ### Linting
 
 ```bash
-cargo clippy
-cargo fmt --check
+just lint
+just fmt-check
 ```
+
+`just check` runs fmt, clippy, and the full suite in one go.

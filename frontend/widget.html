@@ -15,6 +15,7 @@
     .message.sent { background: #2563eb; color: #fff; align-self: flex-end; }
     .message.received { background: #e5e7eb; color: #1f2937; align-self: flex-start; }
     .message.system { background: transparent; color: #9ca3af; align-self: center; font-size: 12px; font-style: italic; }
+    .message.archived { opacity: 0.6; }
     .msg-text { display: inline; }
     .msg-meta { display: flex; justify-content: flex-end; align-items: center; gap: 4px; margin-top: 4px; font-size: 11px; opacity: 0.7; }
     .msg-time { font-size: 11px; }
@@ -54,11 +55,16 @@
 
     const WIDGET_ID = 'test-widget';
     const TOKEN_KEY = 'chatbridge_token';
+    const BASE_URL = location.origin;
 
     // Track sent messages: mid -> { text, element, acknowledged }
     const sentMessages = new Map();
+    // external_message_id of every bubble in the DOM — history dedup key.
+    const renderedIds = new Set();
     let ws;
     let editingMid = null;
+    let chatState = null;      // { id, status } of this client's most recent chat
+    let historyLoaded = false; // first load prepends, later loads append
 
     function connect() {
       let url = `ws://localhost/ws/${WIDGET_ID}`;
@@ -85,6 +91,10 @@
               break;
             case 'ack':
               handleAck(msg.message_id);
+              break;
+            case 'chat':
+              chatState = { id: msg.chat_id, status: msg.status };
+              loadHistory();
               break;
             case 'error':
               addSystemMessage('Error: ' + msg.reason);
@@ -140,6 +150,8 @@
       const div = document.createElement('div');
       div.className = 'message sent';
       div.id = 'msg-' + mid;
+      div.dataset.externalId = 'widget:' + mid;
+      renderedIds.add('widget:' + mid);
       div.innerHTML = `
         <span class="msg-text">${escapeHtml(text)}</span>
         <div class="msg-meta">
@@ -175,6 +187,7 @@
     function startEdit(mid) {
       const entry = sentMessages.get(mid);
       if (!entry || !entry.acknowledged || editingMid) return;
+      if (entry.element.classList.contains('archived')) return;
 
       editingMid = mid;
       const textSpan = entry.element.querySelector('.msg-text');
@@ -244,6 +257,7 @@
       const div = document.createElement('div');
       div.className = 'message received';
       div.dataset.externalId = event.external_message_id;
+      renderedIds.add(event.external_message_id);
       const senderName = event.sender && event.sender.name ? event.sender.name : 'Operator';
       div.innerHTML = `
         <div style="font-size:11px;font-weight:600;color:#6b7280;margin-bottom:2px">${escapeHtml(senderName)}</div>
@@ -255,6 +269,101 @@
       `;
       messagesEl.appendChild(div);
       messagesEl.scrollTop = messagesEl.scrollHeight;
+    }
+
+    async function loadHistory() {
+      if (!chatState) return;
+
+      let messages;
+      try {
+        const resp = await fetch(`${BASE_URL}/api/chats/${chatState.id}`);
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        messages = await resp.json();
+      } catch (e) {
+        console.error('Failed to load history:', e);
+        addSystemMessage('Failed to load history');
+        return;
+      }
+
+      const archived = chatState.status !== 'new';
+      const frag = document.createDocumentFragment();
+      let newestUnread = null;
+
+      for (const msg of messages) {
+        if (msg.sender_type !== 'client' && msg.status !== 'read') {
+          newestUnread = msg;
+        }
+        if (renderedIds.has(msg.external_message_id)) continue;
+        renderedIds.add(msg.external_message_id);
+        frag.appendChild(msg.sender_type === 'client'
+          ? buildHistorySent(msg, archived)
+          : buildHistoryReceived(msg, archived));
+      }
+
+      if (historyLoaded) {
+        // Reconnect: whatever arrived while we were offline belongs at the bottom.
+        messagesEl.appendChild(frag);
+      } else {
+        // First load: history belongs above the "Connected to server" line, or old
+        // messages read as if they had just arrived.
+        messagesEl.prepend(frag);
+        historyLoaded = true;
+      }
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+
+      // One read receipt clears the whole prefix — mark_messages_read_by_id marks
+      // every message in the chat with created_at <= the target. Archived chats get
+      // none: back-dating reads in a closed conversation is meaningless.
+      if (!archived && newestUnread && ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ action: 'read', mid: newestUnread.id }));
+      }
+    }
+
+    function buildHistorySent(msg, archived) {
+      const mid = msg.external_message_id.startsWith('widget:')
+        ? msg.external_message_id.slice('widget:'.length)
+        : msg.id;
+      const div = document.createElement('div');
+      div.className = 'message sent' + (archived ? ' archived' : '');
+      div.id = 'msg-' + mid;
+      div.dataset.externalId = msg.external_message_id;
+      const check = msg.status === 'read'
+        ? '<span class="checkmark" style="color:rgba(255,255,255,0.8)">✓✓</span>'
+        : '<span class="checkmark">✓</span>';
+      div.innerHTML = `
+        <span class="msg-text">${escapeHtml(msg.text || '')}</span>
+        <div class="msg-meta">
+          <span class="msg-edited"${msg.edited_at ? '' : ' style="display:none"'}>edited</span>
+          <span class="msg-time">${formatTime(new Date(msg.created_at))}</span>
+          <span class="msg-status">${check}</span>
+        </div>
+      `;
+      div.addEventListener('dblclick', () => startEdit(mid));
+      // Registering the entry is what makes double-click editing and incoming
+      // read/edit events work on a bubble that came from history.
+      sentMessages.set(mid, {
+        text: msg.text || '',
+        element: div,
+        acknowledged: true,
+        edited: !!msg.edited_at,
+      });
+      return div;
+    }
+
+    function buildHistoryReceived(msg, archived) {
+      const div = document.createElement('div');
+      div.className = 'message received' + (archived ? ' archived' : '');
+      div.dataset.externalId = msg.external_message_id;
+      const senderName = msg.sender_name || 'Operator';
+      div.innerHTML = `
+        <div style="font-size:11px;font-weight:600;color:#6b7280;margin-bottom:2px">${escapeHtml(senderName)}</div>
+        <span class="msg-text">${escapeHtml(msg.text || '')}</span>
+        <div class="msg-meta">
+          <span class="msg-edited"${msg.edited_at ? '' : ' style="display:none"'}>edited</span>
+          <span class="msg-time">${formatTime(new Date(msg.created_at))}</span>
+        </div>
+      `;
+      return div;
     }
 
     function updateInboundEdit(event) {
