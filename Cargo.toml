@@ -10,10 +10,10 @@ chrono = { version = "0.4", features = ["serde"] }
 futures-util = "0.3"
 hex = "0.4"
 jsonwebtoken = { version = "10.3", features = ["rust_crypto"] }
-hmac = "0.12"
+hmac = "0.13"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.10"
+sha2 = "0.11"
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chrono"] }
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }

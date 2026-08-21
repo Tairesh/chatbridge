@@ -20,8 +20,6 @@ Use the `justfile` — `just test` starts the Postgres and Redis containers and 
 
 ## Gotchas
 
-- reqwest 0.13+ TLS feature is `rustls` (not `rustls-tls`)
-- DB client functions (`upsert_client`, `find_client_by_external_id`) accept `ProviderKind` enum, not `&str`
 - `reqwest::Client` is a `LazyLock` static in `provider/instagram.rs` and `provider/telegram.rs` — don't create new clients per-request
 - Integration tests use RAII drop guards (`TestChannel`, `TestClient`, `TestChat`, `TestMessage`) in `tests/common/mod.rs` for DB cleanup — always use these instead of manual DELETE queries
 - Channel insert helpers in integration tests must INSERT into `channels` table first, then the provider-specific table (FK constraint)
