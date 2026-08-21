@@ -175,7 +175,7 @@ async fn build_state_with(db: PgPool, telegram_api_base: String) -> Arc<AppState
             instagram_verify_token: TEST_VERIFY_TOKEN.into(),
             instagram_app_secret: TEST_APP_SECRET.into(),
             redis_url: "redis://localhost:6379".into(),
-            widget_jwt_secret: TEST_JWT_SECRET.into(),
+            app_jwt_secret: TEST_JWT_SECRET.into(),
             public_base_url: TEST_PUBLIC_BASE_URL.into(),
             telegram_api_base,
         },

@@ -24,7 +24,7 @@ pub struct AppConfig {
     pub instagram_verify_token: String,
     pub instagram_app_secret: String,
     pub redis_url: String,
-    pub widget_jwt_secret: String,
+    pub app_jwt_secret: String,
     /// Public origin of this deployment, without a trailing slash. Used to build
     /// webhook URLs for `setWebhook` and the `endpoint` field of a channel.
     pub public_base_url: String,
@@ -42,8 +42,8 @@ impl AppConfig {
             instagram_app_secret: std::env::var("INSTAGRAM_APP_SECRET")
                 .expect("INSTAGRAM_APP_SECRET must be set"),
             redis_url: std::env::var("REDIS_URL").expect("REDIS_URL must be set"),
-            widget_jwt_secret: std::env::var("WIDGET_JWT_SECRET")
-                .expect("WIDGET_JWT_SECRET must be set"),
+            app_jwt_secret: std::env::var("APP_JWT_SECRET")
+                .expect("APP_JWT_SECRET must be set"),
             public_base_url: std::env::var("PUBLIC_BASE_URL")
                 .expect("PUBLIC_BASE_URL must be set")
                 .trim_end_matches('/')

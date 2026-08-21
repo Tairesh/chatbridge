@@ -25,7 +25,7 @@ pub async fn operator_ws(
 ) -> Result<impl IntoResponse, AppError> {
     let (operator_id, new_token) = resolve_operator(
         params.token.as_deref(),
-        &state.config.widget_jwt_secret,
+        &state.config.app_jwt_secret,
         &state,
     )
     .await

@@ -47,7 +47,7 @@ Required at runtime:
 - `INSTAGRAM_APP_SECRET` — HMAC-SHA256 secret for Instagram payload signature validation
 - `DATABASE_URL` — Postgres connection string (e.g. `postgres://chatbridge:chatbridge@localhost:5432/chatbridge`)
 - `REDIS_URL` — Redis connection string (e.g. `redis://localhost:6379`)
-- `WIDGET_JWT_SECRET` — HMAC-SHA256 secret for signing/verifying WebSocket JWTs (used for both widget clients and operators)
+- `APP_JWT_SECRET` — HMAC-SHA256 secret for signing/verifying WebSocket JWTs (used for both widget clients and operators)
 - `PUBLIC_BASE_URL` — public origin of this deployment, no trailing slash. Used to build Telegram
   webhook URLs for `setWebhook` and the `endpoint` field returned by `/api/channels`
 - `TELEGRAM_API_BASE` — optional, defaults to `https://api.telegram.org`. Set it to point a local

@@ -41,7 +41,7 @@ pub async fn widget_ws(
 
     let (client_id, new_token) = match resolve_client(
         params.token.as_deref(),
-        &state.config.widget_jwt_secret,
+        &state.config.app_jwt_secret,
         &state,
     )
     .await

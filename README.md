@@ -219,7 +219,7 @@ export INSTAGRAM_VERIFY_TOKEN=your_token
 export INSTAGRAM_APP_SECRET=your_secret
 export DATABASE_URL=postgres://chatbridge:chatbridge@localhost:5432/chatbridge
 export REDIS_URL=redis://localhost:6379
-export WIDGET_JWT_SECRET=your-jwt-secret-here-at-least-32-bytes
+export APP_JWT_SECRET=your-jwt-secret-here-at-least-32-bytes
 export PUBLIC_BASE_URL=https://your-public-host
 
 # Build and run
@@ -237,7 +237,7 @@ Migrations run automatically on startup.
 | `INSTAGRAM_APP_SECRET` | yes | — | HMAC-SHA256 secret for Instagram signature validation |
 | `DATABASE_URL` | yes | — | Postgres connection string |
 | `REDIS_URL` | yes | — | Redis connection string |
-| `WIDGET_JWT_SECRET` | yes | — | HMAC-SHA256 secret for WebSocket JWTs (widget clients + operators) |
+| `APP_JWT_SECRET` | yes | — | HMAC-SHA256 secret for WebSocket JWTs (widget clients + operators) |
 | `PUBLIC_BASE_URL` | yes | — | Public origin of this deployment, no trailing slash. Builds Telegram webhook URLs and the `endpoint` field of a channel |
 | `TELEGRAM_API_BASE` | no | `https://api.telegram.org` | Telegram Bot API origin. Point it at a fake Bot API for local work |
 

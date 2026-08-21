@@ -13,7 +13,7 @@ so anyone who knows a chat UUID can read the whole conversation, and anyone at a
 list every active chat together with client names and last-message text.
 
 Both sides of the app already have a JWT: `resolve_client` and `resolve_operator`
-(`src/handler/mod.rs`) sign one with `WIDGET_JWT_SECRET`, and the frontends keep it in
+(`src/handler/mod.rs`) sign one with `APP_JWT_SECRET`, and the frontends keep it in
 localStorage (`chatbridge_token` / `operator_token`). Today it is used only for the
 WebSocket handshake — the REST calls in `frontend/operator.html` send nothing.
 
