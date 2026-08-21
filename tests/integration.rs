@@ -170,7 +170,7 @@ async fn build_state(db: PgPool) -> Arc<AppState> {
     let redis = setup_redis().await;
     Arc::new(AppState {
         config: AppConfig {
-            meta_verify_token: TEST_VERIFY_TOKEN.into(),
+            instagram_verify_token: TEST_VERIFY_TOKEN.into(),
             instagram_app_secret: TEST_APP_SECRET.into(),
             redis_url: "redis://localhost:6379".into(),
             widget_jwt_secret: TEST_JWT_SECRET.into(),

@@ -28,7 +28,9 @@ pub async fn meta_verify(
     State(state): State<Arc<AppState>>,
     Query(params): Query<VerifyParams>,
 ) -> Result<String, WebhookError> {
-    if params.hub_mode == "subscribe" && params.hub_verify_token == state.config.meta_verify_token {
+    if params.hub_mode == "subscribe"
+        && params.hub_verify_token == state.config.instagram_verify_token
+    {
         tracing::info!("webhook verified, returning challenge");
         Ok(params.hub_challenge)
     } else {

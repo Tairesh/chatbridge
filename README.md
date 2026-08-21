@@ -214,7 +214,7 @@ Requires Rust 1.88+, a running PostgreSQL instance, and Redis.
 
 ```bash
 # Set environment variables
-export META_VERIFY_TOKEN=your_token
+export INSTAGRAM_VERIFY_TOKEN=your_token
 export INSTAGRAM_APP_SECRET=your_secret
 export DATABASE_URL=postgres://chatbridge:chatbridge@localhost:5432/chatbridge
 export REDIS_URL=redis://localhost:6379
@@ -230,7 +230,7 @@ Migrations run automatically on startup.
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `META_VERIFY_TOKEN` | yes | — | Token for Instagram webhook subscription handshake |
+| `INSTAGRAM_VERIFY_TOKEN` | yes | — | Token for Instagram webhook subscription handshake |
 | `INSTAGRAM_APP_SECRET` | yes | — | HMAC-SHA256 secret for Instagram signature validation |
 | `DATABASE_URL` | yes | — | Postgres connection string |
 | `REDIS_URL` | yes | — | Redis connection string |

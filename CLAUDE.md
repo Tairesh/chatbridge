@@ -28,7 +28,7 @@ Use the `justfile` — `just test` starts the Postgres and Redis containers and 
 ## Environment Variables
 
 Required at runtime:
-- `META_VERIFY_TOKEN` — token for Meta/Instagram webhook subscription handshake
+- `INSTAGRAM_VERIFY_TOKEN` — token for Meta/Instagram webhook subscription handshake
 - `INSTAGRAM_APP_SECRET` — HMAC-SHA256 secret for Instagram payload signature validation
 - `DATABASE_URL` — Postgres connection string (e.g. `postgres://chatbridge:chatbridge@localhost:5432/chatbridge`)
 - `REDIS_URL` — Redis connection string (e.g. `redis://localhost:6379`)
