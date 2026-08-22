@@ -72,6 +72,11 @@ Use the `justfile` — `just test` starts the Postgres and Redis containers and 
   needs runtime shape; `AssertSqlSafe` is the escape hatch and nothing in this repo uses it
 - `reqwest::Client` is a `LazyLock` static in `provider/instagram.rs` and `provider/telegram.rs` — don't create new clients per-request
 - Integration tests use RAII drop guards (`TestChannel`, `TestClient`, `TestChat`, `TestMessage`) in `tests/common/mod.rs` for DB cleanup — always use these instead of manual DELETE queries
+- A test that polls the DB for the result of a spawned task must use `fetch_optional`, not
+  `fetch_one`: nothing in the operator WS flow lets the test wait for the INSERT, so "no row
+  yet" is an expected pass of the loop and `RowNotFound` from `fetch_one` turns it into a
+  CI-only flake. Query *before* the first sleep so that branch is exercised on every local
+  run. A `count(*)` poll is immune — an aggregate always returns a row
 - Channels live in ONE table. `channels.external_key` is the provider's non-secret identity
   (widget → `widget_id`, telegram → numeric bot id, instagram → `user_id`) and `channels.config`
   is a JSONB blob of provider settings including secrets. The blob has no provider tag — read it

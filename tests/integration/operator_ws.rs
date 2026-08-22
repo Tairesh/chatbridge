@@ -546,23 +546,28 @@ async fn a_telegram_reply_adopts_the_id_the_bot_api_returned() {
         .await
         .unwrap();
 
-    // Delivery is spawned after the ack, so poll for the adoption.
-    let mut external_id = String::new();
+    // Delivery is spawned after the ack, so poll for the adoption. The row itself may
+    // also be missing on the first pass: nothing here waits for the ack, so `None` is
+    // "not stored yet" and has to keep the loop going rather than fail it.
+    let mut external_id: Option<String> = None;
     for _ in 0..40 {
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         external_id = sqlx::query_scalar(
             "SELECT external_message_id FROM messages
              WHERE channel_id = $1 AND sender_type = 'operator'",
         )
         .bind(channel.id)
-        .fetch_one(&pool)
+        .fetch_optional(&pool)
         .await
         .unwrap();
-        if external_id.starts_with("telegram:") {
+        if external_id
+            .as_deref()
+            .is_some_and(|id| id.starts_with("telegram:"))
+        {
             break;
         }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    assert_eq!(external_id, "telegram:4242:77");
+    assert_eq!(external_id.as_deref(), Some("telegram:4242:77"));
 }
 
 #[tokio::test]
