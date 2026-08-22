@@ -275,6 +275,29 @@ pub async fn send_message(
     serde_json::from_value(json).map_err(|e| format!("unexpected send response: {e}"))
 }
 
+/// Tell Instagram the customer's messages have been seen.
+///
+/// Same endpoint as a send, so no extra permission is involved. It marks the whole
+/// thread — Instagram has no per-message granularity here, which is why nothing about
+/// our own watermark is sent along.
+pub async fn mark_seen(
+    ep: &InstagramEndpoints,
+    token: &str,
+    recipient: &str,
+) -> Result<(), String> {
+    call(
+        HTTP_CLIENT
+            .post(format!("{}/me/messages", ep.graph))
+            .query(&[("access_token", token)])
+            .json(&serde_json::json!({
+                "recipient": {"id": recipient},
+                "sender_action": "mark_seen",
+            })),
+    )
+    .await?;
+    Ok(())
+}
+
 /// A refresh needs the *current* token to still be valid, and Meta refuses a token
 /// less than 24 hours old. Once it has expired there is no automatic recovery —
 /// the account must be connected again.

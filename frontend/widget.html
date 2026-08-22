@@ -59,7 +59,7 @@
 
     // Track sent messages: mid -> { text, element, acknowledged }
     const sentMessages = new Map();
-    // external_message_id of every bubble in the DOM — history dedup key.
+    // Row id of every bubble in the DOM — history dedup key.
     const renderedIds = new Set();
     let ws;
     let editingMid = null;
@@ -90,7 +90,7 @@
               if (msg.token) localStorage.setItem(TOKEN_KEY, msg.token);
               break;
             case 'ack':
-              handleAck(msg.message_id);
+              handleAck(msg.message_id, msg.id);
               break;
             case 'chat':
               chatState = { id: msg.chat_id, status: msg.status };
@@ -150,8 +150,10 @@
       const div = document.createElement('div');
       div.className = 'message sent';
       div.id = 'msg-' + mid;
-      div.dataset.externalId = 'widget:' + mid;
-      renderedIds.add('widget:' + mid);
+      // No id from the server yet — the ack brings the row id, and that is what every
+      // later event names. The external id is never reconstructed here: it contains
+      // the client id, which the browser does not know.
+      div.dataset.messageId = '';
       div.innerHTML = `
         <span class="msg-text">${escapeHtml(text)}</span>
         <div class="msg-meta">
@@ -167,10 +169,14 @@
       sentMessages.set(mid, { text, element: div, acknowledged: false });
     }
 
-    function handleAck(messageId) {
+    function handleAck(messageId, id) {
       const entry = sentMessages.get(messageId);
       if (!entry) return;
 
+      if (id) {
+        entry.element.dataset.messageId = id;
+        renderedIds.add(id);
+      }
       entry.acknowledged = true;
       const statusSpan = entry.element.querySelector('.msg-status');
       if (statusSpan) {
@@ -256,8 +262,8 @@
     function appendInboundMessage(event) {
       const div = document.createElement('div');
       div.className = 'message received';
-      div.dataset.externalId = event.external_message_id;
-      renderedIds.add(event.external_message_id);
+      div.dataset.messageId = event.id;
+      renderedIds.add(event.id);
       const senderName = event.sender && event.sender.name ? event.sender.name : 'Operator';
       div.innerHTML = `
         <div style="font-size:11px;font-weight:600;color:#6b7280;margin-bottom:2px">${escapeHtml(senderName)}</div>
@@ -293,8 +299,8 @@
         if (msg.sender_type !== 'client' && msg.status !== 'read') {
           newestUnread = msg;
         }
-        if (renderedIds.has(msg.external_message_id)) continue;
-        renderedIds.add(msg.external_message_id);
+        if (renderedIds.has(msg.id)) continue;
+        renderedIds.add(msg.id);
         frag.appendChild(msg.sender_type === 'client'
           ? buildHistorySent(msg, archived)
           : buildHistoryReceived(msg, archived));
@@ -320,13 +326,15 @@
     }
 
     function buildHistorySent(msg, archived) {
+      // `widget:<client_id>:<mid>` — `startEdit` needs the trailing mid, because the
+      // edit goes back out under it and the server rebuilds the same external id.
       const mid = msg.external_message_id.startsWith('widget:')
-        ? msg.external_message_id.slice('widget:'.length)
+        ? msg.external_message_id.split(':').pop()
         : msg.id;
       const div = document.createElement('div');
       div.className = 'message sent' + (archived ? ' archived' : '');
       div.id = 'msg-' + mid;
-      div.dataset.externalId = msg.external_message_id;
+      div.dataset.messageId = msg.id;
       const check = msg.status === 'read'
         ? '<span class="checkmark" style="color:rgba(255,255,255,0.8)">✓✓</span>'
         : '<span class="checkmark">✓</span>';
@@ -353,7 +361,7 @@
     function buildHistoryReceived(msg, archived) {
       const div = document.createElement('div');
       div.className = 'message received' + (archived ? ' archived' : '');
-      div.dataset.externalId = msg.external_message_id;
+      div.dataset.messageId = msg.id;
       const senderName = msg.sender_name || 'Operator';
       div.innerHTML = `
         <div style="font-size:11px;font-weight:600;color:#6b7280;margin-bottom:2px">${escapeHtml(senderName)}</div>
@@ -367,7 +375,9 @@
     }
 
     function updateInboundEdit(event) {
-      const el = messagesEl.querySelector(`[data-external-id="${event.external_message_id}"]`);
+      // The row id, not the external one: the external id belongs to the server, and
+      // a provider replaces it the moment it accepts the message.
+      const el = messagesEl.querySelector(`[data-message-id="${event.id}"]`);
       if (!el) return;
       const textEl = el.querySelector('.msg-text');
       if (textEl) textEl.textContent = event.text || '';
@@ -376,8 +386,7 @@
     }
 
     function updateReadStatus(event) {
-      // Find the message by external_message_id and show read badge
-      const el = document.getElementById('msg-' + event.external_message_id?.replace('widget:', ''));
+      const el = messagesEl.querySelector(`[data-message-id="${event.id}"]`);
       if (!el) return;
       const statusSpan = el.querySelector('.msg-status');
       if (statusSpan) statusSpan.innerHTML = '<span class="checkmark" style="color:rgba(255,255,255,0.8)">✓✓</span>';

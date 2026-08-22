@@ -13,7 +13,8 @@ use super::{
 };
 use crate::config::AppState;
 use crate::model::{
-    EventKind, IncomingEvent, IncomingRead, NewMessage, ProviderKind, WsInbound, WsOutbound,
+    Conversation, EventKind, IncomingEvent, IncomingRead, NewMessage, ProviderKind, WsInbound,
+    WsOutbound,
 };
 use crate::pipeline::{persist_and_publish, publish_event, resolve_sender};
 
@@ -237,8 +238,9 @@ async fn process_text_message(
     }
 
     let msg = NewMessage {
-        external_message_id: format!("widget:{}", inbound.mid),
+        external_message_id: crate::external_id::widget(client_id, inbound.mid),
         channel_id,
+        conversation: Some(Conversation::Customer(client_id)),
         sender_id: Some(client_id),
         sender_type: "client".into(),
         provider: ProviderKind::Widget,
@@ -248,10 +250,11 @@ async fn process_text_message(
     };
 
     let mut redis = state.redis.clone();
-    persist_and_publish(&state.db, &mut redis, &msg, None, state).await;
+    let persisted = persist_and_publish(&state.db, &mut redis, &msg, state).await;
 
     let ack = WsOutbound::Ack {
         message_id: inbound.mid,
+        id: persisted,
     };
     if !send_outbound(socket, &ack).await {
         tracing::warn!(channel_id = %channel_id, "ack send failed, disconnecting");

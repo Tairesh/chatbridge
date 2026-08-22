@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::cache::{ChannelCache, ClientCache};
 use crate::error::AppError;
-use crate::model::{EventKind, NewMessage, ProviderKind};
+use crate::model::{Conversation, EventKind, NewMessage, ProviderKind};
 use crate::provider::WebhookProvider;
 
 static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
@@ -88,9 +88,6 @@ impl WebhookProvider for InstagramProvider {
         }
 
         let mut messages = Vec::new();
-        // Echoes are skipped on purpose, so a payload that contained nothing but
-        // echoes is not a payload that lost anything.
-        let mut echoes_skipped = 0usize;
 
         for entry in &payload.entry {
             // Both delivery shapes, in one list. Which one Meta uses depends on the
@@ -131,27 +128,31 @@ impl WebhookProvider for InstagramProvider {
             }
 
             for event in events {
-                // Silently, not via the no-channel path: an echo is expected and
-                // uninteresting, and letting it reach the warning would bury genuine
-                // misroutes under the operator's own replies.
-                if event.message.as_ref().is_some_and(|m| m.is_echo) {
-                    echoes_skipped += 1;
-                    continue;
-                }
-
                 let (event_kind, mid) = classify_event(event);
 
-                let Some(recipient_id) = event.recipient.as_ref().map(|r| r.id.as_str()) else {
-                    tracing::warn!("no recipient in instagram event");
+                // An echo is the mirror of an inbound event: the account is the
+                // sender and the customer is the recipient. Routed the normal way it
+                // matches no channel, which is why it used to be dropped — and with
+                // it, every message the owner sent from the Instagram app, which is
+                // the only record of those we will ever have.
+                let is_echo = event.message.as_ref().is_some_and(|m| m.is_echo);
+                let (account, customer) = if is_echo {
+                    (event.sender.as_ref(), event.recipient.as_ref())
+                } else {
+                    (event.recipient.as_ref(), event.sender.as_ref())
+                };
+
+                let Some(account_id) = account.map(|p| p.id.as_str()) else {
+                    tracing::warn!(is_echo, "instagram event names no account");
                     continue;
                 };
 
                 let Some(channel) = self
                     .cache
-                    .get_channel_by_external_key(db, ProviderKind::Instagram, recipient_id)
+                    .get_channel_by_external_key(db, ProviderKind::Instagram, account_id)
                     .await?
                 else {
-                    tracing::warn!(?recipient_id, "no channel found for instagram event");
+                    tracing::warn!(?account_id, "no channel found for instagram event");
                     continue;
                 };
 
@@ -167,7 +168,7 @@ impl WebhookProvider for InstagramProvider {
                 let client_id = resolve_instagram_client(
                     db,
                     &self.client_cache,
-                    event.sender.as_ref(),
+                    customer,
                     &config.access_token,
                     &self.graph_base,
                     redis.clone(),
@@ -175,17 +176,26 @@ impl WebhookProvider for InstagramProvider {
                 .await;
 
                 let raw = serde_json::to_value(event).unwrap_or(serde_json::Value::Null);
-                let external_message_id = format!("instagram:{}", mid.unwrap_or(&entry.id));
+                let external_message_id = crate::external_id::instagram(mid.unwrap_or(&entry.id));
                 let text = match event_kind {
                     EventKind::Message => event.message.as_ref().and_then(|m| m.text.clone()),
                     EventKind::Edit => event.message_edit.as_ref().and_then(|e| e.text.clone()),
                     _ => None,
                 };
+                // Nobody in `operators` typed an echo, so it has no author — only a
+                // side.
+                let (sender_id, sender_type) = if is_echo {
+                    (None, "operator")
+                } else {
+                    (client_id, "client")
+                };
+
                 messages.push(NewMessage {
                     external_message_id,
                     channel_id: channel.id,
-                    sender_id: client_id,
-                    sender_type: "client".into(),
+                    conversation: client_id.map(Conversation::Customer),
+                    sender_id,
+                    sender_type: sender_type.into(),
                     provider: ProviderKind::Instagram,
                     event: event_kind,
                     text,
@@ -194,7 +204,7 @@ impl WebhookProvider for InstagramProvider {
             }
         }
 
-        if messages.is_empty() && echoes_skipped == 0 {
+        if messages.is_empty() {
             tracing::warn!(
                 entries = payload.entry.len(),
                 "instagram webhook produced no messages — nothing will reach the inbox"
@@ -235,7 +245,7 @@ fn classify_event(event: &MessagingEvent) -> (EventKind, Option<&String>) {
         return (EventKind::Edit, Some(&edit.mid));
     }
     if let Some(ref read) = event.read {
-        return (EventKind::Read, Some(&read.mid));
+        return (EventKind::Read, read.mid.as_ref());
     }
     if let Some(ref reaction) = event.reaction {
         return (EventKind::Reaction, Some(&reaction.mid));
@@ -438,9 +448,11 @@ pub struct MessageEdit {
     pub num_edit: Option<i32>,
 }
 
+/// Instagram sends `mid`; a receipt without one is not worth failing the whole
+/// payload for — the pipeline falls back to the chat.
 #[derive(Debug, Deserialize, serde::Serialize)]
 pub struct ReadReceipt {
-    pub mid: String,
+    pub mid: Option<String>,
 }
 
 #[derive(Debug, Deserialize, serde::Serialize)]
@@ -454,6 +466,24 @@ pub struct Reaction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_read_receipt_without_a_mid_is_still_a_read() {
+        // A required `mid` would fail `from_slice` for the *whole* payload, taking
+        // every event batched alongside it down with it.
+        let event: MessagingEvent = serde_json::from_value(serde_json::json!({
+            "sender": {"id": "customer"},
+            "recipient": {"id": "account"},
+            "read": {}
+        }))
+        .unwrap();
+        let (kind, mid) = classify_event(&event);
+        assert!(matches!(kind, EventKind::Read));
+        assert!(
+            mid.is_none(),
+            "no anchor — the pipeline falls back to the chat"
+        );
+    }
     use crate::cache::{ChannelCache, ClientCache};
     use crate::provider::WebhookProvider;
     use hmac::{Hmac, Mac};
@@ -607,7 +637,7 @@ mod tests {
             message: None,
             message_edit: None,
             read: Some(ReadReceipt {
-                mid: "mid_005".into(),
+                mid: Some("mid_005".into()),
             }),
             reaction: None,
         };

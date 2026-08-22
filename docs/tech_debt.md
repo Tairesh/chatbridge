@@ -17,8 +17,9 @@ Both sides of the app already have a JWT: `resolve_client` and `resolve_operator
 localStorage (`chatbridge_token` / `operator_token`). Today it is used only for the
 WebSocket handshake — the REST calls in `frontend/operator.html` send nothing.
 
-This gets worse once the widget loads chat history over REST: the chat UUID starts
-living in public client-side JS, so it stops being even an accidental secret.
+This is no longer hypothetical: `frontend/widget.html` loads its history from
+`GET /api/chats/{chat_id}`, so the chat UUID now lives in public client-side JS on every
+site that embeds the widget. It stopped being even an accidental secret.
 
 **Fix:** require the JWT on the chat REST endpoints.
 - Operator token → may list chats and read any chat.
@@ -48,16 +49,15 @@ mirroring `ProviderKind`.
 
 **Status:** open (found 2026-08-21)
 
-`get_chat_messages` (`src/db.rs:337`) is `ORDER BY created_at ASC LIMIT 100` with no offset,
+`get_chat_messages` (`src/db.rs:528`) is `ORDER BY created_at ASC LIMIT 100` with no offset,
 no cursor, and no total count. Past 100 messages in a chat, the query keeps returning the
 same oldest 100 and silently drops everything newer — the exact opposite of what a chat UI
 needs. There is no way to ask for the rest.
 
-`frontend/operator.html` already hits this: open a long-running chat and the operator sees
-the start of the conversation with no indication that recent messages exist. Widget history
-loading (`docs/superpowers/specs/2026-08-21-widget-chat-history-design.md`) inherits the
-same behaviour, and there it is worse — the client's own recent messages would be missing
-from their own transcript.
+Both frontends hit this: open a long-running chat and the operator sees the start of the
+conversation with no indication that recent messages exist. The widget now loads history
+through the same query, and there it is worse — the customer's own recent messages are
+missing from their own transcript.
 
 **Fix:** invert the query and paginate.
 - Fetch the *newest* N (`ORDER BY created_at DESC LIMIT n`), reverse for display.
@@ -136,6 +136,38 @@ account's identity occupied by a channel that never worked. The same fix covers 
 with the panel offering to finish or discard provisional channels; or a reconciliation pass on
 startup.
 
+## Nothing outbound is ever retried
+
+**Status:** open (found 2026-08-23)
+
+Every call this app makes to somebody else's API is attempted exactly once, and a failure
+is reported rather than repeated. There is no queue, no backoff and no dead-letter
+anywhere:
+
+- **Operator → provider delivery** (`spawn_instagram_delivery`, `spawn_telegram_delivery`)
+  — one attempt, then `status = 'failed'` and `WsOutbound::DeliveryFailed`. The operator
+  decides whether to type it again.
+- **`mark_seen`** — one attempt, logged and shown to the operator. The local read stands.
+- **Instagram profile lookup** (`resolve_instagram_client`) — one attempt; on failure the
+  client row keeps a NULL name until the 24-hour staleness check comes round again.
+- **`setWebhook` / `subscribed_apps` on channel create** — one attempt, and the row is
+  rolled back rather than retried.
+- **Redis publish** (`pipeline::publish_event`) — a failure is logged and the event is
+  gone; no replica ever sees it, and no socket ever hears about the message.
+
+Only the token refresher is different, and only by accident: it runs hourly, so a failed
+refresh is retried an hour later until the token expires.
+
+A transient 500 or a dropped connection therefore loses whatever it touched. Rate limiting
+is the concrete case that will hit first: Meta returns `X-Business-Use-Case-Usage` with
+`estimated_time_to_regain_access`, which nothing reads.
+
+**Fix:** one retry policy, not five — a small helper with bounded exponential backoff for
+the calls that are safe to repeat, plus an outbox for the ones that are not (a delivery
+must not be retried without an idempotency key, or the customer gets the message twice).
+The Redis publish is the odd one out: it is not a provider call, and losing it silently is
+arguably worse than any of the above.
+
 ## Instagram outbound is text-only
 
 **Status:** open (found 2026-08-22)
@@ -151,9 +183,8 @@ Three things are deliberately missing:
   operator-readable message. Nothing tracks `last_inbound_at` or refuses the send up front,
   and message tags (`HUMAN_AGENT`) are not implemented. The sibling PHP integration has the
   tag coded but commented out pending App Review, so that half is unsolved there too.
-- **Rate-limit backoff.** A `4`/`17`/`32` is surfaced to the operator verbatim rather than
-  retried. Meta returns `X-Business-Use-Case-Usage` with
-  `estimated_time_to_regain_access`, which nothing reads.
+- **Rate-limit backoff.** A `4`/`17`/`32` is surfaced to the operator verbatim — see
+  "Nothing outbound is ever retried" above, which covers this and the rest of them.
 
 **Fix:** attachments first — they are the common case and need only the array shape plus a
 publicly reachable URL. The window needs `last_inbound_at` per chat before it can be
@@ -172,22 +203,30 @@ the bytes promptly, store them in object storage, and persist a local reference 
 instead of Meta's URL. The PHP integration does exactly this and its type mapping is the observed
 set: `image`, `video`, `audio` (→ voice), `file` (→ document); anything else is dropped.
 
-## `messaging_seen` and `message_reactions` have never delivered a real event
+## Reactions arrive from live accounts and are dropped
 
-**Status:** open (found 2026-08-22)
+**Status:** open (found 2026-08-23)
 
-`oauth::INSTAGRAM_FIELDS` subscribes to `messages`, `message_edit`, `message_reactions` and
-`messaging_seen` — exactly what `classify_event` handles. All four are accepted by
-`POST /me/subscribed_apps`, echoed back by the GET, and observed firing App Dashboard test
-sends, so all four exist and are subscribed. What has never been observed is a *real* read
-receipt or reaction arriving — because no real event of any kind has been observed yet.
+Confirmed on the wire, not inferred. Two reactions from a live account on 2026-08-23:
 
-`oauth::subscribe` degrades instead of failing when a name is rejected, so a name that stops
-being valid later costs a warning in the log and a missing field rather than a broken create.
-That makes it easy to never notice.
+```
+18:42:34  reaction  action=react  reaction=other  emoji=❤   -> event logged (not persisted)
+18:48:42  reaction  action=react  reaction=sad    emoji=😢  -> event logged (not persisted)
+```
 
-**Fix:** once real delivery works, confirm that a reaction and a read receipt arrive and are
-classified, or drop the two fields.
+`classify_event` recognises them and `persist_and_publish` sends `EventKind::Reaction` down
+the "log it and move on" branch, so nothing is stored, nothing is published, and no operator
+ever learns that a customer reacted. `messaging_seen` and `messages` are confirmed live in the
+same session; `message_edit` has still only been seen as an App Dashboard test send.
+
+The payload carries everything needed: the `mid` of the message reacted to, `action`
+(`react` / `unreact`), a `reaction` name and the `emoji`.
+
+**Fix:** a `reactions` table keyed `(message_id, client_id)` — `unreact` deletes, `react`
+upserts, so the same person switching hearts to tears replaces their row rather than adding
+one. Then an `IncomingEvent::Reaction` for the live path and a badge on the bubble. Outbound
+reactions (an operator reacting) are a separate question: Instagram accepts them on the same
+`/me/messages` endpoint.
 
 ## Meta's deauthorize and data-deletion callbacks are missing
 

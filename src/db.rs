@@ -389,7 +389,7 @@ pub struct DbMessage {
     pub sender_id: Option<Uuid>,
     pub sender_type: String,
     pub text: Option<String>,
-    pub status: String,
+    pub status: crate::model::MessageStatus,
     pub created_at: DateTime<Utc>,
 }
 
@@ -512,7 +512,7 @@ pub struct ChatMessage {
     pub sender_type: String,
     pub sender_name: Option<String>,
     pub text: Option<String>,
-    pub status: String,
+    pub status: crate::model::MessageStatus,
     pub edited_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
 }
@@ -555,45 +555,137 @@ pub async fn mark_messages_read(
     reader_type: &str,
 ) -> Result<Vec<DbRead>, sqlx::Error> {
     sqlx::query_as::<_, DbRead>(
-        "UPDATE messages SET status = 'read'
+        "UPDATE messages SET status = $4
          WHERE chat_id = (
              SELECT chat_id FROM messages WHERE channel_id = $1 AND external_message_id = $2
          )
          AND created_at <= (
              SELECT created_at FROM messages WHERE channel_id = $1 AND external_message_id = $2
          )
-         AND status = 'new'
+         AND status IN ('new', 'delivered')
          AND sender_type != $3
          RETURNING id, external_message_id, channel_id, chat_id, sender_id, sender_type",
     )
     .bind(channel_id)
     .bind(external_message_id)
     .bind(reader_type)
+    .bind(crate::model::MessageStatus::Read)
     .fetch_all(pool)
     .await
 }
 
-/// Replace an outbound message's external id with the one the provider assigned.
+/// Mark everything the other side has unread in this customer's active chat.
 ///
-/// Read receipts and edits arrive keyed by the *provider's* id, and
-/// `mark_messages_read` looks the anchor message up by `(channel_id,
-/// external_message_id)`. Until the provider's id is stored, every read receipt for
-/// an operator's reply finds nothing. Returns whether a row was renamed.
-pub async fn rename_external_message_id(
+/// The fallback for a read receipt whose anchor we do not have: the receipt overtook
+/// the id adoption, or the message was sent from the provider's own app before we
+/// stored it. There is deliberately no upper time bound — comparing our `created_at`
+/// with the provider's clock is comparing two clocks, and a read means "everything up
+/// to here", so with no "here" the honest reading is "everything so far".
+pub async fn mark_chat_read(
     pool: &PgPool,
     channel_id: Uuid,
-    old: &str,
-    new: &str,
-) -> Result<bool, sqlx::Error> {
-    let result = sqlx::query(
-        "UPDATE messages SET external_message_id = $3
-         WHERE channel_id = $1 AND external_message_id = $2",
+    client_id: Uuid,
+    reader_type: &str,
+) -> Result<Vec<DbRead>, sqlx::Error> {
+    sqlx::query_as::<_, DbRead>(
+        // The subquery returns at most one row: idx_chats_active is unique on
+        // (client_id, channel_id) where status = 'new'.
+        "UPDATE messages SET status = $4
+         WHERE chat_id = (
+             SELECT id FROM chats
+             WHERE client_id = $2 AND channel_id = $1 AND status = 'new'
+         )
+         AND channel_id = $1
+         AND status IN ('new', 'delivered')
+         AND sender_type != $3
+         RETURNING id, external_message_id, channel_id, chat_id, sender_id, sender_type",
     )
     .bind(channel_id)
-    .bind(old)
+    .bind(client_id)
+    .bind(reader_type)
+    .bind(crate::model::MessageStatus::Read)
+    .fetch_all(pool)
+    .await
+}
+
+/// Attach the provider's id to a row stored under a local one.
+///
+/// Returns `false` when the row is gone. Read receipts and edits arrive keyed by the
+/// *provider's* id, so until this runs every receipt for an operator's reply resolves
+/// to nothing.
+pub async fn adopt_external_message_id(
+    pool: &PgPool,
+    message_id: Uuid,
+    new: &str,
+) -> Result<bool, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+
+    // Step one is not optional: without it, a delivery task whose row was deleted
+    // would go on to delete whatever else holds `new`.
+    let Some((channel_id,)): Option<(Uuid,)> =
+        sqlx::query_as("SELECT channel_id FROM messages WHERE id = $1 FOR UPDATE")
+            .bind(message_id)
+            .fetch_optional(&mut *tx)
+            .await?
+    else {
+        return Ok(false);
+    };
+
+    // An echo of this very message can arrive before we get here. Both rows then
+    // claim the provider's id and only one can keep it: ours, which carries the
+    // operator. `id <> $3` keeps a repeated adoption from deleting its own row.
+    let duplicate: Option<(Uuid,)> = sqlx::query_as(
+        "DELETE FROM messages
+         WHERE channel_id = $1 AND external_message_id = $2 AND id <> $3
+         RETURNING id",
+    )
+    .bind(channel_id)
     .bind(new)
-    .execute(pool)
+    .bind(message_id)
+    .fetch_optional(&mut *tx)
     .await?;
+    if let Some((dropped,)) = duplicate {
+        tracing::warn!(
+            %channel_id, %dropped, %new,
+            "an echo of this reply arrived before its provider id was stored; \
+             dropping the duplicate row"
+        );
+    }
+
+    sqlx::query("UPDATE messages SET external_message_id = $2 WHERE id = $1")
+        .bind(message_id)
+        .bind(new)
+        .execute(&mut *tx)
+        .await?;
+
+    tx.commit().await?;
+    Ok(true)
+}
+
+/// Mark a message the provider accepted.
+///
+/// `status = 'new'` guards it against the receipt that beat the adoption: a customer
+/// with the thread open can read a reply before its delivery task gets this far, and
+/// `read` must not fall back to `delivered`.
+pub async fn mark_message_delivered(pool: &PgPool, message_id: Uuid) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query("UPDATE messages SET status = $2 WHERE id = $1 AND status = 'new'")
+        .bind(message_id)
+        .bind(crate::model::MessageStatus::Delivered)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// Mark a message the provider refused to deliver.
+///
+/// `status = 'new'` guards it: a row somebody already read cannot then become
+/// undelivered. Returns whether anything changed.
+pub async fn mark_message_failed(pool: &PgPool, message_id: Uuid) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query("UPDATE messages SET status = $2 WHERE id = $1 AND status = 'new'")
+        .bind(message_id)
+        .bind(crate::model::MessageStatus::Failed)
+        .execute(pool)
+        .await?;
     Ok(result.rows_affected() > 0)
 }
 
@@ -604,15 +696,16 @@ pub async fn mark_messages_read_by_id(
     reader_type: &str,
 ) -> Result<Vec<DbRead>, sqlx::Error> {
     sqlx::query_as::<_, DbRead>(
-        "UPDATE messages SET status = 'read'
+        "UPDATE messages SET status = $3
          WHERE chat_id = (SELECT chat_id FROM messages WHERE id = $1)
          AND created_at <= (SELECT created_at FROM messages WHERE id = $1)
-         AND status = 'new'
+         AND status IN ('new', 'delivered')
          AND sender_type != $2
          RETURNING id, external_message_id, channel_id, chat_id, sender_id, sender_type",
     )
     .bind(message_id)
     .bind(reader_type)
+    .bind(crate::model::MessageStatus::Read)
     .fetch_all(pool)
     .await
 }
@@ -622,15 +715,25 @@ pub async fn mark_messages_read_by_id(
 #[derive(Debug, Clone, FromRow)]
 pub struct Operator {
     pub id: Uuid,
-    pub name: Option<String>,
+    pub name: String,
     pub created_at: DateTime<Utc>,
 }
 
+/// Create an operator with a name.
+///
+/// The id is generated here rather than by the database because the name is derived
+/// from it, and a column default cannot reference its own row. There is no login yet,
+/// so nobody gets to choose the name — but "Operator 3f2a" beats a blank, and it stays
+/// the same for as long as the row does.
 pub async fn create_operator(pool: &PgPool) -> Result<Uuid, sqlx::Error> {
-    let row: (Uuid,) = sqlx::query_as("INSERT INTO operators DEFAULT VALUES RETURNING id")
-        .fetch_one(pool)
+    let id = Uuid::new_v4();
+    let name = format!("Operator {}", &id.simple().to_string()[..4]);
+    sqlx::query("INSERT INTO operators (id, name) VALUES ($1, $2)")
+        .bind(id)
+        .bind(&name)
+        .execute(pool)
         .await?;
-    Ok(row.0)
+    Ok(id)
 }
 
 pub async fn find_operator_by_id(

@@ -3,7 +3,8 @@ use uuid::Uuid;
 
 use crate::config::AppState;
 use crate::model::{
-    EventKind, IncomingEdit, IncomingEvent, IncomingMessage, IncomingRead, NewMessage, Sender,
+    Conversation, EventKind, IncomingEdit, IncomingEvent, IncomingMessage, IncomingRead,
+    NewMessage, Sender,
 };
 
 pub(crate) const REDIS_CHANNEL: &str = "incoming_messages";
@@ -36,7 +37,7 @@ pub(crate) async fn resolve_sender(
             Sender {
                 id: sender_id,
                 sender_type: "operator".into(),
-                name: op.and_then(|o| o.name),
+                name: op.map(|o| o.name.clone()),
                 username: None,
             }
         }
@@ -57,21 +58,32 @@ pub(crate) async fn resolve_sender(
     }
 }
 
+/// Persist an event and publish it.
+///
+/// Returns the id of the row it inserted — `None` for every other outcome, including
+/// a duplicate. The delivery path uses it to name the row it just sent, and the ack
+/// uses it to give the panel an anchor that survives the provider renaming the
+/// message.
 pub(crate) async fn persist_and_publish(
     db: &sqlx::PgPool,
     redis: &mut redis::aio::ConnectionManager,
     msg: &NewMessage,
-    chat_id_override: Option<Uuid>,
     state: &AppState,
-) {
+) -> Option<Uuid> {
     match msg.event {
         EventKind::Message => {
-            let (chat_id, insert_msg) = if let Some(cid) = chat_id_override {
-                // Operator path: chat already exists
-                (Some(cid), msg.clone())
+            let (chat_id, insert_msg) = if let Some(Conversation::Chat(id)) = msg.conversation {
+                // The panel named the chat, so there is nothing to resolve.
+                (Some(id), msg.clone())
             } else {
-                // Client path: verify sender exists (FK safety), then find_or_create_chat
-                let verified_sender = match msg.sender_id {
+                // The chat belongs to the customer. The author may be somebody else
+                // entirely — or nobody, when the account owner wrote from the
+                // provider's own app.
+                let customer = match msg.conversation {
+                    Some(Conversation::Customer(id)) => Some(id),
+                    _ => None,
+                };
+                let verified_client = match customer {
                     Some(id)
                         if state
                             .client_cache
@@ -86,9 +98,9 @@ pub(crate) async fn persist_and_publish(
                     _ => None,
                 };
 
-                let chat_id = match verified_sender {
-                    Some(sender_id) => {
-                        match crate::db::find_or_create_chat(db, sender_id, msg.channel_id).await {
+                let chat_id = match verified_client {
+                    Some(client_id) => {
+                        match crate::db::find_or_create_chat(db, client_id, msg.channel_id).await {
                             Ok(id) => {
                                 crate::cache::publish_invalidation(&mut redis.clone(), "chat", id)
                                     .await;
@@ -103,9 +115,13 @@ pub(crate) async fn persist_and_publish(
                     None => None,
                 };
 
-                let insert_msg = if verified_sender != msg.sender_id {
+                // An author we cannot resolve is not an author: `resolve_sender` must
+                // never be handed an id with nothing behind it. An operator-side
+                // message legitimately has no author and passes through as NULL.
+                let insert_msg = if msg.sender_type == "client" && msg.sender_id != verified_client
+                {
                     NewMessage {
-                        sender_id: verified_sender,
+                        sender_id: verified_client,
                         ..msg.clone()
                     }
                 } else {
@@ -133,17 +149,21 @@ pub(crate) async fn persist_and_publish(
                         created_at: db_msg.created_at,
                         sender,
                     };
+                    let id = incoming.id;
                     tracing::info!(message = ?incoming, "processed incoming message");
                     publish_event(redis, &IncomingEvent::Message(incoming)).await;
+                    Some(id)
                 }
                 Ok(None) => {
                     tracing::debug!(
                         external_message_id = %msg.external_message_id,
                         "duplicate message, skipping"
                     );
+                    None
                 }
                 Err(e) => {
                     tracing::error!("insert_message failed: {e}");
+                    None
                 }
             }
         }
@@ -186,9 +206,10 @@ pub(crate) async fn persist_and_publish(
                     tracing::error!("edit_message failed: {e}");
                 }
             }
+            None
         }
         EventKind::Read => {
-            match crate::db::mark_messages_read(
+            let mut reads = match crate::db::mark_messages_read(
                 db,
                 msg.channel_id,
                 &msg.external_message_id,
@@ -196,37 +217,59 @@ pub(crate) async fn persist_and_publish(
             )
             .await
             {
-                Ok(reads) if reads.is_empty() => {
-                    tracing::warn!(
-                        external_message_id = %msg.external_message_id,
-                        "read receipt for unknown or already-read message"
-                    );
-                }
-                Ok(reads) => {
-                    tracing::info!(count = reads.len(), "processed read receipt");
-                    for db_read in &reads {
-                        // Resolve sender of Read event, not sender of messages readed
-                        // HACK: just switch operator and client
-                        let sender_type = if msg.sender_type == "client" {
-                            "operator"
-                        } else {
-                            "client"
-                        };
-                        let sender = resolve_sender(Uuid::nil(), sender_type, db, state).await;
-                        let read = IncomingRead {
-                            id: db_read.id,
-                            external_message_id: db_read.external_message_id.clone(),
-                            channel_id: db_read.channel_id,
-                            chat_id: db_read.chat_id,
-                            sender,
-                        };
-                        publish_event(redis, &IncomingEvent::Read(read)).await;
-                    }
-                }
+                Ok(rows) => rows,
                 Err(e) => {
                     tracing::error!("mark_messages_read failed: {e}");
+                    return None;
+                }
+            };
+
+            if reads.is_empty() {
+                // The anchor is unknown: the receipt overtook the id adoption, or the
+                // message was sent from the provider's own app before we stored it.
+                // Only a customer's chat can be swept this way; a read on a chat the
+                // panel named is already anchored by `mark_messages_read_by_id`.
+                if let Some(Conversation::Customer(client_id)) = msg.conversation {
+                    match crate::db::mark_chat_read(db, msg.channel_id, client_id, &msg.sender_type)
+                        .await
+                    {
+                        Ok(rows) => reads = rows,
+                        Err(e) => tracing::error!("mark_chat_read failed: {e}"),
+                    }
                 }
             }
+
+            if reads.is_empty() {
+                tracing::warn!(
+                    external_message_id = %msg.external_message_id,
+                    conversation = ?msg.conversation,
+                    "read receipt matched nothing — this reader had nothing unread"
+                );
+                return None;
+            }
+
+            tracing::info!(count = reads.len(), "processed read receipt");
+            for db_read in &reads {
+                // The sender of a read event is the *author* of the message that was
+                // read — what listener.rs routes on, and what the widget and operator
+                // paths already publish.
+                let sender = resolve_sender(
+                    db_read.sender_id.unwrap_or(Uuid::nil()),
+                    &db_read.sender_type,
+                    db,
+                    state,
+                )
+                .await;
+                let read = IncomingRead {
+                    id: db_read.id,
+                    external_message_id: db_read.external_message_id.clone(),
+                    channel_id: db_read.channel_id,
+                    chat_id: db_read.chat_id,
+                    sender,
+                };
+                publish_event(redis, &IncomingEvent::Read(read)).await;
+            }
+            None
         }
         EventKind::Reaction | EventKind::Unknown => {
             tracing::info!(
@@ -234,6 +277,7 @@ pub(crate) async fn persist_and_publish(
                 external_message_id = %msg.external_message_id,
                 "event logged (not persisted)"
             );
+            None
         }
     }
 }

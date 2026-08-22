@@ -20,6 +20,51 @@ Use the `justfile` — `just test` starts the Postgres and Redis containers and 
 
 ## Gotchas
 
+- **External message ids are built in `src/external_id.rs` and nowhere else.** The
+  invariant is that the id is unique *within its channel*, because
+  `UNIQUE (channel_id, external_message_id)` spans the channel and `insert_message`
+  ends in `ON CONFLICT DO NOTHING` — a colliding id silently drops a message instead
+  of raising. Telegram's `message_id` is per-chat, so its id carries the chat
+  (`telegram:<chat_id>:<message_id>`); the widget's `mid` comes from the browser, so
+  its id carries the client
+- **Instagram echoes are stored, not skipped.** `is_echo` marks a copy of a message the
+  *account* sent — including one the owner typed in the Instagram app, which is the only
+  record of it we will ever have. An echo is the mirror of an inbound event (`sender` is
+  the account, `recipient` is the customer), so it is routed by `sender.id` and its client
+  is resolved from `recipient.id`. It is stored with `sender_type = 'operator'` and
+  `sender_id = NULL` — nobody in `operators` typed it. An echo of a reply sent through the
+  panel carries the id already adopted for that row, so the unique index absorbs it and
+  nothing is published twice
+- `NewMessage.conversation` is *which thread this is*; `NewMessage.sender_id` is *who wrote
+  it*. `Conversation::Chat(id)` is the panel naming an existing chat,
+  `Conversation::Customer(id)` is a provider naming the customer whose chat it is — created
+  if this is their first message. The two coincide for an inbound client message and part
+  company for everything the account sends, which is why they are separate fields: deriving
+  the thread from the author is what used to lose the chat of a message with no author.
+  `None` means no customer could be resolved; the row is stored without a chat rather than
+  dropped. `persist_and_publish` takes no chat parameter — this field is the only way to
+  say which conversation a message belongs to
+- **A read receipt marks its anchor and everything older** (`created_at <=`), never just
+  what precedes it. When the anchor is unknown — the receipt overtook the id adoption, or
+  the message was sent from the Instagram app — `db::mark_chat_read` marks everything the
+  other side has unread in that customer's active chat. It has no upper time bound on
+  purpose: our `created_at` and Meta's `timestamp` are different clocks, and a read means
+  "everything up to here"
+- `mark_seen` goes out **only when a read actually marked something**. The panel sends
+  one read receipt per inbound message it renders, so an unconditional call would mean a
+  Graph API request for every message in the visible history. It marks the whole thread,
+  not a message — Instagram has no per-message granularity for it
+- `messages.status` is a `MessageStatus` enum constrained by `messages_status_check`:
+  `new` → `delivered` → `read`, plus the dead end `failed`. One tick
+  in the panel means the provider took the message (`delivered`), two mean the customer
+  read it. A widget message never passes a provider, so it goes straight from `new` to
+  `read`. Both transitions out of `new` are guarded on `status = 'new'`, because a
+  customer with the thread open can read a reply before its delivery task has written
+  anything — `read` must never fall back to `delivered`. The read queries therefore match
+  `status IN ('new', 'delivered')`, never `= 'new'`
+- A reply the provider refuses is marked `status = 'failed'` and keeps its local
+  `operator:<mid>` — there is no provider id to adopt. `messages.status` has no CHECK
+  constraint, so neither value needed a migration
 - `reqwest::Client` is a `LazyLock` static in `provider/instagram.rs` and `provider/telegram.rs` — don't create new clients per-request
 - Integration tests use RAII drop guards (`TestChannel`, `TestClient`, `TestChat`, `TestMessage`) in `tests/common/mod.rs` for DB cleanup — always use these instead of manual DELETE queries
 - Channels live in ONE table. `channels.external_key` is the provider's non-secret identity
@@ -149,16 +194,16 @@ Key patterns:
 - Client resolution (Instagram/Telegram) is async with 24h staleness check — `sender_id` may not exist in `clients` yet
 - `ClientCache` is dual-keyed: by UUID and by `(ProviderKind, external_id)`
 - `listener.rs`: in read events, `sender` = original message author (not the reader)
-- An outbound message is stored under a local id (`operator:<mid>`) and then **renamed** to
-  the provider's id once the send returns (`db::rename_external_message_id`). Read receipts
-  and edits arrive keyed by the provider's id and `mark_messages_read` anchors on
-  `(channel_id, external_message_id)`, so without the rename every receipt for an operator's
-  reply resolves to nothing. Instagram does this; Telegram does not yet — its `send` discards
-  the returned id
+- An outbound message is stored under a local id (`operator:<mid>`) and then **adopts** the
+  provider's id once the send returns (`db::adopt_external_message_id`, keyed on the row UUID
+  that `persist_and_publish` returned). Read receipts and edits arrive keyed by the provider's
+  id and `mark_messages_read` anchors on `(channel_id, external_message_id)`, so without the
+  adoption every receipt for an operator's reply resolves to nothing. Both providers do it,
+  and the adoption drops a duplicate row if an echo of the same message got there first
 
 ### Database
 
-Tables: `channels`, `clients`, `operators`, `chats`, `messages`. `channels` is the single channel table — `provider`, `name`, `external_key`, `config` (JSONB), `deleted_at` — with `UNIQUE (provider, external_key)`. `chats` tracks active conversations per `(client_id, channel_id)` with partial unique index. `messages` stores all persisted incoming messages. Migrations in `migrations/`. Schema managed by sqlx with auto-run on startup.
+Tables: `channels`, `clients`, `operators`, `chats`, `messages`. `operators.name` is NOT NULL and derived from the row's id at creation — there is no login yet, so nobody chooses it, but nothing is anonymous either. `messages.status` is constrained to `new` / `delivered` / `read` / `failed`. `channels` is the single channel table — `provider`, `name`, `external_key`, `config` (JSONB), `deleted_at` — with `UNIQUE (provider, external_key)`. `chats` tracks active conversations per `(client_id, channel_id)` with partial unique index. `messages` stores all persisted incoming messages. Migrations in `migrations/`. Schema managed by sqlx with auto-run on startup.
 
 ### Docker
 

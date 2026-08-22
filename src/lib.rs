@@ -2,6 +2,7 @@ pub mod cache;
 pub mod config;
 pub mod db;
 pub mod error;
+pub mod external_id;
 pub mod handler;
 pub mod jwt;
 pub mod listener;

@@ -188,7 +188,7 @@ impl ClientCache {
 #[derive(Debug, Clone)]
 pub struct CachedOperator {
     pub id: Uuid,
-    pub name: Option<String>,
+    pub name: String,
 }
 
 /// In-memory operator cache with read-through to Postgres.
@@ -409,7 +409,7 @@ mod tests {
             id,
             CachedOperator {
                 id,
-                name: Some("Alice".into()),
+                name: "Alice".into(),
             },
         );
         assert_eq!(cache.operators.read().unwrap().len(), 1);

@@ -66,7 +66,7 @@ pub async fn instagram_ingest(
                 Ok(messages) => {
                     let mut redis = state.redis.clone();
                     for msg in &messages {
-                        persist_and_publish(&state.db, &mut redis, msg, None, &state).await;
+                        persist_and_publish(&state.db, &mut redis, msg, &state).await;
                     }
                 }
                 Err(e) => tracing::error!("instagram parse failed: {e}"),
@@ -102,7 +102,7 @@ pub async fn telegram_ingest(
                 Ok(messages) => {
                     let mut redis = state.redis.clone();
                     for msg in &messages {
-                        persist_and_publish(&state.db, &mut redis, msg, None, &state).await;
+                        persist_and_publish(&state.db, &mut redis, msg, &state).await;
                     }
                 }
                 Err(e) => tracing::error!("telegram parse failed: {e}"),

@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use crate::cache::{ChannelCache, ClientCache};
 use crate::error::AppError;
-use crate::model::{EventKind, NewMessage, ProviderKind};
+use crate::model::{Conversation, EventKind, NewMessage, ProviderKind};
 use crate::provider::WebhookProvider;
 
 pub struct TelegramProvider {
@@ -79,9 +79,9 @@ impl WebhookProvider for TelegramProvider {
             (EventKind::Unknown, None)
         };
 
-        let message_id = match msg_ref {
-            Some(msg) => msg.message_id,
-            None => update.update_id,
+        let external_message_id = match msg_ref {
+            Some(msg) => crate::external_id::telegram(msg.chat.id, msg.message_id),
+            None => crate::external_id::telegram_update(update.update_id),
         };
 
         let client_id = if let Some(from) = msg_ref.and_then(|m| m.from.as_ref()) {
@@ -97,8 +97,9 @@ impl WebhookProvider for TelegramProvider {
         let raw = serde_json::from_slice(body).unwrap_or(serde_json::Value::Null);
 
         Ok(vec![NewMessage {
-            external_message_id: format!("telegram:{message_id}"),
+            external_message_id,
             channel_id: self.channel_id,
+            conversation: client_id.map(Conversation::Customer),
             sender_id: client_id,
             sender_type: "client".into(),
             provider: ProviderKind::Telegram,
@@ -201,9 +202,16 @@ pub struct TelegramUpdate {
 pub struct TelegramMessage {
     pub message_id: i64,
     pub date: i64,
+    pub chat: TelegramChat,
     pub from: Option<TelegramUser>,
-    pub chat: Option<serde_json::Value>,
     pub text: Option<String>,
+}
+
+/// Required inside a `Message`: the Bot API always sends it, and without it a
+/// `message_id` cannot be turned into an id that is unique on our side.
+#[derive(Debug, Deserialize)]
+pub struct TelegramChat {
+    pub id: i64,
 }
 
 #[derive(Debug, Deserialize, serde::Serialize, Clone)]
@@ -317,20 +325,30 @@ pub async fn get_webhook_info(base_url: &str, bot_token: &str) -> Result<Webhook
     serde_json::from_value(json).map_err(|e| format!("unexpected getWebhookInfo response: {e}"))
 }
 
+/// What the Bot API says it created.
+///
+/// `chat.id` is read back from the response rather than echoed from the argument:
+/// the response is the value a later update will agree with.
+#[derive(Debug, Deserialize)]
+pub struct SentMessage {
+    pub message_id: i64,
+    pub chat: TelegramChat,
+}
+
 pub async fn send(
     base_url: &str,
     bot_token: &str,
     chat_id: &str,
     message: &OutboundMessage,
-) -> Result<(), String> {
+) -> Result<SentMessage, String> {
     let (method, body) = match message {
         OutboundMessage::Text { text } => (
             "sendMessage",
             serde_json::json!({ "chat_id": chat_id, "text": text }),
         ),
     };
-    call(&format!("{base_url}/bot{bot_token}/{method}"), Some(body)).await?;
-    Ok(())
+    let json = call(&format!("{base_url}/bot{bot_token}/{method}"), Some(body)).await?;
+    serde_json::from_value(json).map_err(|e| format!("unexpected sendMessage response: {e}"))
 }
 
 #[cfg(test)]
@@ -396,6 +414,7 @@ mod tests {
             "message": {
                 "message_id": 42,
                 "date": 1700000000,
+                "chat": {"id": 123, "type": "private"},
                 "text": "hello"
             }
         });
@@ -414,6 +433,7 @@ mod tests {
             "edited_message": {
                 "message_id": 42,
                 "date": 1700000001,
+                "chat": {"id": 123, "type": "private"},
                 "text": "edited text"
             }
         });
@@ -422,6 +442,25 @@ mod tests {
         let msg = update.edited_message.unwrap();
         assert_eq!(msg.message_id, 42);
         assert_eq!(msg.text.as_deref(), Some("edited text"));
+    }
+
+    #[test]
+    fn a_message_id_is_scoped_to_its_chat() {
+        let update: TelegramUpdate = serde_json::from_value(serde_json::json!({
+            "update_id": 1,
+            "message": {
+                "message_id": 1,
+                "date": 1,
+                "chat": {"id": 777, "type": "private"},
+                "text": "hi"
+            }
+        }))
+        .unwrap();
+        let msg = update.message.unwrap();
+        assert_eq!(
+            crate::external_id::telegram(msg.chat.id, msg.message_id),
+            "telegram:777:1"
+        );
     }
 
     #[test]
@@ -507,13 +546,15 @@ mod tests {
     #[tokio::test]
     async fn send_text_message_success() {
         let base = mock_bot_api(serde_json::json!({
-            "sendMessage": {"ok": true, "result": {}}
+            "sendMessage": {"ok": true, "result": {"message_id": 7, "chat": {"id": 42}}}
         }))
         .await;
         let msg = OutboundMessage::Text {
             text: "hello".into(),
         };
-        assert!(send(&base, "fake_token", "12345", &msg).await.is_ok());
+        let sent = send(&base, "fake_token", "42", &msg).await.unwrap();
+        assert_eq!(sent.message_id, 7);
+        assert_eq!(sent.chat.id, 42);
     }
 
     #[tokio::test]
