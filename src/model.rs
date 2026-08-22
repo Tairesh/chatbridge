@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ProviderKind {
     Instagram,
     Telegram,
@@ -23,8 +23,15 @@ pub struct TelegramConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstagramConfig {
     pub access_token: String,
+    /// When the long-lived token dies, ~60 days after it was issued. Absent for a
+    /// manually pasted token, which the refresher then treats as due.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub refresh_time: Option<chrono::DateTime<chrono::Utc>>,
+    pub token_expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Kept separate from `channels.name`, which is operator-editable: rename a
+    /// channel to "Support" and the numeric `external_key` no longer says which
+    /// account it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
 }
 
 /// Stored contents of `channels.config` for a widget channel. A widget channel
@@ -46,8 +53,10 @@ pub enum ChannelSpec {
     Telegram {
         bot_token: String,
     },
+    /// Only the token. `GET /me` is the authority on which account it belongs to,
+    /// so asking the operator to type the id in is asking for a value that can
+    /// only be wrong.
     Instagram {
-        user_id: String,
         access_token: String,
     },
 }
@@ -459,7 +468,7 @@ mod tests {
         assert_eq!(telegram.provider(), ProviderKind::Telegram);
 
         let instagram: ChannelSpec = serde_json::from_value(serde_json::json!({
-            "provider": "instagram", "user_id": "17841", "access_token": "tok"
+            "provider": "instagram", "access_token": "tok"
         }))
         .unwrap();
         assert_eq!(instagram.provider(), ProviderKind::Instagram);
@@ -486,12 +495,11 @@ mod tests {
         );
 
         let instagram = ChannelSpec::Instagram {
-            user_id: "17841".into(),
             access_token: "tok".into(),
         };
         assert_eq!(
             serde_json::to_value(&instagram).unwrap(),
-            serde_json::json!({"provider": "instagram", "user_id": "17841", "access_token": "tok"})
+            serde_json::json!({"provider": "instagram", "access_token": "tok"})
         );
     }
 
@@ -508,10 +516,9 @@ mod tests {
                 .is_err()
         );
         assert!(
-            serde_json::from_value::<ChannelSpec>(
-                serde_json::json!({"provider": "instagram", "user_id": "1"})
-            )
-            .is_err()
+            serde_json::from_value::<ChannelSpec>(serde_json::json!({"provider": "instagram"}))
+                .is_err(),
+            "access_token is required"
         );
     }
 
@@ -534,21 +541,44 @@ mod tests {
     }
 
     #[test]
-    fn instagram_config_accepts_absent_refresh_time() {
-        let value = serde_json::json!({"access_token": "tok"});
-        let cfg: InstagramConfig = serde_json::from_value(value).unwrap();
-        assert_eq!(cfg.access_token, "tok");
-        assert!(cfg.refresh_time.is_none());
+    fn instagram_config_accepts_a_bare_access_token() {
+        // A manually pasted token has no known expiry and no username; the
+        // refresher fills the expiry in on its next pass.
+        let cfg: InstagramConfig =
+            serde_json::from_value(serde_json::json!({"access_token": "t"})).unwrap();
+        assert_eq!(cfg.access_token, "t");
+        assert!(cfg.token_expires_at.is_none());
+        assert!(cfg.username.is_none());
     }
 
     #[test]
-    fn instagram_config_parses_refresh_time() {
-        let value = serde_json::json!({
-            "access_token": "tok",
-            "refresh_time": "2026-03-14T00:00:00+00:00"
+    fn instagram_config_round_trips_the_expiry_and_username() {
+        let json = serde_json::json!({
+            "access_token": "t",
+            "token_expires_at": "2026-10-19T09:00:00Z",
+            "username": "yourbiz"
         });
-        let cfg: InstagramConfig = serde_json::from_value(value).unwrap();
-        assert!(cfg.refresh_time.is_some());
+        let cfg: InstagramConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(cfg.username.as_deref(), Some("yourbiz"));
+        assert_eq!(
+            cfg.token_expires_at.unwrap().to_rfc3339(),
+            "2026-10-19T09:00:00+00:00"
+        );
+    }
+
+    #[test]
+    fn instagram_config_omits_absent_optional_fields() {
+        // The blob is written back on every edit; a null-filled config would be
+        // noise in the panel, which renders config verbatim.
+        let cfg = InstagramConfig {
+            access_token: "t".into(),
+            token_expires_at: None,
+            username: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&cfg).unwrap(),
+            serde_json::json!({"access_token": "t"})
+        );
     }
 
     #[test]

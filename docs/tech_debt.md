@@ -83,6 +83,11 @@ Accepted deliberately — there is no production deployment yet, and returning k
 requirement for the panel, since editing a token means seeing it. It must be closed before the
 first deployment that is reachable from the internet.
 
+This now covers the OAuth routes too. `GET /api/oauth/{provider}/start` is reachable by anyone,
+so anyone can begin a login and, on completing it, attach an Instagram account to this
+deployment. The `state` JWT is a CSRF guard — it proves the callback follows a `start` this
+deployment issued — but it is not bound to a session, because there are no sessions.
+
 **Fix:** whatever authorization scheme closes the entry above, applied to `/api/channels` first,
 plus a decision about whether the panel should return secrets at all once more than one person
 can reach it.
@@ -123,6 +128,86 @@ the unique index, rather than a racy pre-check, arbitrates duplicates and a live
 cannot be hijacked. An in-process `setWebhook` failure is already handled by a physical rollback.
 Only the crash case is uncovered.
 
+The Instagram paths have the identical window: `create_instagram` and the OAuth callback both
+commit the row before calling `/me/subscribed_apps`, and a crash inside that window leaves the
+account's identity occupied by a channel that never worked. The same fix covers both.
+
 **Fix:** a `webhook_registered_at` column marking a channel provisional until `setWebhook` returns,
 with the panel offering to finish or discard provisional channels; or a reconciliation pass on
 startup.
+
+## Instagram outbound is text-only
+
+**Status:** open (found 2026-08-22)
+
+`oauth::instagram::send_message` sends `{recipient: {id}, message: {text}}` and nothing else.
+Three things are deliberately missing:
+
+- **Attachments.** They go out as `message.attachments` — an array, unlike the singular
+  `message.attachment` of the Messenger docs — with `payload.url` pointing at a publicly
+  reachable HTTPS URL that Meta fetches during the call. There is no two-step upload.
+- **The 24-hour customer-service window.** Outside it Meta rejects free-form messages with
+  `code 10, error_subcode 2534022`, which `describe_instagram_failure` turns into an
+  operator-readable message. Nothing tracks `last_inbound_at` or refuses the send up front,
+  and message tags (`HUMAN_AGENT`) are not implemented. The sibling PHP integration has the
+  tag coded but commented out pending App Review, so that half is unsolved there too.
+- **Rate-limit backoff.** A `4`/`17`/`32` is surfaced to the operator verbatim rather than
+  retried. Meta returns `X-Business-Use-Case-Usage` with
+  `estimated_time_to_regain_access`, which nothing reads.
+
+**Fix:** attachments first — they are the common case and need only the array shape plus a
+publicly reachable URL. The window needs `last_inbound_at` per chat before it can be
+enforced rather than merely reported.
+
+## Inbound Instagram attachments are Meta CDN links that expire in minutes
+
+**Status:** open (found 2026-08-22)
+
+`provider/instagram.rs` stores the whole messaging event in `messages.raw`, attachments included.
+Each attachment is a signed `lookaside.fbsbx.com` URL whose query string expires in minutes, not
+hours. Any UI that renders last week's conversation renders dead links.
+
+**Fix:** a download worker — take `(message_id, attachment_type, url)` off the ingest path, fetch
+the bytes promptly, store them in object storage, and persist a local reference on the message
+instead of Meta's URL. The PHP integration does exactly this and its type mapping is the observed
+set: `image`, `video`, `audio` (→ voice), `file` (→ document); anything else is dropped.
+
+## `messaging_seen` and `message_reactions` have never delivered a real event
+
+**Status:** open (found 2026-08-22)
+
+`oauth::INSTAGRAM_FIELDS` subscribes to `messages`, `message_edit`, `message_reactions` and
+`messaging_seen` — exactly what `classify_event` handles. All four are accepted by
+`POST /me/subscribed_apps`, echoed back by the GET, and observed firing App Dashboard test
+sends, so all four exist and are subscribed. What has never been observed is a *real* read
+receipt or reaction arriving — because no real event of any kind has been observed yet.
+
+`oauth::subscribe` degrades instead of failing when a name is rejected, so a name that stops
+being valid later costs a warning in the log and a missing field rather than a broken create.
+That makes it easy to never notice.
+
+**Fix:** once real delivery works, confirm that a reaction and a read receipt arrive and are
+classified, or drop the two fields.
+
+## Meta's deauthorize and data-deletion callbacks are missing
+
+**Status:** open (found 2026-08-22)
+
+Meta requires two callbacks for App Review, and this deployment has neither:
+
+- **Deauthorize** — `POST` with a `signed_request` form field when a user removes the app in their
+  Instagram settings. Without it the channel stays live holding a token that is already dead, and
+  nothing tells the operator why messages stopped.
+- **Data deletion** — `POST` with a `signed_request`, answering `{url, confirmation_code}`, plus a
+  `GET .../status?code=` endpoint reporting whether the deletion happened.
+
+The sibling PHP integration has a complete, portable implementation:
+`InstagramBusinessDeauthorizeController`, `InstagramBusinessDataDeletionController`,
+`InstagramBusinessDataDeletionStatusController`, `InstagramChannelDeauthorizeService` and
+`InstagramSignedRequestParser`. Two details worth copying rather than re-deriving: the HMAC is
+computed over the **still-base64url-encoded** payload string, not the decoded JSON; and "deleted"
+is defined as soft-deleted **and** access token blanked, which is what makes the status endpoint's
+three states (never existed / deleted / not deleted) distinguishable.
+
+**Fix:** port all three endpoints and the signed-request parser. Blocks App Review, and therefore
+blocks connecting any Instagram account other than one holding a role on the app.

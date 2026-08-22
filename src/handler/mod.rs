@@ -1,5 +1,7 @@
 pub mod api;
 pub mod channels;
+pub mod connection;
+pub mod oauth;
 pub mod operator_ws;
 pub mod webhook;
 pub mod widget_ws;

@@ -19,9 +19,18 @@ thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 redis = { version = "1.1", features = ["tokio-comp", "aio", "connection-manager"] }
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+# `query` and `form` are feature-gated in reqwest 0.13: the Instagram Graph calls pass
+# their parameters as a query string, and the OAuth code exchange is form-encoded.
+reqwest = { version = "0.13", default-features = false, features = [
+    "json",
+    "rustls",
+    "query",
+    "form",
+] }
 tracing = "0.1"
-tracing-subscriber = "0.3"
+# `env-filter` gives RUST_LOG control over the level; without it `fmt::init()` is
+# pinned to INFO and the debug-level webhook payload can never be turned on.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]

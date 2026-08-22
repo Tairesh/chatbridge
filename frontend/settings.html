@@ -30,10 +30,10 @@
 
     .channel-body { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border); }
     .channel-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
-    .webhook-status { margin-top: 10px; padding: 8px 10px; border-radius: 6px; font-size: 12px; }
-    .webhook-ok { background: #ecfdf5; color: var(--ok); border: 1px solid #6ee7b7; }
-    .webhook-warn { background: #fffbeb; color: var(--warn); border: 1px solid #fcd34d; }
-    .webhook-bad { background: #fef2f2; color: var(--danger); border: 1px solid #fca5a5; }
+    .connection-status { margin-top: 10px; padding: 8px 10px; border-radius: 6px; font-size: 12px; }
+    .connection-ok { background: #ecfdf5; color: var(--ok); border: 1px solid #6ee7b7; }
+    .connection-warn { background: #fffbeb; color: var(--warn); border: 1px solid #fcd34d; }
+    .connection-bad { background: #fef2f2; color: var(--danger); border: 1px solid #fca5a5; }
   </style>
 </head>
 <body>
@@ -75,10 +75,26 @@
       </div>
 
       <div class="form-row" data-provider="instagram">
-        <button class="btn" disabled>Log in with Instagram (coming soon)</button>
-        <p class="hint">Instagram channels cannot be created here yet. An existing Instagram
-          channel can still be edited in the list below.</p>
+        <button id="create-instagram-login" class="btn">Log in with Instagram</button>
+        <p class="hint">Opens Instagram in a popup. The account id, the handle and the
+          token all come back from the login — there is nothing to type.</p>
+        <p class="hint">Redirect URI to register in the Meta dashboard
+          (<em>Use cases &rarr; Manage messaging &amp; content on Instagram &rarr; Set up
+          Instagram business login</em>). Meta compares it byte for byte:<br>
+          <code id="instagram-redirect-uri"></code>
+          <button id="copy-redirect-uri" class="btn btn-secondary">Copy</button>
+        </p>
       </div>
+
+      <details class="form-row" data-provider="instagram">
+        <summary>Paste a token instead</summary>
+        <label for="create-instagram-token">Access token</label>
+        <input id="create-instagram-token" class="input" placeholder="IGQ..." />
+        <p class="hint">The fallback for when the login is unavailable. The account is
+          identified from the token itself and the channel is subscribed to events the
+          same way, so this produces a working channel rather than a silent one.</p>
+        <button id="create-instagram-submit" class="btn">Create channel</button>
+      </details>
 
       <div id="create-error" class="banner" hidden></div>
 
@@ -97,6 +113,26 @@
 
     let channels = [];
     let expandedId = null;
+
+    // Filled from /api/oauth/providers. The panel hardcodes nothing about a provider —
+    // not the authorize URL, not the app id, not even that Instagram has a login.
+    let oauthProviders = {};
+
+    async function loadOauthProviders() {
+      try {
+        const resp = await fetch(`${BASE_URL}/api/oauth/providers`);
+        if (!resp.ok) throw new Error(await resp.text());
+        const list = await resp.json();
+        oauthProviders = Object.fromEntries(list.map((p) => [p.provider, p]));
+      } catch (e) {
+        console.error('Failed to load OAuth providers:', e);
+      }
+      const ig = oauthProviders.instagram;
+      document.getElementById('instagram-redirect-uri').textContent =
+        ig ? ig.redirect_uri : 'unavailable';
+      // A button that can only 404 is worse than a disabled one.
+      document.getElementById('create-instagram-login').disabled = !ig;
+    }
 
     // ── Loading and rendering ────────────────────────────────────
 
@@ -134,6 +170,7 @@
         </div>
         <div class="channel-meta">
           <div><span class="k">identity</span>${escapeHtml(ch.external_key)}</div>
+          ${ch.config.username ? `<div><span class="k">account</span>@${escapeHtml(ch.config.username)}</div>` : ''}
           <div><span class="k">endpoint</span>${escapeHtml(ch.endpoint)}</div>
           <div><span class="k">created</span>${formatDate(ch.created_at)}</div>
         </div>
@@ -160,14 +197,18 @@
       } else if (ch.provider === 'telegram') {
         fields = field(ch.id, 'bot_token', 'Bot token', ch.config.bot_token || '');
       } else {
-        fields =
-          field(ch.id, 'user_id', 'user_id', ch.external_key) +
-          field(ch.id, 'access_token', 'Access token', ch.config.access_token || '');
+        // Behind a disclosure: the login is the normal way in, and the token is only
+        // reached for when it is not available.
+        fields = `<details class="form-row">
+            <summary>Access token (manual)</summary>
+            ${field(ch.id, 'access_token', 'Access token', ch.config.access_token || '')}
+          </details>`;
       }
 
       const restoreNote = ch.deleted_at
         ? `<p class="hint">Restoring keeps this channel's id and its whole message history.
-             Check the values above first — a Telegram token may have been regenerated since.</p>`
+             Check the values above first — a Telegram token may have been regenerated, and
+             an Instagram token may have expired, while the channel was deleted.</p>`
         : '';
 
       const widgetWarning =
@@ -182,7 +223,7 @@
         ${restoreNote}
         <div class="banner" id="err-${ch.id}" hidden></div>
         <div class="channel-actions"></div>
-        <div id="webhook-${ch.id}"></div>
+        <div id="connection-${ch.id}"></div>
       `;
 
       const actions = body.querySelector('.channel-actions');
@@ -190,12 +231,17 @@
         actions.appendChild(button('Restore', 'btn', () => saveChannel(ch, true)));
       } else {
         actions.appendChild(button('Save', 'btn', () => saveChannel(ch, false)));
-        if (ch.provider === 'telegram') {
+        if (ch.provider === 'telegram' || ch.provider === 'instagram') {
           actions.appendChild(
-            button('Check webhook', 'btn btn-secondary', () => checkWebhook(ch, 'GET'))
+            button('Check connection', 'btn btn-secondary', () => checkConnection(ch, 'GET'))
           );
           actions.appendChild(
-            button('Re-register', 'btn btn-secondary', () => checkWebhook(ch, 'POST'))
+            button('Re-register', 'btn btn-secondary', () => checkConnection(ch, 'POST'))
+          );
+        }
+        if (ch.provider === 'instagram' && oauthProviders.instagram) {
+          actions.appendChild(
+            button('Reconnect', 'btn btn-secondary', () => openLogin('instagram', ch.id))
           );
         }
         actions.appendChild(button('Delete', 'btn btn-danger', () => deleteChannel(ch)));
@@ -253,6 +299,8 @@
         body.widget_id = document.getElementById('create-widget-id').value.trim();
       } else if (provider === 'telegram') {
         body.bot_token = document.getElementById('create-bot-token').value.trim();
+      } else if (provider === 'instagram') {
+        body.access_token = document.getElementById('create-instagram-token').value.trim();
       }
       const name = document.getElementById('create-name').value.trim();
       if (name) body.name = name;
@@ -281,7 +329,12 @@
           showBanner('create-error', await resp.text());
           return;
         }
-        for (const id of ['create-widget-id', 'create-bot-token', 'create-name']) {
+        for (const id of [
+          'create-widget-id',
+          'create-bot-token',
+          'create-instagram-token',
+          'create-name',
+        ]) {
           document.getElementById(id).value = '';
         }
         hideBanner('create-error');
@@ -345,20 +398,13 @@
       if (ch.provider === 'telegram') {
         return { provider: 'telegram', bot_token: readField(ch.id, 'bot_token') };
       }
-      return {
-        provider: 'instagram',
-        user_id: readField(ch.id, 'user_id'),
-        access_token: readField(ch.id, 'access_token'),
-      };
+      return { provider: 'instagram', access_token: readField(ch.id, 'access_token') };
     }
 
     function specChanged(ch, spec) {
       if (ch.provider === 'widget') return spec.widget_id !== ch.external_key;
       if (ch.provider === 'telegram') return spec.bot_token !== (ch.config.bot_token || '');
-      return (
-        spec.user_id !== ch.external_key ||
-        spec.access_token !== (ch.config.access_token || '')
-      );
+      return spec.access_token !== (ch.config.access_token || '');
     }
 
     /**
@@ -394,7 +440,11 @@
       const confirmed = confirm(
         `Delete "${ch.name}"?\n\nIts message history is kept and it can be restored later. ` +
           `Its open conversations leave the operator inbox` +
-          (ch.provider === 'telegram' ? ` and its Telegram webhook is removed.` : `.`)
+          (ch.provider === 'telegram'
+            ? ` and its Telegram webhook is removed.`
+            : ch.provider === 'instagram'
+              ? ` and the Instagram account is unsubscribed from events.`
+              : `.`)
       );
       if (!confirmed) return;
       try {
@@ -412,46 +462,110 @@
 
     // ── Webhook status ───────────────────────────────────────────
 
+    // ── OAuth login ──────────────────────────────────────────────
+
     /**
-     * `GET` reports, `POST` re-registers and reports in the same response.
-     * Never called automatically on page load: N telegram channels would be N
-     * Telegram round trips per render, tying this page to Telegram's uptime and
-     * rate limits for information nobody reads on most visits.
+     * The popup opens the backend's `start` path, which redirects to the provider.
+     * The frontend never assembles an authorize URL, so there is nothing here to
+     * drift out of sync with the backend or with the Meta dashboard.
+     *
+     * `channelId` pins the channel a "Reconnect" came from: the callback then
+     * refuses to write anything if a different account comes back.
      */
-    async function checkWebhook(ch, method) {
-      const target = document.getElementById(`webhook-${ch.id}`);
-      target.innerHTML = '<div class="webhook-status">Checking…</div>';
+    function openLogin(provider, channelId) {
+      const descriptor = oauthProviders[provider];
+      if (!descriptor) return;
+      const url = channelId
+        ? `${descriptor.start_path}?channel_id=${encodeURIComponent(channelId)}`
+        : descriptor.start_path;
+
+      const win = window.open(url, 'chatbridge-oauth', 'width=600,height=760');
+      if (win) return;
+
+      // Popup blocked. The fallback link opens a normal tab, which has no
+      // window.opener, so the callback page falls back to plain text and a link back
+      // here rather than posting a message into nothing.
+      const el = document.getElementById(channelId ? `err-${channelId}` : 'create-error');
+      if (!el) return;
+      el.textContent = 'The popup was blocked. Allow popups for this site, or ';
+      const link = document.createElement('a');
+      link.href = url;
+      link.target = '_blank';
+      link.rel = 'noopener';
+      link.textContent = 'open the login in a new tab';
+      el.appendChild(link);
+      el.hidden = false;
+    }
+
+    function onOauthMessage(event) {
+      // Same-origin only: the callback page is served by this deployment.
+      if (event.origin !== location.origin) return;
+      const data = event.data;
+      if (!data || data.source !== 'chatbridge-oauth') return;
+
+      if (!data.ok) {
+        showBanner('create-error', data.error || 'The login did not complete.');
+        return;
+      }
+      // Expand the affected row before reloading, so a warning banner lands somewhere
+      // visible rather than inside a collapsed body.
+      expandedId = data.channel_id;
+      loadChannels().then(() => {
+        highlightRow(data.channel_id);
+        if (data.warning) showBanner(`err-${data.channel_id}`, data.warning);
+      });
+    }
+
+    // ── Connection status ────────────────────────────────────────
+
+    /**
+     * `GET` reports, `POST` re-arms and reports in the same response.
+     * Never called automatically on page load: N channels would be N provider round
+     * trips per render, tying this page to Meta's and Telegram's uptime and rate
+     * limits for information nobody reads on most visits.
+     */
+    async function checkConnection(ch, method) {
+      const target = document.getElementById(`connection-${ch.id}`);
+      target.innerHTML = '<div class="connection-status">Checking…</div>';
       try {
-        const resp = await fetch(`${BASE_URL}/api/channels/${ch.id}/webhook`, { method });
+        const resp = await fetch(`${BASE_URL}/api/channels/${ch.id}/connection`, { method });
         if (!resp.ok) {
           target.innerHTML =
-            `<div class="webhook-status webhook-bad">${escapeHtml(await resp.text())}</div>`;
+            `<div class="connection-status connection-bad">${escapeHtml(await resp.text())}</div>`;
           return;
         }
-        target.innerHTML = renderWebhookStatus(await resp.json());
+        target.innerHTML = renderConnectionStatus(await resp.json());
       } catch (e) {
-        target.innerHTML = `<div class="webhook-status webhook-bad">${escapeHtml(String(e))}</div>`;
+        target.innerHTML =
+          `<div class="connection-status connection-bad">${escapeHtml(String(e))}</div>`;
       }
     }
 
-    function renderWebhookStatus(status) {
-      if (status.matches && !status.last_error_message) {
-        return `<div class="webhook-status webhook-ok">Webhook active.
-                  ${status.pending_update_count} pending updates.</div>`;
-      }
-      if (status.matches) {
-        // Telegram's own report of failures delivering to us.
-        return `<div class="webhook-status webhook-warn">Active, but Telegram reports delivery
-                  errors: ${escapeHtml(status.last_error_message)}
-                  (${status.pending_update_count} pending updates).</div>`;
-      }
-      if (!status.registered_url) {
-        return `<div class="webhook-status webhook-bad">No webhook registered.
-                  Press "Re-register".</div>`;
-      }
-      return `<div class="webhook-status webhook-bad">Webhook points elsewhere:
-                ${escapeHtml(status.registered_url)}<br>Expected:
-                ${escapeHtml(status.expected_url)}<br>Press "Re-register" to take it back.</div>`;
+    /**
+     * `summary` is composed by the server — URL comparison and day arithmetic do not
+     * belong in the browser. `details` is rendered generically, so a provider can add
+     * a field without a change here.
+     */
+    function renderConnectionStatus(status) {
+      const details = status.details || {};
+      const cls = !status.ok
+        ? 'connection-bad'
+        : details.last_error_message
+          ? 'connection-warn'
+          : 'connection-ok';
+
+      const rows = Object.entries(details)
+        .filter(([, v]) => v !== null && v !== undefined && !(Array.isArray(v) && !v.length))
+        .map(
+          ([k, v]) =>
+            `<div><span class="k">${escapeHtml(k)}</span>${escapeHtml(
+              Array.isArray(v) ? v.join(', ') : String(v)
+            )}</div>`
+        )
+        .join('');
+
+      return `<div class="connection-status ${cls}">${escapeHtml(status.summary)}
+                ${rows ? `<div class="channel-meta">${rows}</div>` : ''}</div>`;
     }
 
     // ── Helpers ──────────────────────────────────────────────────
@@ -502,7 +616,18 @@
 
     document.getElementById('create-provider').addEventListener('change', syncCreateForm);
     document.getElementById('create-submit').addEventListener('click', submitCreate);
+    document.getElementById('create-instagram-submit').addEventListener('click', submitCreate);
+    document
+      .getElementById('create-instagram-login')
+      .addEventListener('click', () => openLogin('instagram', null));
+    document.getElementById('copy-redirect-uri').addEventListener('click', () => {
+      const uri = oauthProviders.instagram && oauthProviders.instagram.redirect_uri;
+      if (uri) navigator.clipboard.writeText(uri);
+    });
+    // Registered once, not per click: a listener per popup would fire N times.
+    window.addEventListener('message', onOauthMessage);
     syncCreateForm();
+    loadOauthProviders();
     loadChannels();
   </script>
 </body>

@@ -106,6 +106,21 @@ pub async fn list_channels(pool: &PgPool) -> Result<Vec<Channel>, sqlx::Error> {
     .await
 }
 
+/// Live channels of one provider. Small result sets by design — the caller filters
+/// on the config blob in Rust rather than casting JSONB in SQL.
+pub async fn list_live_channels_by_provider(
+    pool: &PgPool,
+    provider: ProviderKind,
+) -> Result<Vec<Channel>, sqlx::Error> {
+    sqlx::query_as::<_, Channel>(&format!(
+        "SELECT {CHANNEL_COLUMNS} FROM channels
+         WHERE provider = $1 AND deleted_at IS NULL"
+    ))
+    .bind(provider.to_string())
+    .fetch_all(pool)
+    .await
+}
+
 /// The caller supplies the id so that it can build the webhook URL before the
 /// row exists.
 pub async fn insert_channel(
@@ -128,6 +143,51 @@ pub async fn insert_channel(
     .bind(config)
     .fetch_one(pool)
     .await
+}
+
+/// Write a channel identified by the provider's own identity, creating it or
+/// refreshing the one that is already there.
+///
+/// `name` is deliberately absent from `DO UPDATE`: the channel may have been
+/// renamed by an operator, and re-connecting the same account must not undo that.
+/// Clearing `deleted_at` is the auto-restore — logging in is an explicit "I want
+/// this account", and a popup has nowhere to ask a follow-up question.
+///
+/// One statement, so the unique index stays the sole arbiter and two simultaneous
+/// logins for the same account cannot both insert.
+///
+/// Returns `(channel, inserted)`. `xmax = 0` is Postgres's own answer to "did this
+/// row come from the INSERT branch", and it is the *only* trustworthy one: a
+/// `SELECT` before the upsert can be overtaken by a concurrent insert, and the
+/// caller uses this flag to decide whether a failure afterwards may physically
+/// delete the row. Getting it wrong deletes somebody else's live channel.
+pub async fn upsert_channel_by_external_key(
+    pool: &PgPool,
+    id: Uuid,
+    provider: ProviderKind,
+    name: &str,
+    external_key: &str,
+    config: &serde_json::Value,
+) -> Result<(Channel, bool), sqlx::Error> {
+    use sqlx::{FromRow, Row};
+
+    let row = sqlx::query(&format!(
+        "INSERT INTO channels (id, provider, name, external_key, config)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (provider, external_key) DO UPDATE
+             SET config = EXCLUDED.config, deleted_at = NULL
+         RETURNING {CHANNEL_COLUMNS}, (xmax = 0) AS inserted"
+    ))
+    .bind(id)
+    .bind(provider.to_string())
+    .bind(name)
+    .bind(external_key)
+    .bind(config)
+    .fetch_one(pool)
+    .await?;
+
+    let inserted: bool = row.try_get("inserted")?;
+    Ok((Channel::from_row(&row)?, inserted))
 }
 
 /// `None` arguments leave their column untouched. `restore` clears `deleted_at`.
@@ -511,6 +571,30 @@ pub async fn mark_messages_read(
     .bind(reader_type)
     .fetch_all(pool)
     .await
+}
+
+/// Replace an outbound message's external id with the one the provider assigned.
+///
+/// Read receipts and edits arrive keyed by the *provider's* id, and
+/// `mark_messages_read` looks the anchor message up by `(channel_id,
+/// external_message_id)`. Until the provider's id is stored, every read receipt for
+/// an operator's reply finds nothing. Returns whether a row was renamed.
+pub async fn rename_external_message_id(
+    pool: &PgPool,
+    channel_id: Uuid,
+    old: &str,
+    new: &str,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE messages SET external_message_id = $3
+         WHERE channel_id = $1 AND external_message_id = $2",
+    )
+    .bind(channel_id)
+    .bind(old)
+    .bind(new)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
 }
 
 /// Mark messages as read by target message UUID (for WS read receipts).

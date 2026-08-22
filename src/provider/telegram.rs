@@ -130,9 +130,18 @@ async fn resolve_telegram_client(
             Some(client.id)
         }
         Ok(None) => {
-            let client_id = Uuid::new_v4();
-            spawn_telegram_upsert(db.clone(), client_id, from, redis);
-            Some(client_id)
+            // Awaited, not spawned. Same reason as the instagram path: the message is
+            // persisted right after this returns, and `persist_and_publish` will not
+            // set `sender_id` or create the chat unless the client row already exists.
+            // Telegram needs no network call here at all — the display name is already
+            // in the update — so there was never anything to gain by deferring it.
+            match upsert_telegram_client(db, Uuid::new_v4(), from, redis).await {
+                Ok(id) => Some(id),
+                Err(e) => {
+                    tracing::error!("telegram client insert failed: {e}");
+                    None
+                }
+            }
         }
         Err(e) => {
             tracing::error!("telegram client lookup failed: {e}");
@@ -141,30 +150,40 @@ async fn resolve_telegram_client(
     }
 }
 
+/// Write the client row and tell the other replicas. Returns the effective id, so
+/// two updates racing on the same new sender converge on one row.
+async fn upsert_telegram_client(
+    db: &PgPool,
+    client_id: Uuid,
+    from: &TelegramUser,
+    mut redis: redis::aio::ConnectionManager,
+) -> Result<Uuid, sqlx::Error> {
+    let name = build_display_name(from);
+    let id = crate::db::upsert_client(
+        db,
+        client_id,
+        ProviderKind::Telegram,
+        &from.id.to_string(),
+        Some(name.as_str()),
+        from.username.as_deref(),
+    )
+    .await?;
+    crate::cache::publish_invalidation(&mut redis, "client", id).await;
+    Ok(id)
+}
+
+/// Refresh a known client's profile in the background. Only for the stale-cache
+/// path, where nothing is waiting on the result.
 fn spawn_telegram_upsert(
     db: PgPool,
     client_id: Uuid,
     from: &TelegramUser,
     redis: redis::aio::ConnectionManager,
 ) {
-    let name = build_display_name(from);
-    let external_id = from.id.to_string();
-    let username = from.username.clone();
+    let from = from.clone();
     tokio::spawn(async move {
-        let mut redis = redis;
-        if let Err(e) = crate::db::upsert_client(
-            &db,
-            client_id,
-            ProviderKind::Telegram,
-            &external_id,
-            Some(name.as_str()),
-            username.as_deref(),
-        )
-        .await
-        {
-            tracing::error!("telegram client upsert failed: {e}");
-        } else {
-            crate::cache::publish_invalidation(&mut redis, "client", client_id).await;
+        if let Err(e) = upsert_telegram_client(&db, client_id, &from, redis).await {
+            tracing::error!("telegram client refresh failed: {e}");
         }
     });
 }
@@ -187,7 +206,7 @@ pub struct TelegramMessage {
     pub text: Option<String>,
 }
 
-#[derive(Debug, Deserialize, serde::Serialize)]
+#[derive(Debug, Deserialize, serde::Serialize, Clone)]
 pub struct TelegramUser {
     pub id: i64,
     pub first_name: String,

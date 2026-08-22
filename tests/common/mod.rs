@@ -31,6 +31,47 @@ fn drop_query(query: &str, id: Uuid) {
     });
 }
 
+/// Deletes a channel by provider identity rather than by id.
+///
+/// For tests that assert a row was *not* created. When such a test fails it fails
+/// because the row exists — and without this guard that orphan stays in the shared
+/// database forever, where the token refresher will later pick it up and rewrite it.
+pub struct TestChannelKey {
+    pub provider: &'static str,
+    pub external_key: String,
+}
+
+impl TestChannelKey {
+    pub fn instagram(external_key: &str) -> Self {
+        Self {
+            provider: "instagram",
+            external_key: external_key.to_owned(),
+        }
+    }
+}
+
+impl Drop for TestChannelKey {
+    fn drop(&mut self) {
+        let db_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+        let provider = self.provider;
+        let key = self.external_key.clone();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                tokio::runtime::Runtime::new().unwrap().block_on(async {
+                    let pool = PgPool::connect(&db_url).await.unwrap();
+                    let _ = sqlx::query(
+                        "DELETE FROM channels WHERE provider = $1 AND external_key = $2",
+                    )
+                    .bind(provider)
+                    .bind(&key)
+                    .execute(&pool)
+                    .await;
+                });
+            });
+        });
+    }
+}
+
 /// RAII guard that deletes a test row on drop, even if the test panics.
 pub struct TestChannel {
     pub id: Uuid,

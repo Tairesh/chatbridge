@@ -215,6 +215,7 @@ Requires Rust 1.88+, a running PostgreSQL instance, and Redis.
 
 ```bash
 # Set environment variables
+export INSTAGRAM_APP_ID=your_instagram_app_id
 export INSTAGRAM_VERIFY_TOKEN=your_token
 export INSTAGRAM_APP_SECRET=your_secret
 export DATABASE_URL=postgres://chatbridge:chatbridge@localhost:5432/chatbridge
@@ -233,13 +234,38 @@ Migrations run automatically on startup.
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
+| `INSTAGRAM_APP_ID` | yes | — | Public id of the **Instagram** app (App dashboard → Use cases → Manage messaging & content on Instagram). Not the Meta app id from Settings → Basic |
 | `INSTAGRAM_VERIFY_TOKEN` | yes | — | Token for Instagram webhook subscription handshake |
-| `INSTAGRAM_APP_SECRET` | yes | — | HMAC-SHA256 secret for Instagram signature validation |
+| `INSTAGRAM_APP_SECRET` | yes | — | HMAC-SHA256 secret for Instagram signature validation, and for the OAuth token exchanges |
 | `DATABASE_URL` | yes | — | Postgres connection string |
 | `REDIS_URL` | yes | — | Redis connection string |
 | `APP_JWT_SECRET` | yes | — | HMAC-SHA256 secret for WebSocket JWTs (widget clients + operators) |
 | `PUBLIC_BASE_URL` | yes | — | Public origin of this deployment, no trailing slash. Builds Telegram webhook URLs and the `endpoint` field of a channel |
 | `TELEGRAM_API_BASE` | no | `https://api.telegram.org` | Telegram Bot API origin. Point it at a fake Bot API for local work |
+| `RUST_LOG` | no | `info` | Log level. `chatbridge=debug` logs raw webhook payloads and every provider call |
+| `INSTAGRAM_API_BASE` | no | — | Overrides all three Meta hosts at once (`www.instagram.com`, `api.instagram.com`, `graph.instagram.com/v26.0`). For pointing a local run at a fake API |
+
+## Connecting an Instagram account
+
+Register `<PUBLIC_BASE_URL>/api/oauth/instagram/callback` as a redirect URI in the Meta
+dashboard (*Use cases → Manage messaging & content on Instagram → Set up Instagram business
+login → Business Login Settings*). Meta compares it byte for byte; the settings panel shows
+the exact string with a copy button.
+
+`PUBLIC_BASE_URL` must be **https** — Meta refuses a plain-http redirect URI — and the panel
+has to be opened at that same origin, because the popup lands there.
+
+Then press **Log in with Instagram** in the panel. The popup returns with the account
+connected, subscribed, and its 60-day token recorded. A background pass refreshes tokens
+hourly, starting three days before they expire.
+
+Until App Review grants advanced access to `instagram_business_basic` and
+`instagram_business_manage_messages`, the login works only for Instagram accounts that hold a
+role on the app.
+
+Outbound replies are text-only: no attachments, and no enforcement of Instagram's 24-hour
+customer-service window (Meta rejects a late reply and the operator is told why). See
+`docs/tech_debt.md`.
 
 ## Testing
 

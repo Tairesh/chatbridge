@@ -17,7 +17,7 @@ use chatbridge::config::{AppConfig, AppState};
 use chatbridge::model::ProviderKind;
 use chatbridge::registry::ClientRegistry;
 use chatbridge::routes;
-use common::{TestChannel, TestChat, TestClient, TestOperator};
+use common::{TestChannel, TestChannelKey, TestChat, TestClient, TestOperator};
 use tokio_util::sync::CancellationToken;
 
 const TEST_VERIFY_TOKEN: &str = "test_verify_token";
@@ -158,22 +158,39 @@ async fn setup_redis() -> redis::aio::ConnectionManager {
 
 const TEST_PUBLIC_BASE_URL: &str = "https://test.example.com";
 
-/// Port 1 is never listening and needs no DNS lookup, so any Telegram call made
+/// Port 1 is never listening and needs no DNS lookup, so any provider call made
 /// by a test that forgot to pass a mock fails instantly and locally instead of
-/// reaching out to the real Bot API. The test suite must make zero outbound
-/// requests. A test that needs Telegram calls `build_state_with(db, mock_url)`.
+/// reaching out to the real API. The test suite must make zero outbound requests.
 const NO_TELEGRAM: &str = "http://127.0.0.1:1";
+const NO_INSTAGRAM: &str = "http://127.0.0.1:1";
+const TEST_APP_ID: &str = "1234567890";
 
 async fn build_state(db: PgPool) -> Arc<AppState> {
-    build_state_with(db, NO_TELEGRAM.into()).await
+    build_state_full(db, NO_TELEGRAM.into(), NO_INSTAGRAM.into()).await
 }
 
+/// A test that needs Telegram.
 async fn build_state_with(db: PgPool, telegram_api_base: String) -> Arc<AppState> {
+    build_state_full(db, telegram_api_base, NO_INSTAGRAM.into()).await
+}
+
+/// A test that needs Instagram.
+async fn build_state_ig(db: PgPool, instagram_base: String) -> Arc<AppState> {
+    build_state_full(db, NO_TELEGRAM.into(), instagram_base).await
+}
+
+async fn build_state_full(
+    db: PgPool,
+    telegram_api_base: String,
+    instagram_base: String,
+) -> Arc<AppState> {
     let redis = setup_redis().await;
     Arc::new(AppState {
         config: AppConfig {
             instagram_verify_token: TEST_VERIFY_TOKEN.into(),
             instagram_app_secret: TEST_APP_SECRET.into(),
+            instagram_app_id: TEST_APP_ID.into(),
+            instagram: chatbridge::config::InstagramEndpoints::single(&instagram_base),
             redis_url: "redis://localhost:6379".into(),
             app_jwt_secret: TEST_JWT_SECRET.into(),
             public_base_url: TEST_PUBLIC_BASE_URL.into(),
@@ -1253,6 +1270,7 @@ async fn instagram_rejects_non_instagram_object() {
     fn test_provider() -> InstagramProvider {
         InstagramProvider::new(
             TEST_APP_SECRET,
+            NO_INSTAGRAM,
             Arc::new(ChannelCache::new()),
             Arc::new(ClientCache::new()),
         )
@@ -3210,6 +3228,581 @@ async fn request_json(
     (status, json)
 }
 
+async fn request_raw(
+    state: Arc<AppState>,
+    method: &str,
+    uri: &str,
+) -> (StatusCode, axum::http::HeaderMap, String) {
+    let app = routes::build(state);
+    let request = Request::builder()
+        .method(method)
+        .uri(uri)
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(request).await.unwrap();
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (
+        status,
+        headers,
+        String::from_utf8_lossy(&bytes).into_owned(),
+    )
+}
+
+/// Every request the mock saw: `(method, path, query)`.
+type Requests = Arc<std::sync::Mutex<Vec<(String, String, String)>>>;
+
+/// One server for all three Meta hosts. `responses` is keyed by the request path
+/// with its leading slash stripped, e.g. "me" or "me/subscribed_apps"; anything
+/// unlisted answers `{"success": true}`.
+///
+/// It **records** every request, because the permissive default is a trap: a test
+/// that only asserts on the database passes just as happily when the production
+/// code never made the call at all. Any test whose name claims a provider call
+/// happened has to assert against this log.
+async fn spawn_mock_instagram_recording(responses: serde_json::Value) -> (String, Requests) {
+    use axum::Router;
+    use axum::extract::Request as AxumRequest;
+    use axum::routing::any;
+
+    let responses = Arc::new(responses);
+    let seen: Requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorder = seen.clone();
+
+    let app = Router::new().fallback(any(move |req: AxumRequest| {
+        let responses = responses.clone();
+        let recorder = recorder.clone();
+        async move {
+            let path = req.uri().path().trim_start_matches('/').to_owned();
+            let query = req.uri().query().unwrap_or_default().to_owned();
+            recorder
+                .lock()
+                .unwrap()
+                .push((req.method().to_string(), path.clone(), query));
+            let body = responses
+                .get(path.as_str())
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({"success": true}));
+            axum::Json(body)
+        }
+    }));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}"), seen)
+}
+
+/// For tests that do not need the request log.
+async fn spawn_mock_instagram(responses: serde_json::Value) -> String {
+    spawn_mock_instagram_recording(responses).await.0
+}
+
+/// Did the mock see a subscribe carrying every field we mean to subscribe to?
+///
+/// reqwest percent-encodes the comma in a query value, so the expected list is
+/// matched on `%2C`.
+fn subscribed_all_fields(requests: &Requests) -> bool {
+    let wanted = "subscribed_fields=messages%2Cmessage_edit%2Cmessage_reactions%2Cmessaging_seen";
+    requests
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(method, path, query)| {
+            method == "POST" && path == "me/subscribed_apps" && query.contains(wanted)
+        })
+}
+
+fn saw(requests: &Requests, method: &str, path: &str) -> bool {
+    requests
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(m, p, _)| m == method && p == path)
+}
+
+/// A mock that walks the whole happy path: code → short → long → profile → subscribe.
+fn instagram_login_ok(user_id: &str, username: &str) -> serde_json::Value {
+    serde_json::json!({
+        "oauth/access_token": {"access_token": "short_lived", "user_id": user_id},
+        "access_token": {"access_token": "long_lived", "token_type": "bearer", "expires_in": 5_183_944},
+        "me": {"user_id": user_id, "username": username, "id": user_id},
+        "me/subscribed_apps": {"success": true},
+    })
+}
+
+/// Drive the callback the way the browser would, with a state this deployment signed.
+async fn oauth_callback(state: Arc<AppState>, channel_id: Option<Uuid>) -> (StatusCode, String) {
+    let token = chatbridge::oauth::sign_state(
+        TEST_JWT_SECRET.as_bytes(),
+        chatbridge::model::ProviderKind::Instagram,
+        channel_id,
+    );
+    let (status, _, body) = request_raw(
+        state,
+        "GET",
+        &format!("/api/oauth/instagram/callback?code=AQB123&state={token}"),
+    )
+    .await;
+    (status, body)
+}
+
+#[tokio::test]
+async fn oauth_providers_lists_instagram_with_its_redirect_uri() {
+    let pool = setup_pool().await;
+    let state = build_state(pool.clone()).await;
+
+    let (status, body) = request_json(state, "GET", "/api/oauth/providers", None).await;
+
+    assert_eq!(status, StatusCode::OK);
+    let list = body.as_array().unwrap();
+    assert_eq!(list.len(), 1, "only instagram has an OAuth login today");
+    assert_eq!(list[0]["provider"], "instagram");
+    assert_eq!(list[0]["label"], "Instagram");
+    assert_eq!(list[0]["start_path"], "/api/oauth/instagram/start");
+    // The panel shows this so it can be pasted into the Meta dashboard.
+    assert_eq!(
+        list[0]["redirect_uri"],
+        format!("{TEST_PUBLIC_BASE_URL}/api/oauth/instagram/callback")
+    );
+}
+
+#[tokio::test]
+async fn oauth_start_redirects_to_the_provider_with_a_signed_state() {
+    let pool = setup_pool().await;
+    let state = build_state_ig(pool.clone(), "http://mock.test".into()).await;
+
+    let (status, headers, _) = request_raw(state, "GET", "/api/oauth/instagram/start").await;
+
+    assert_eq!(status, StatusCode::TEMPORARY_REDIRECT);
+    let location = headers["location"].to_str().unwrap();
+    assert!(
+        location.starts_with("http://mock.test/oauth/authorize?"),
+        "{location}"
+    );
+    assert!(
+        location.contains(&format!("client_id={TEST_APP_ID}")),
+        "{location}"
+    );
+
+    // The state must verify against the app secret and carry no pinned channel.
+    let url = reqwest::Url::parse(location).unwrap();
+    let token = url
+        .query_pairs()
+        .find(|(k, _)| k == "state")
+        .map(|(_, v)| v.into_owned())
+        .expect("state parameter");
+    let claims = chatbridge::oauth::verify_state(
+        TEST_JWT_SECRET.as_bytes(),
+        &token,
+        chatbridge::model::ProviderKind::Instagram,
+    )
+    .unwrap();
+    assert_eq!(claims.ch, None);
+}
+
+#[tokio::test]
+async fn oauth_start_pins_the_channel_the_reconnect_button_came_from() {
+    let pool = setup_pool().await;
+    let state = build_state_ig(pool.clone(), "http://mock.test".into()).await;
+    let channel_id = Uuid::new_v4();
+
+    let (status, headers, _) = request_raw(
+        state,
+        "GET",
+        &format!("/api/oauth/instagram/start?channel_id={channel_id}"),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::TEMPORARY_REDIRECT);
+    let url = reqwest::Url::parse(headers["location"].to_str().unwrap()).unwrap();
+    let token = url
+        .query_pairs()
+        .find(|(k, _)| k == "state")
+        .map(|(_, v)| v.into_owned())
+        .unwrap();
+    let claims = chatbridge::oauth::verify_state(
+        TEST_JWT_SECRET.as_bytes(),
+        &token,
+        chatbridge::model::ProviderKind::Instagram,
+    )
+    .unwrap();
+    assert_eq!(claims.ch, Some(channel_id));
+}
+
+#[tokio::test]
+async fn oauth_start_is_404_for_a_provider_without_a_login() {
+    let pool = setup_pool().await;
+    let state = build_state(pool.clone()).await;
+
+    let (status, _, _) = request_raw(state.clone(), "GET", "/api/oauth/telegram/start").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let (status, _, _) = request_raw(state, "GET", "/api/oauth/nonsense/start").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn oauth_callback_creates_a_channel_and_subscribes_it() {
+    let pool = setup_pool().await;
+    let user_id = format!("ig_{}", Uuid::new_v4().simple());
+    let (api, requests) =
+        spawn_mock_instagram_recording(instagram_login_ok(&user_id, "yourbiz")).await;
+    let state = build_state_ig(pool.clone(), api).await;
+
+    // Taken before the first assertion: this test creates a real row, and a failing
+    // assertion below would otherwise leak it into the shared database — which is
+    // exactly what happened once while checking the subscribe assertion can fail.
+    let _key_guard = TestChannelKey::instagram(&user_id);
+
+    let (status, body) = oauth_callback(state, None).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the callback is a page, never a 4xx"
+    );
+    assert!(body.contains("\"ok\":true"), "{body}");
+    assert!(body.contains("\"created\":true"), "{body}");
+    // Without this the test passes with the entire subscribe call deleted, because
+    // the mock answers unlisted paths with {"success": true} and the row is written
+    // either way.
+    assert!(
+        subscribed_all_fields(&requests),
+        "no subscribe reached the provider: {:?}",
+        requests.lock().unwrap()
+    );
+
+    let row = sqlx::query_as::<_, (Uuid, String, String, serde_json::Value)>(
+        "SELECT id, name, external_key, config FROM channels
+         WHERE provider = 'instagram' AND external_key = $1",
+    )
+    .bind(&user_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let _guard = TestChannel { id: row.0 };
+
+    assert_eq!(
+        row.1, "@yourbiz",
+        "the name defaults to the account's handle"
+    );
+    assert_eq!(
+        row.3["access_token"], "long_lived",
+        "the short-lived token is never stored"
+    );
+    assert_eq!(row.3["username"], "yourbiz");
+    assert!(
+        row.3["token_expires_at"].is_string(),
+        "the 60-day expiry is recorded so the refresher can find it"
+    );
+}
+
+#[tokio::test]
+async fn oauth_callback_on_a_live_channel_replaces_the_token_and_keeps_the_name() {
+    let pool = setup_pool().await;
+    let user_id = format!("ig_{}", Uuid::new_v4().simple());
+    let guard = insert_test_channel(
+        &pool,
+        "instagram",
+        &user_id,
+        serde_json::json!({"access_token": "stale"}),
+    )
+    .await;
+    sqlx::query("UPDATE channels SET name = 'Support' WHERE id = $1")
+        .bind(guard.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let api = spawn_mock_instagram(instagram_login_ok(&user_id, "yourbiz")).await;
+    let state = build_state_ig(pool.clone(), api).await;
+
+    let (status, body) = oauth_callback(state, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("\"created\":false"), "{body}");
+
+    let (name, config) = sqlx::query_as::<_, (String, serde_json::Value)>(
+        "SELECT name, config FROM channels WHERE id = $1",
+    )
+    .bind(guard.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        name, "Support",
+        "a login must not undo an operator's rename"
+    );
+    assert_eq!(config["access_token"], "long_lived");
+}
+
+#[tokio::test]
+async fn oauth_callback_restores_a_deleted_channel() {
+    let pool = setup_pool().await;
+    let user_id = format!("ig_{}", Uuid::new_v4().simple());
+    let guard = insert_test_channel(
+        &pool,
+        "instagram",
+        &user_id,
+        serde_json::json!({"access_token": "stale"}),
+    )
+    .await;
+    sqlx::query("UPDATE channels SET deleted_at = now() WHERE id = $1")
+        .bind(guard.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let (api, requests) =
+        spawn_mock_instagram_recording(instagram_login_ok(&user_id, "yourbiz")).await;
+    let state = build_state_ig(pool.clone(), api).await;
+
+    let (status, body) = oauth_callback(state, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("\"restored\":true"), "{body}");
+    assert!(
+        subscribed_all_fields(&requests),
+        "a restored channel has to be subscribed again"
+    );
+
+    let deleted_at: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT deleted_at FROM channels WHERE id = $1")
+            .bind(guard.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(
+        deleted_at.is_none(),
+        "a login is an explicit 'I want this account'"
+    );
+}
+
+#[tokio::test]
+async fn oauth_callback_refuses_a_different_account_when_a_channel_is_pinned() {
+    let pool = setup_pool().await;
+    let ours = format!("ig_{}", Uuid::new_v4().simple());
+    let theirs = format!("ig_{}", Uuid::new_v4().simple());
+    let guard = insert_test_channel(
+        &pool,
+        "instagram",
+        &ours,
+        serde_json::json!({"access_token": "ours"}),
+    )
+    .await;
+
+    let api = spawn_mock_instagram(instagram_login_ok(&theirs, "someone_else")).await;
+    let state = build_state_ig(pool.clone(), api).await;
+    let _stranger = TestChannelKey::instagram(&theirs);
+
+    let (status, body) = oauth_callback(state, Some(guard.id)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("\"ok\":false"), "{body}");
+    assert!(
+        body.contains("someone_else"),
+        "the page names the account: {body}"
+    );
+
+    let config: serde_json::Value = sqlx::query_scalar("SELECT config FROM channels WHERE id = $1")
+        .bind(guard.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        config["access_token"], "ours",
+        "the pinned channel is untouched"
+    );
+
+    let stranger: i64 = sqlx::query_scalar("SELECT count(*) FROM channels WHERE external_key = $1")
+        .bind(&theirs)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        stranger, 0,
+        "and no channel is created for the other account"
+    );
+}
+
+#[tokio::test]
+async fn oauth_callback_rolls_back_a_new_channel_when_subscribing_fails() {
+    let pool = setup_pool().await;
+    let user_id = format!("ig_{}", Uuid::new_v4().simple());
+    let mut responses = instagram_login_ok(&user_id, "yourbiz");
+    // Every subscribe attempt fails, including the per-field probes.
+    responses["me/subscribed_apps"] = serde_json::json!({
+        "error": {"message": "Application does not have permission", "code": 10}
+    });
+    let api = spawn_mock_instagram(responses).await;
+    let state = build_state_ig(pool.clone(), api).await;
+
+    // If the rollback regresses, the assertion below fires *and* the row survives; the
+    // guard is what stops it from poisoning the shared database for every later test.
+    let _guard = TestChannelKey::instagram(&user_id);
+
+    let (status, body) = oauth_callback(state, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("\"ok\":false"), "{body}");
+
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM channels WHERE external_key = $1")
+        .bind(&user_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        rows, 0,
+        "a row that never worked must not occupy this account's identity forever"
+    );
+}
+
+#[tokio::test]
+async fn oauth_callback_keeps_an_existing_channel_when_subscribing_fails() {
+    let pool = setup_pool().await;
+    let user_id = format!("ig_{}", Uuid::new_v4().simple());
+    let guard = insert_test_channel(
+        &pool,
+        "instagram",
+        &user_id,
+        serde_json::json!({"access_token": "stale"}),
+    )
+    .await;
+
+    let mut responses = instagram_login_ok(&user_id, "yourbiz");
+    responses["me/subscribed_apps"] =
+        serde_json::json!({"error": {"message": "temporarily unavailable", "code": 2}});
+    let api = spawn_mock_instagram(responses).await;
+    let state = build_state_ig(pool.clone(), api).await;
+
+    let (status, body) = oauth_callback(state, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains("\"ok\":true"),
+        "the token is still an improvement: {body}"
+    );
+    assert!(body.contains("\"warning\""), "{body}");
+
+    let config: serde_json::Value = sqlx::query_scalar("SELECT config FROM channels WHERE id = $1")
+        .bind(guard.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(config["access_token"], "long_lived");
+}
+
+#[tokio::test]
+async fn oauth_callback_writes_nothing_for_a_tampered_state() {
+    let pool = setup_pool().await;
+    let user_id = format!("ig_{}", Uuid::new_v4().simple());
+    let api = spawn_mock_instagram(instagram_login_ok(&user_id, "yourbiz")).await;
+    let state = build_state_ig(pool.clone(), api).await;
+    let _guard = TestChannelKey::instagram(&user_id);
+
+    let (status, _, body) = request_raw(
+        state,
+        "GET",
+        "/api/oauth/instagram/callback?code=AQB123&state=not.a.jwt",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("\"ok\":false"), "{body}");
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM channels WHERE external_key = $1")
+        .bind(&user_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 0);
+}
+
+#[tokio::test]
+async fn oauth_callback_reports_a_cancelled_login_without_writing() {
+    let pool = setup_pool().await;
+    // No mock at all: a cancelled login must not reach the provider.
+    let state = build_state(pool.clone()).await;
+
+    let (status, _, body) = request_raw(
+        state,
+        "GET",
+        "/api/oauth/instagram/callback?error=access_denied&error_description=User+denied",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("\"ok\":false"), "{body}");
+    assert!(body.contains("User denied"), "{body}");
+}
+
+#[tokio::test]
+async fn oauth_callback_refuses_a_pinned_channel_that_no_longer_exists() {
+    let pool = setup_pool().await;
+    let user_id = format!("ig_{}", Uuid::new_v4().simple());
+    let api = spawn_mock_instagram(instagram_login_ok(&user_id, "yourbiz")).await;
+    let state = build_state_ig(pool.clone(), api).await;
+    let _guard = TestChannelKey::instagram(&user_id);
+
+    // Deleted between opening the popup and finishing the login.
+    let (status, body) = oauth_callback(state, Some(Uuid::new_v4())).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("\"ok\":false"), "{body}");
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM channels WHERE external_key = $1")
+        .bind(&user_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 0, "a pin that cannot be honoured writes nothing");
+}
+
+#[tokio::test]
+async fn oauth_callback_refuses_a_pinned_channel_of_another_provider() {
+    let pool = setup_pool().await;
+    let user_id = format!("ig_{}", Uuid::new_v4().simple());
+    let telegram = insert_test_telegram_channel(&pool, "s").await;
+    let api = spawn_mock_instagram(instagram_login_ok(&user_id, "yourbiz")).await;
+    let state = build_state_ig(pool.clone(), api).await;
+    let _guard = TestChannelKey::instagram(&user_id);
+
+    let (status, body) = oauth_callback(state, Some(telegram.id)).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("\"ok\":false"), "{body}");
+    assert!(
+        body.contains("telegram"),
+        "the page says what the channel is: {body}"
+    );
+}
+
+#[tokio::test]
+async fn oauth_callback_writes_nothing_when_the_code_exchange_fails() {
+    let pool = setup_pool().await;
+    let user_id = format!("ig_{}", Uuid::new_v4().simple());
+    let mut responses = instagram_login_ok(&user_id, "yourbiz");
+    responses["oauth/access_token"] = serde_json::json!({
+        "error": {"message": "This authorization code has been used.", "code": 100}
+    });
+    let api = spawn_mock_instagram(responses).await;
+    let state = build_state_ig(pool.clone(), api).await;
+    let _guard = TestChannelKey::instagram(&user_id);
+
+    let (status, body) = oauth_callback(state, None).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("\"ok\":false"), "{body}");
+    assert!(
+        body.contains("authorization code"),
+        "Meta's own message survives: {body}"
+    );
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM channels WHERE external_key = $1")
+        .bind(&user_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 0);
+}
+
 #[tokio::test]
 async fn post_channel_creates_a_widget_channel() {
     let pool = setup_pool().await;
@@ -3323,28 +3916,69 @@ async fn post_channel_on_a_deleted_identity_conflicts_with_channel_deleted() {
     );
 }
 
+/// `request_json` parses the body, and an `AppError` renders as plain text — so a 4xx
+/// comes back as `Null` and its message is lost. This keeps the text.
+async fn request_text(
+    state: Arc<AppState>,
+    method: &str,
+    uri: &str,
+    body: Option<serde_json::Value>,
+) -> (StatusCode, String) {
+    let app = routes::build(state);
+    let builder = Request::builder().method(method).uri(uri);
+    let request = match body {
+        Some(b) => builder
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&b).unwrap()))
+            .unwrap(),
+        None => builder.body(Body::empty()).unwrap(),
+    };
+    let resp = app.oneshot(request).await.unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, String::from_utf8_lossy(&bytes).into_owned())
+}
+
 #[tokio::test]
-async fn post_channel_creates_an_instagram_channel() {
+async fn post_instagram_channel_derives_its_identity_from_the_token() {
     let pool = setup_pool().await;
-    let user_id = format!("178414{}", Uuid::new_v4().as_u128() as u32);
-    let state = build_state(pool.clone()).await;
+    let user_id = format!("ig_{}", Uuid::new_v4().simple());
+    let (api, requests) = spawn_mock_instagram_recording(serde_json::json!({
+        "me": {"user_id": user_id, "username": "yourbiz"},
+        "me/subscribed_apps": {"success": true},
+    }))
+    .await;
+    let state = build_state_ig(pool.clone(), api).await;
 
     let (status, body) = post_json(
         state,
         "/api/channels",
-        serde_json::json!({
-            "provider": "instagram", "user_id": user_id, "access_token": "IGQ_token"
-        }),
+        serde_json::json!({"provider": "instagram", "access_token": "IGQ_token"}),
     )
     .await;
 
     assert_eq!(status, StatusCode::CREATED);
-    let _guard = TestChannel {
-        id: body["id"].as_str().unwrap().parse().unwrap(),
-    };
-    assert_eq!(body["provider"], "instagram");
+    // The whole point of the manual path is that it produces a working channel rather
+    // than a silent one, so the subscribe is the assertion that matters.
+    assert!(
+        subscribed_all_fields(&requests),
+        "the manual path must subscribe too"
+    );
+
+    let id: Uuid = body["id"].as_str().unwrap().parse().unwrap();
+    let _guard = TestChannel { id };
+
+    // The operator types only the token; /me is the authority on who it belongs to.
     assert_eq!(body["external_key"], user_id);
+    assert_eq!(body["name"], "@yourbiz");
     assert_eq!(body["config"]["access_token"], "IGQ_token");
+    assert_eq!(body["config"]["username"], "yourbiz");
+    assert!(
+        body["config"]["token_expires_at"].is_null(),
+        "a pasted token has no known expiry; the refresher fills it in"
+    );
     assert_eq!(
         body["endpoint"],
         "https://test.example.com/webhook/instagram"
@@ -3352,18 +3986,615 @@ async fn post_channel_creates_an_instagram_channel() {
 }
 
 #[tokio::test]
-async fn post_channel_rejects_an_empty_instagram_token() {
+async fn post_instagram_channel_rejects_an_empty_token() {
     let pool = setup_pool().await;
-    let state = build_state(pool).await;
+    // No mock: validation must fail before any network call.
+    let state = build_state(pool.clone()).await;
 
-    let (status, _) = post_json(
+    let (status, body) = request_text(
         state,
+        "POST",
         "/api/channels",
-        serde_json::json!({"provider": "instagram", "user_id": "17841", "access_token": "  "}),
+        Some(serde_json::json!({"provider": "instagram", "access_token": "  "})),
     )
     .await;
 
     assert_eq!(status, StatusCode::BAD_REQUEST);
+    // Asserting the status alone proves nothing: with the guard removed, `fetch_profile`
+    // hits the unreachable default base, and that failure is also mapped to a 400.
+    assert!(body.contains("must not be empty"), "{body}");
+}
+
+#[tokio::test]
+async fn post_instagram_channel_rolls_back_when_subscribing_fails() {
+    let pool = setup_pool().await;
+    let user_id = format!("ig_{}", Uuid::new_v4().simple());
+    let api = spawn_mock_instagram(serde_json::json!({
+        "me": {"user_id": user_id, "username": "yourbiz"},
+        "me/subscribed_apps": {"error": {"message": "no permission", "code": 10}},
+    }))
+    .await;
+    let state = build_state_ig(pool.clone(), api).await;
+    let _guard = TestChannelKey::instagram(&user_id);
+
+    let (status, _) = post_json(
+        state,
+        "/api/channels",
+        serde_json::json!({"provider": "instagram", "access_token": "IGQ_token"}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM channels WHERE external_key = $1")
+        .bind(&user_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        rows, 0,
+        "the manual path must not leave a silent channel behind"
+    );
+}
+
+#[tokio::test]
+async fn patch_instagram_channel_drops_the_stale_expiry() {
+    let pool = setup_pool().await;
+    let user_id = format!("ig_{}", Uuid::new_v4().simple());
+    let guard = insert_test_channel(
+        &pool,
+        "instagram",
+        &user_id,
+        serde_json::json!({
+            "access_token": "old",
+            "token_expires_at": "2026-10-19T09:00:00Z",
+            "username": "yourbiz"
+        }),
+    )
+    .await;
+    let (api, requests) = spawn_mock_instagram_recording(serde_json::json!({
+        "me": {"user_id": user_id, "username": "yourbiz"},
+        "me/subscribed_apps": {"success": true},
+    }))
+    .await;
+    let state = build_state_ig(pool.clone(), api).await;
+
+    let (status, body) = request_json(
+        state,
+        "PATCH",
+        &format!("/api/channels/{}", guard.id),
+        Some(serde_json::json!({
+            "spec": {"provider": "instagram", "access_token": "new"}
+        })),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["config"]["access_token"], "new");
+    assert!(
+        body["config"]["token_expires_at"].is_null(),
+        "the old expiry described the token that was just replaced"
+    );
+    assert_eq!(body["config"]["username"], "yourbiz");
+    assert!(
+        subscribed_all_fields(&requests),
+        "a new token has to be armed, or the whole Rearm branch could be deleted unnoticed"
+    );
+}
+
+#[tokio::test]
+async fn patch_instagram_channel_refuses_a_token_from_another_account() {
+    let pool = setup_pool().await;
+    let ours = format!("ig_{}", Uuid::new_v4().simple());
+    let theirs = format!("ig_{}", Uuid::new_v4().simple());
+    let guard = insert_test_channel(
+        &pool,
+        "instagram",
+        &ours,
+        serde_json::json!({"access_token": "ours"}),
+    )
+    .await;
+    let api = spawn_mock_instagram(serde_json::json!({
+        "me": {"user_id": theirs, "username": "someone_else"},
+    }))
+    .await;
+    let state = build_state_ig(pool.clone(), api).await;
+
+    let (status, _) = request_json(
+        state,
+        "PATCH",
+        &format!("/api/channels/{}", guard.id),
+        Some(serde_json::json!({
+            "spec": {"provider": "instagram", "access_token": "theirs"}
+        })),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let config: serde_json::Value = sqlx::query_scalar("SELECT config FROM channels WHERE id = $1")
+        .bind(guard.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(config["access_token"], "ours");
+}
+
+#[tokio::test]
+async fn delete_instagram_channel_unsubscribes() {
+    let pool = setup_pool().await;
+    let user_id = format!("ig_{}", Uuid::new_v4().simple());
+    let guard = insert_test_channel(
+        &pool,
+        "instagram",
+        &user_id,
+        serde_json::json!({"access_token": "tok"}),
+    )
+    .await;
+    let (api, requests) = spawn_mock_instagram_recording(serde_json::json!({})).await;
+    let state = build_state_ig(pool.clone(), api).await;
+
+    let (status, _, _) = request_raw(state, "DELETE", &format!("/api/channels/{}", guard.id)).await;
+
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    // Unsubscribing is best effort, so a failure is invisible from the outside — the
+    // request log is the only way to tell "it failed" from "it never happened".
+    assert!(
+        saw(&requests, "DELETE", "me/subscribed_apps"),
+        "the account has to be unsubscribed: {:?}",
+        requests.lock().unwrap()
+    );
+}
+
+#[tokio::test]
+async fn delete_instagram_channel_survives_a_failing_unsubscribe() {
+    let pool = setup_pool().await;
+    let user_id = format!("ig_{}", Uuid::new_v4().simple());
+    let guard = insert_test_channel(
+        &pool,
+        "instagram",
+        &user_id,
+        serde_json::json!({"access_token": "revoked"}),
+    )
+    .await;
+    let api = spawn_mock_instagram(serde_json::json!({
+        "me/subscribed_apps": {"error": {"message": "Invalid OAuth access token.", "code": 190}},
+    }))
+    .await;
+    let state = build_state_ig(pool.clone(), api).await;
+
+    let (status, _, _) = request_raw(state, "DELETE", &format!("/api/channels/{}", guard.id)).await;
+
+    // A channel whose token was revoked must stay deletable.
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let deleted_at: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT deleted_at FROM channels WHERE id = $1")
+            .bind(guard.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(deleted_at.is_some());
+}
+
+#[tokio::test]
+async fn patch_does_not_subscribe_a_channel_that_stays_deleted() {
+    let pool = setup_pool().await;
+    let user_id = format!("ig_{}", Uuid::new_v4().simple());
+    let guard = insert_test_channel(
+        &pool,
+        "instagram",
+        &user_id,
+        serde_json::json!({"access_token": "old"}),
+    )
+    .await;
+    sqlx::query("UPDATE channels SET deleted_at = now() WHERE id = $1")
+        .bind(guard.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (api, requests) = spawn_mock_instagram_recording(serde_json::json!({
+        "me": {"user_id": user_id, "username": "yourbiz"},
+    }))
+    .await;
+    let state = build_state_ig(pool.clone(), api).await;
+
+    // Editing a deleted channel's token is allowed; subscribing it is not. Meta would
+    // start delivering events for a channel the app rejects, and report the failures
+    // against something the operator believes is gone.
+    let (status, _) = request_json(
+        state,
+        "PATCH",
+        &format!("/api/channels/{}", guard.id),
+        Some(serde_json::json!({
+            "spec": {"provider": "instagram", "access_token": "new"}
+        })),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !saw(&requests, "POST", "me/subscribed_apps"),
+        "a channel that stays deleted must not be armed"
+    );
+}
+
+#[tokio::test]
+async fn restore_instagram_channel_resubscribes() {
+    let pool = setup_pool().await;
+    let user_id = format!("ig_{}", Uuid::new_v4().simple());
+    let guard = insert_test_channel(
+        &pool,
+        "instagram",
+        &user_id,
+        serde_json::json!({"access_token": "tok"}),
+    )
+    .await;
+    sqlx::query("UPDATE channels SET deleted_at = now() WHERE id = $1")
+        .bind(guard.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // Subscribing fails, so a restore that forgot to re-subscribe would pass this
+    // test silently; the 502 is what proves the call happened.
+    let api = spawn_mock_instagram(serde_json::json!({
+        "me/subscribed_apps": {"error": {"message": "nope", "code": 10}},
+    }))
+    .await;
+    let state = build_state_ig(pool.clone(), api).await;
+
+    let (status, _) = request_json(
+        state,
+        "PATCH",
+        &format!("/api/channels/{}", guard.id),
+        Some(serde_json::json!({"restore": true})),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    let deleted_at: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT deleted_at FROM channels WHERE id = $1")
+            .bind(guard.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(
+        deleted_at.is_none(),
+        "the row is already committed; only the subscription failed"
+    );
+}
+
+#[tokio::test]
+async fn a_first_instagram_message_from_a_new_sender_creates_a_chat() {
+    // The first message of a conversation is the only one that decides whether the
+    // conversation appears in the inbox at all. Client resolution used to insert the
+    // client row in a spawned task, so `persist_and_publish` found no client, left
+    // `sender_id` NULL and created no chat — every new customer's opening message was
+    // orphaned, and the second one silently repaired it.
+    let pool = setup_pool().await;
+    let user_id = format!("ig_{}", Uuid::new_v4().simple());
+    let sender = format!("igsid_{}", Uuid::new_v4().simple());
+    let channel = insert_test_channel(
+        &pool,
+        "instagram",
+        &user_id,
+        serde_json::json!({"access_token": "tok"}),
+    )
+    .await;
+    // No profile endpoint: the lookup is allowed to fail, the chat must appear anyway.
+    let api = spawn_mock_instagram(serde_json::json!({})).await;
+    let state = build_state_ig(pool.clone(), api).await;
+
+    let body = serde_json::json!({
+        "object": "instagram",
+        "entry": [{
+            "id": user_id,
+            "time": 1_787_416_334_529i64,
+            "messaging": [{
+                "sender": {"id": sender},
+                "recipient": {"id": user_id},
+                "timestamp": 1_787_416_333_085i64,
+                "message": {"mid": format!("mid_{}", Uuid::new_v4().simple()), "text": "first ever"}
+            }]
+        }]
+    });
+    let raw = serde_json::to_vec(&body).unwrap();
+    let signature = sign_body(TEST_APP_SECRET, &raw);
+
+    let app = routes::build(state);
+    let request = Request::builder()
+        .method("POST")
+        .uri("/webhook/instagram")
+        .header("content-type", "application/json")
+        .header("X-Hub-Signature-256", format!("sha256={signature}"))
+        .body(Body::from(raw))
+        .unwrap();
+    let resp = app.oneshot(request).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Ingestion is spawned, so poll rather than sleep a fixed amount.
+    let mut chat: Option<Uuid> = None;
+    for _ in 0..40 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        chat = sqlx::query_scalar("SELECT chat_id FROM messages WHERE channel_id = $1")
+            .bind(channel.id)
+            .fetch_optional(&pool)
+            .await
+            .unwrap()
+            .flatten();
+        if chat.is_some() {
+            break;
+        }
+    }
+
+    let client_id: Option<Uuid> =
+        sqlx::query_scalar("SELECT sender_id FROM messages WHERE channel_id = $1")
+            .bind(channel.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let _client_guard = client_id.map(|id| TestClient { id });
+
+    assert!(
+        client_id.is_some(),
+        "the message must carry its sender, not NULL"
+    );
+    assert!(
+        chat.is_some(),
+        "the first message from a new sender has to create a chat"
+    );
+}
+
+#[tokio::test]
+async fn an_operator_reply_reaches_instagram() {
+    use std::time::Duration;
+
+    let pool = setup_pool().await;
+    let user_id = format!("ig_{}", Uuid::new_v4().simple());
+    let igsid = format!("igsid_{}", Uuid::new_v4().simple());
+    let channel = insert_test_channel(
+        &pool,
+        "instagram",
+        &user_id,
+        serde_json::json!({"access_token": "tok"}),
+    )
+    .await;
+    let (api, requests) = spawn_mock_instagram_recording(serde_json::json!({
+        "me/messages": {"message_id": "mid_out", "recipient_id": igsid},
+    }))
+    .await;
+    let state = build_state_ig(pool.clone(), api).await;
+    let addr = spawn_app(state).await;
+
+    let (mut op_ws, _operator_id, _op_guard) = operator_ws_connect(addr).await;
+
+    // An inbound message first: it is what creates the client and the chat, and the
+    // client's external_id is the IGSID the reply has to be addressed to.
+    let body = serde_json::json!({
+        "object": "instagram",
+        "entry": [{
+            "id": user_id,
+            "time": 1_787_416_334_529i64,
+            "messaging": [{
+                "sender": {"id": igsid},
+                "recipient": {"id": user_id},
+                "message": {"mid": format!("in_{}", Uuid::new_v4().simple()), "text": "customer asks"}
+            }]
+        }]
+    });
+    let raw = serde_json::to_vec(&body).unwrap();
+    let signature = sign_body(TEST_APP_SECRET, &raw);
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{addr}/webhook/instagram"))
+        .header("content-type", "application/json")
+        .header("X-Hub-Signature-256", format!("sha256={signature}"))
+        .body(raw)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // Wait for the chat, then reply into it.
+    let deadline = Duration::from_secs(5);
+    let start = std::time::Instant::now();
+    let chat_id;
+    loop {
+        let remaining = deadline.saturating_sub(start.elapsed());
+        let event = tokio::time::timeout(remaining, wait_for_ws_msg(&mut op_ws))
+            .await
+            .expect("timed out waiting for the inbound message");
+        if event["channel_id"] == channel.id.to_string() && event["type"] == "message" {
+            chat_id = event["chat_id"].as_str().unwrap().to_string();
+            break;
+        }
+    }
+
+    let reply = serde_json::json!({
+        "action": "send",
+        "chat_id": chat_id,
+        "mid": Uuid::new_v4().to_string(),
+        "text": "operator answers"
+    });
+    op_ws
+        .send(tungstenite::Message::Text(
+            serde_json::to_string(&reply).unwrap().into(),
+        ))
+        .await
+        .unwrap();
+
+    // Delivery is spawned after the Ack, so poll the mock's request log.
+    let mut sent = false;
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if saw(&requests, "POST", "me/messages") {
+            sent = true;
+            break;
+        }
+    }
+    assert!(
+        sent,
+        "the operator's reply never reached Instagram: {:?}",
+        requests.lock().unwrap()
+    );
+
+    // Meta's own id has to replace the local one, or every read receipt for this
+    // reply resolves to nothing: `mark_messages_read` anchors on
+    // (channel_id, external_message_id) and the receipt carries Meta's id.
+    let mut external_id = String::new();
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        external_id = sqlx::query_scalar(
+            "SELECT external_message_id FROM messages
+             WHERE channel_id = $1 AND sender_type = 'operator'",
+        )
+        .bind(channel.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        if external_id.starts_with("instagram:") {
+            break;
+        }
+    }
+    assert_eq!(
+        external_id, "instagram:mid_out",
+        "the outbound row must adopt the id Meta returned"
+    );
+}
+
+/// Load a channel and its parsed config so a test can drive one refresh directly.
+async fn channel_for_refresh(
+    pool: &PgPool,
+    id: Uuid,
+) -> (chatbridge::db::Channel, chatbridge::model::InstagramConfig) {
+    let channel = chatbridge::db::find_live_channel_by_id(pool, id)
+        .await
+        .unwrap()
+        .unwrap();
+    let config = serde_json::from_value(channel.config.clone()).unwrap();
+    (channel, config)
+}
+
+#[tokio::test]
+async fn the_refresher_replaces_an_expiring_token() {
+    let pool = setup_pool().await;
+    let user_id = format!("ig_{}", Uuid::new_v4().simple());
+    let guard = insert_test_channel(
+        &pool,
+        "instagram",
+        &user_id,
+        serde_json::json!({
+            "access_token": "about_to_die",
+            "token_expires_at": (chrono::Utc::now() + chrono::TimeDelta::days(2)).to_rfc3339(),
+            "username": "yourbiz"
+        }),
+    )
+    .await;
+    let api = spawn_mock_instagram(serde_json::json!({
+        "refresh_access_token": {
+            "access_token": "fresh", "token_type": "bearer", "expires_in": 5_183_944
+        },
+    }))
+    .await;
+    let state = build_state_ig(pool.clone(), api).await;
+
+    // `refresh_channel`, not `refresh_due_tokens`: the pass walks every live Instagram
+    // channel in the shared database and would rewrite rows that other tests are
+    // asserting on, failing them at random depending on scheduling.
+    let (channel, config) = channel_for_refresh(&pool, guard.id).await;
+    chatbridge::refresh::refresh_channel(&state, &channel, &config)
+        .await
+        .unwrap();
+
+    let config: serde_json::Value = sqlx::query_scalar("SELECT config FROM channels WHERE id = $1")
+        .bind(guard.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(config["access_token"], "fresh");
+    assert_eq!(
+        config["username"], "yourbiz",
+        "the handle survives a refresh"
+    );
+    let expires_at = config["token_expires_at"].as_str().unwrap();
+    let parsed = chrono::DateTime::parse_from_rfc3339(expires_at).unwrap();
+    assert!(
+        parsed > chrono::Utc::now() + chrono::TimeDelta::days(50),
+        "the new expiry should be ~60 days out, got {expires_at}"
+    );
+}
+
+#[tokio::test]
+async fn the_refresher_fills_in_a_missing_expiry() {
+    let pool = setup_pool().await;
+    let user_id = format!("ig_{}", Uuid::new_v4().simple());
+    let guard = insert_test_channel(
+        &pool,
+        "instagram",
+        &user_id,
+        serde_json::json!({"access_token": "pasted_by_hand"}),
+    )
+    .await;
+    let api = spawn_mock_instagram(serde_json::json!({
+        "refresh_access_token": {
+            "access_token": "fresh", "token_type": "bearer", "expires_in": 5_183_944
+        },
+    }))
+    .await;
+    let state = build_state_ig(pool.clone(), api).await;
+
+    let (channel, config) = channel_for_refresh(&pool, guard.id).await;
+    assert!(
+        chatbridge::refresh::is_due(&config, chrono::Utc::now()),
+        "an unknown expiry has to be due, or a hand-pasted token never acquires one"
+    );
+    chatbridge::refresh::refresh_channel(&state, &channel, &config)
+        .await
+        .unwrap();
+
+    let config: serde_json::Value = sqlx::query_scalar("SELECT config FROM channels WHERE id = $1")
+        .bind(guard.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(
+        config["token_expires_at"].is_string(),
+        "a hand-pasted token acquires a real expiry on the first pass"
+    );
+}
+
+#[tokio::test]
+async fn a_rejected_refresh_leaves_the_stored_token_alone() {
+    let pool = setup_pool().await;
+    let user_id = format!("ig_{}", Uuid::new_v4().simple());
+    let guard = insert_test_channel(
+        &pool,
+        "instagram",
+        &user_id,
+        serde_json::json!({"access_token": "already_expired"}),
+    )
+    .await;
+    let api = spawn_mock_instagram(serde_json::json!({
+        "refresh_access_token": {
+            "error": {"message": "Error validating access token", "code": 190}
+        },
+    }))
+    .await;
+    let state = build_state_ig(pool.clone(), api).await;
+
+    let (channel, config) = channel_for_refresh(&pool, guard.id).await;
+    let err = chatbridge::refresh::refresh_channel(&state, &channel, &config)
+        .await
+        .unwrap_err();
+    assert!(err.contains("Error validating access token"), "{err}");
+
+    let config: serde_json::Value = sqlx::query_scalar("SELECT config FROM channels WHERE id = $1")
+        .bind(guard.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        config["access_token"], "already_expired",
+        "a failed refresh must not overwrite the stored token"
+    );
 }
 
 /// Spawn a fake Bot API that answers `/bot<token>/<method>` from `responses`,
@@ -3886,37 +5117,6 @@ async fn patch_channel_does_not_arm_the_webhook_of_a_channel_that_stays_deleted(
 }
 
 #[tokio::test]
-async fn patch_channel_preserves_instagram_refresh_time() {
-    let pool = setup_pool().await;
-    let user_id = format!("178414{}", Uuid::new_v4().as_u128() as u32);
-    let guard = insert_test_channel(
-        &pool,
-        "instagram",
-        &user_id,
-        serde_json::json!({"access_token": "old", "refresh_time": "2026-03-14T00:00:00+00:00"}),
-    )
-    .await;
-    let state = build_state(pool.clone()).await;
-
-    let (status, body) = request_json(
-        state,
-        "PATCH",
-        &format!("/api/channels/{}", guard.id),
-        Some(serde_json::json!({
-            "spec": {"provider": "instagram", "user_id": user_id, "access_token": "new"}
-        })),
-    )
-    .await;
-
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["config"]["access_token"], "new");
-    assert_eq!(
-        body["config"]["refresh_time"], "2026-03-14T00:00:00+00:00",
-        "a field the form never shows must survive a Save"
-    );
-}
-
-#[tokio::test]
 async fn delete_channel_soft_deletes_and_is_idempotent() {
     let pool = setup_pool().await;
     let widget_id = format!("api_{}", Uuid::new_v4());
@@ -4059,7 +5259,7 @@ async fn list_active_chats_excludes_chats_of_a_deleted_channel() {
 }
 
 #[tokio::test]
-async fn get_webhook_status_reports_a_match() {
+async fn connection_status_reports_a_registered_telegram_webhook() {
     let pool = setup_pool().await;
     let bot_id = (Uuid::new_v4().as_u128() as u32) as i64;
     let guard = insert_test_channel(
@@ -4081,20 +5281,24 @@ async fn get_webhook_status_reports_a_match() {
     let (status, body) = request_json(
         state,
         "GET",
-        &format!("/api/channels/{}/webhook", guard.id),
+        &format!("/api/channels/{}/connection", guard.id),
         None,
     )
     .await;
 
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["matches"], true);
-    assert_eq!(body["registered_url"], expected);
-    assert_eq!(body["expected_url"], expected);
-    assert_eq!(body["last_error_message"], serde_json::Value::Null);
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["details"]["registered_url"], expected);
+    assert_eq!(body["details"]["expected_url"], expected);
+    assert_eq!(
+        body["details"]["last_error_message"],
+        serde_json::Value::Null
+    );
+    assert!(body["summary"].as_str().unwrap().contains("registered at"));
 }
 
 #[tokio::test]
-async fn get_webhook_status_reports_a_hijacked_webhook_and_delivery_errors() {
+async fn connection_status_reports_a_hijacked_telegram_webhook() {
     let pool = setup_pool().await;
     let bot_id = (Uuid::new_v4().as_u128() as u32) as i64;
     let guard = insert_test_channel(
@@ -4118,19 +5322,24 @@ async fn get_webhook_status_reports_a_hijacked_webhook_and_delivery_errors() {
     let (status, body) = request_json(
         state,
         "GET",
-        &format!("/api/channels/{}/webhook", guard.id),
+        &format!("/api/channels/{}/connection", guard.id),
         None,
     )
     .await;
 
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["matches"], false);
-    assert_eq!(body["pending_update_count"], 12);
-    assert!(body["last_error_message"].as_str().unwrap().contains("404"));
+    assert_eq!(body["ok"], false);
+    assert_eq!(body["details"]["pending_update_count"], 12);
+    assert!(
+        body["details"]["last_error_message"]
+            .as_str()
+            .unwrap()
+            .contains("404")
+    );
 }
 
 #[tokio::test]
-async fn post_webhook_reregisters_and_returns_the_fresh_status() {
+async fn connection_register_reregisters_a_telegram_webhook() {
     let pool = setup_pool().await;
     let bot_id = (Uuid::new_v4().as_u128() as u32) as i64;
     let guard = insert_test_channel(
@@ -4153,23 +5362,21 @@ async fn post_webhook_reregisters_and_returns_the_fresh_status() {
     let (status, body) = request_json(
         state,
         "POST",
-        &format!("/api/channels/{}/webhook", guard.id),
+        &format!("/api/channels/{}/connection", guard.id),
         None,
     )
     .await;
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
-        body["matches"], true,
+        body["ok"], true,
         "re-register then report in one round trip"
     );
 }
 
 #[tokio::test]
-async fn webhook_status_rejects_non_telegram_and_deleted_channels() {
+async fn connection_status_is_404_for_a_deleted_channel() {
     let pool = setup_pool().await;
-    let widget_id = format!("api_{}", Uuid::new_v4());
-    let widget = insert_test_widget_channel(&pool, &widget_id).await;
     let deleted = insert_test_telegram_channel(&pool, "s").await;
     chatbridge::db::soft_delete_channel(&pool, deleted.id)
         .await
@@ -4177,28 +5384,123 @@ async fn webhook_status_rejects_non_telegram_and_deleted_channels() {
     let state = build_state(pool.clone()).await;
 
     let (status, _) = request_json(
-        state.clone(),
-        "GET",
-        &format!("/api/channels/{}/webhook", widget.id),
-        None,
-    )
-    .await;
-    assert_eq!(
-        status,
-        StatusCode::BAD_REQUEST,
-        "only telegram has a webhook"
-    );
-
-    let (status, _) = request_json(
         state,
         "GET",
-        &format!("/api/channels/{}/webhook", deleted.id),
+        &format!("/api/channels/{}/connection", deleted.id),
         None,
     )
     .await;
     assert_eq!(
         status,
         StatusCode::NOT_FOUND,
-        "a deleted channel has no webhook to manage; restore it instead"
+        "a deleted channel has nothing to manage; restore it instead"
     );
+}
+
+#[tokio::test]
+async fn connection_status_for_a_widget_channel_is_ok_and_says_why() {
+    let pool = setup_pool().await;
+    let widget_id = format!("api_{}", Uuid::new_v4());
+    let widget = insert_test_widget_channel(&pool, &widget_id).await;
+    let state = build_state(pool.clone()).await;
+
+    let (status, body) = request_json(
+        state.clone(),
+        "GET",
+        &format!("/api/channels/{}/connection", widget.id),
+        None,
+    )
+    .await;
+
+    // Not a 400: the endpoint tells the truth rather than refusing. The panel simply
+    // does not show the button for widgets.
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["ok"], true);
+    assert!(
+        body["summary"]
+            .as_str()
+            .unwrap()
+            .contains("register nothing")
+    );
+
+    // POST is a no-op rather than a 400, so the panel never has to special-case it.
+    let (status, body) = request_json(
+        state,
+        "POST",
+        &format!("/api/channels/{}/connection", widget.id),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["ok"], true);
+}
+
+#[tokio::test]
+async fn connection_status_reports_an_instagram_subscription_and_expiry() {
+    let pool = setup_pool().await;
+    let user_id = format!("ig_{}", Uuid::new_v4().simple());
+    let expires_at = chrono::Utc::now() + chrono::TimeDelta::days(58);
+    let guard = insert_test_channel(
+        &pool,
+        "instagram",
+        &user_id,
+        serde_json::json!({
+            "access_token": "tok",
+            "token_expires_at": expires_at.to_rfc3339(),
+        }),
+    )
+    .await;
+    let api = spawn_mock_instagram(serde_json::json!({
+        "me/subscribed_apps": {"data": [
+            {"subscribed_fields": ["messages", "message_edit"]}
+        ]},
+    }))
+    .await;
+    let state = build_state_ig(pool.clone(), api).await;
+
+    let (status, body) = request_json(
+        state,
+        "GET",
+        &format!("/api/channels/{}/connection", guard.id),
+        None,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["details"]["subscribed_fields"][0], "messages");
+    // num_days truncates, so 58 days minus a few microseconds reads as 57.
+    assert_eq!(body["details"]["expires_in_days"], 57);
+    let summary = body["summary"].as_str().unwrap();
+    assert!(summary.contains("messages, message_edit"), "{summary}");
+}
+
+#[tokio::test]
+async fn connection_status_is_not_ok_when_instagram_has_no_subscription() {
+    let pool = setup_pool().await;
+    let user_id = format!("ig_{}", Uuid::new_v4().simple());
+    let guard = insert_test_channel(
+        &pool,
+        "instagram",
+        &user_id,
+        serde_json::json!({"access_token": "tok"}),
+    )
+    .await;
+    let api = spawn_mock_instagram(serde_json::json!({
+        "me/subscribed_apps": {"data": []},
+    }))
+    .await;
+    let state = build_state_ig(pool.clone(), api).await;
+
+    let (status, body) = request_json(
+        state,
+        "GET",
+        &format!("/api/channels/{}/connection", guard.id),
+        None,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["ok"], false, "no subscription means no events arrive");
+    assert!(body["summary"].as_str().unwrap().contains("Not subscribed"));
 }

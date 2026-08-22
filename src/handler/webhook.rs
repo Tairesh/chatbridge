@@ -34,9 +34,7 @@ pub async fn meta_verify(
         tracing::info!("webhook verified, returning challenge");
         Ok(params.hub_challenge)
     } else {
-        Err(AppError::Forbidden(
-            "invalid verify token or mode".into(),
-        ))
+        Err(AppError::Forbidden("invalid verify token or mode".into()))
     }
 }
 
@@ -47,6 +45,7 @@ pub async fn instagram_ingest(
 ) -> StatusCode {
     let provider = InstagramProvider::new(
         &state.config.instagram_app_secret,
+        &state.config.instagram.graph,
         state.cache.clone(),
         state.client_cache.clone(),
     );
@@ -60,6 +59,9 @@ pub async fn instagram_ingest(
     let body = body.to_vec();
     tokio::spawn(
         async move {
+            // The raw payload is the only ground truth when Meta sends a shape we
+            // do not handle. At `debug` because it contains message text.
+            tracing::debug!(payload = %String::from_utf8_lossy(&body), "instagram webhook body");
             match provider.parse(&body, &state.db, state.redis.clone()).await {
                 Ok(messages) => {
                     let mut redis = state.redis.clone();

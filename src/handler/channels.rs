@@ -98,9 +98,7 @@ impl ChannelView {
 
 /// Every channel, live ones first. Deleted channels are included so the panel
 /// can show them dimmed with a Restore button rather than lying about the database.
-pub async fn list(
-    State(state): State<Arc<AppState>>,
-) -> Result<Json<Vec<ChannelView>>, AppError> {
+pub async fn list(State(state): State<Arc<AppState>>) -> Result<Json<Vec<ChannelView>>, AppError> {
     let channels = db::list_channels(&state.db).await?;
     let base = &state.config.public_base_url;
     Ok(Json(
@@ -157,7 +155,7 @@ async fn insert_or_conflict(
     external_key: &str,
     config: &serde_json::Value,
 ) -> Result<Channel, AppError> {
-    match db::insert_channel(db, id, provider.clone(), name, external_key, config).await {
+    match db::insert_channel(db, id, provider, name, external_key, config).await {
         Ok(channel) => Ok(channel),
         Err(sqlx::Error::Database(ref e)) if e.is_unique_violation() => {
             Err(conflict(db, provider, external_key).await)
@@ -167,7 +165,7 @@ async fn insert_or_conflict(
 }
 
 /// Evict the channel from this replica's cache and tell the others to do the same.
-async fn invalidate_everywhere(state: &AppState, channel_id: Uuid) {
+pub(crate) async fn invalidate_everywhere(state: &AppState, channel_id: Uuid) {
     state.cache.invalidate(channel_id);
     let mut redis = state.redis.clone();
     crate::cache::publish_invalidation(&mut redis, "channel", channel_id).await;
@@ -191,25 +189,8 @@ pub async fn create(
             )
             .await?
         }
-        ChannelSpec::Instagram {
-            user_id,
-            access_token,
-        } => {
-            if user_id.trim().is_empty() || access_token.trim().is_empty() {
-                return Err(AppError::BadRequest(
-                    "user_id and access_token must not be empty".into(),
-                ));
-            }
-            let name = body.name.unwrap_or_else(|| format!("instagram:{user_id}"));
-            insert_or_conflict(
-                &state.db,
-                Uuid::new_v4(),
-                ProviderKind::Instagram,
-                &name,
-                &user_id,
-                &serde_json::json!({"access_token": access_token}),
-            )
-            .await?
+        ChannelSpec::Instagram { access_token } => {
+            create_instagram(&state, body.name, access_token).await?
         }
         ChannelSpec::Telegram { bot_token } => {
             create_telegram(&state, body.name, bot_token).await?
@@ -288,8 +269,72 @@ async fn create_telegram(
                  with no webhook — re-register it from the settings panel."
             );
         }
+        return Err(AppError::BadGateway(format!("setWebhook failed: {reason}")));
+    }
+
+    Ok(channel)
+}
+
+/// Create an Instagram channel from a hand-pasted token.
+///
+/// The fallback for what the OAuth login does not cover: Meta down, a token from
+/// Graph Explorer, a local run with no public HTTPS. Same order as telegram —
+/// identify, INSERT, then arm at the provider — so the unique index stays the sole
+/// arbiter of duplicates.
+async fn create_instagram(
+    state: &AppState,
+    name: Option<String>,
+    access_token: String,
+) -> Result<Channel, AppError> {
+    if access_token.trim().is_empty() {
+        return Err(AppError::BadRequest(
+            "access_token must not be empty".into(),
+        ));
+    }
+
+    // /me validates the token and is the authoritative source of the account id.
+    let profile = crate::oauth::instagram::fetch_profile(&state.config.instagram, &access_token)
+        .await
+        .map_err(AppError::BadRequest)?;
+    let external_key = profile.user_id.clone();
+    let name = name.unwrap_or_else(|| match profile.username {
+        Some(ref username) => format!("@{username}"),
+        None => format!("instagram:{external_key}"),
+    });
+
+    // A pasted token carries no expiry; the refresher fills it in on its next pass.
+    let config = serde_json::to_value(crate::model::InstagramConfig {
+        access_token,
+        token_expires_at: None,
+        username: profile.username,
+    })
+    .map_err(|e| AppError::Internal(format!("failed to serialize instagram config: {e}")))?;
+
+    let channel = insert_or_conflict(
+        &state.db,
+        Uuid::new_v4(),
+        ProviderKind::Instagram,
+        &name,
+        &external_key,
+        &config,
+    )
+    .await?;
+
+    if let Err(reason) =
+        crate::oauth::subscribe(ProviderKind::Instagram, &state.config, &channel.config).await
+    {
+        // Roll back PHYSICALLY, for the same reason as telegram: the row is
+        // milliseconds old, and the unique index has no `deleted_at` filter, so a
+        // soft delete would occupy this account's identity forever.
+        if let Err(e) = db::hard_delete_channel(&state.db, channel.id).await {
+            tracing::error!(
+                channel_id = %channel.id,
+                "subscribe failed AND the rollback failed: {e}. The channel is live \
+                 with no subscription — fix it with Check connection in the panel."
+            );
+        }
         return Err(AppError::BadGateway(format!(
-            "setWebhook failed: {reason}"
+            "could not subscribe to events: {reason}"
         )));
     }
 
@@ -310,6 +355,19 @@ pub struct UpdateChannel {
     pub spec: Option<ChannelSpec>,
 }
 
+/// What has to be (re)armed at the provider once this update commits. Only a
+/// channel that ends the request alive is armed: registering a deleted channel's
+/// webhook or subscription would have the provider deliver events the app then
+/// rejects, and report the failures against a channel the operator believes gone.
+enum Rearm {
+    Nothing,
+    TelegramWebhook {
+        bot_token: String,
+        bot_secret: String,
+    },
+    InstagramSubscription,
+}
+
 pub async fn update(
     State(state): State<Arc<AppState>>,
     Path(channel_id): Path<Uuid>,
@@ -321,8 +379,7 @@ pub async fn update(
 
     let mut new_key: Option<String> = None;
     let mut new_config: Option<serde_json::Value> = None;
-    // Set when telegram needs its webhook (re)registered after this update.
-    let mut register: Option<(String, String)> = None;
+    let mut rearm = Rearm::Nothing;
 
     if let Some(spec) = body.spec {
         let provider = spec.provider();
@@ -340,30 +397,40 @@ pub async fn update(
                     new_key = Some(widget_id);
                 }
             }
-            ChannelSpec::Instagram {
-                user_id,
-                access_token,
-            } => {
-                if user_id.trim().is_empty() || access_token.trim().is_empty() {
+            ChannelSpec::Instagram { access_token } => {
+                if access_token.trim().is_empty() {
                     return Err(AppError::BadRequest(
-                        "user_id and access_token must not be empty".into(),
+                        "access_token must not be empty".into(),
                     ));
                 }
-                if user_id != existing.external_key {
-                    new_key = Some(user_id);
+                let profile =
+                    crate::oauth::instagram::fetch_profile(&state.config.instagram, &access_token)
+                        .await
+                        .map_err(AppError::BadRequest)?;
+                if profile.user_id != existing.external_key {
+                    return Err(AppError::BadRequest(
+                        "that token belongs to a different Instagram account; create a \
+                         separate channel instead, because this channel's chats and \
+                         messages belong to the current one"
+                            .into(),
+                    ));
                 }
-                // Merge rather than replace. The stored blob also carries
-                // `refresh_time`, which the form never shows, so a wholesale
-                // rewrite would silently discard it on every Save.
-                let mut merged = match existing.config.clone() {
-                    serde_json::Value::Object(map) => map,
-                    _ => serde_json::Map::new(),
-                };
-                merged.insert(
-                    "access_token".into(),
-                    serde_json::Value::String(access_token),
+                // Rebuilt, not merged: the stored `token_expires_at` describes the
+                // token being replaced, so carrying it over would claim a lifetime
+                // this one has not got. The refresher fills it in.
+                new_config = Some(
+                    serde_json::to_value(crate::model::InstagramConfig {
+                        access_token,
+                        token_expires_at: None,
+                        username: profile.username,
+                    })
+                    .map_err(|e| {
+                        AppError::Internal(format!("failed to serialize instagram config: {e}"))
+                    })?,
                 );
-                new_config = Some(serde_json::Value::Object(merged));
+                if body.restore || existing.deleted_at.is_none() {
+                    rearm = Rearm::InstagramSubscription;
+                }
             }
             ChannelSpec::Telegram { bot_token } => {
                 validate_bot_token(&bot_token)?;
@@ -408,15 +475,28 @@ pub async fn update(
                 // None -> 404, so Telegram queues them and reports permanent delivery
                 // errors against a channel the operator believes is deleted.
                 if body.restore || existing.deleted_at.is_none() {
-                    register = Some((bot_token, old.bot_secret));
+                    rearm = Rearm::TelegramWebhook {
+                        bot_token,
+                        bot_secret: old.bot_secret,
+                    };
                 }
             }
         }
-    } else if body.restore && existing.provider == "telegram" {
-        // Restoring without a new spec still needs the webhook back: DELETE removed it.
-        let cfg: TelegramConfig = serde_json::from_value(existing.config.clone())
-            .map_err(|e| AppError::Internal(format!("bad telegram config: {e}")))?;
-        register = Some((cfg.bot_token, cfg.bot_secret));
+    } else if body.restore {
+        // A restore still has to re-arm: DELETE removed the webhook or the
+        // subscription.
+        match existing.provider.as_str() {
+            "telegram" => {
+                let cfg: TelegramConfig = serde_json::from_value(existing.config.clone())
+                    .map_err(|e| AppError::Internal(format!("bad telegram config: {e}")))?;
+                rearm = Rearm::TelegramWebhook {
+                    bot_token: cfg.bot_token,
+                    bot_secret: cfg.bot_secret,
+                };
+            }
+            "instagram" => rearm = Rearm::InstagramSubscription,
+            _ => {}
+        }
     }
 
     let updated = match db::update_channel(
@@ -443,32 +523,48 @@ pub async fn update(
         Err(e) => return Err(e.into()),
     };
 
-    if let Some((bot_token, bot_secret)) = register {
-        let url = endpoint_for(
-            &state.config.public_base_url,
-            "telegram",
-            updated.id,
-            &updated.external_key,
-        );
-        if let Err(reason) = crate::provider::telegram::set_webhook(
-            &state.config.telegram_api_base,
-            &bot_token,
-            &url,
-            &bot_secret,
-        )
-        .await
-        {
-            // The row is already committed, so the cache has to be dropped even on
-            // the error path. Otherwise this replica keeps verifying inbound updates
-            // against the pre-PATCH config while the database holds the new one —
-            // and no invalidation is published, so the other replicas never learn.
-            // Unlike create, there is nothing to roll back here: the old webhook was
-            // already deleted, so the honest end state is "new config, no webhook",
-            // which the status check surfaces and "Re-register" fixes.
-            invalidate_everywhere(&state, updated.id).await;
-            return Err(AppError::BadGateway(format!(
-                "setWebhook failed: {reason}"
-            )));
+    match rearm {
+        Rearm::Nothing => {}
+        Rearm::TelegramWebhook {
+            bot_token,
+            bot_secret,
+        } => {
+            let url = endpoint_for(
+                &state.config.public_base_url,
+                "telegram",
+                updated.id,
+                &updated.external_key,
+            );
+            if let Err(reason) = crate::provider::telegram::set_webhook(
+                &state.config.telegram_api_base,
+                &bot_token,
+                &url,
+                &bot_secret,
+            )
+            .await
+            {
+                // The row is already committed, so the cache has to be dropped even
+                // on the error path. Otherwise this replica keeps verifying inbound
+                // updates against the pre-PATCH config while the database holds the
+                // new one — and no invalidation is published, so the other replicas
+                // never learn. Unlike create, there is nothing to roll back here: the
+                // old webhook was already deleted, so the honest end state is "new
+                // config, no webhook", which the status check surfaces and
+                // "Re-register" fixes.
+                invalidate_everywhere(&state, updated.id).await;
+                return Err(AppError::BadGateway(format!("setWebhook failed: {reason}")));
+            }
+        }
+        Rearm::InstagramSubscription => {
+            if let Err(reason) =
+                crate::oauth::subscribe(ProviderKind::Instagram, &state.config, &updated.config)
+                    .await
+            {
+                invalidate_everywhere(&state, updated.id).await;
+                return Err(AppError::BadGateway(format!(
+                    "could not subscribe to events: {reason}"
+                )));
+            }
         }
     }
 
@@ -491,10 +587,10 @@ pub async fn delete(
         return Ok(StatusCode::NO_CONTENT);
     };
 
-    if channel.provider == "telegram" {
-        // Best effort. A channel whose token was revoked must stay deletable, so a
-        // failure here is logged and the delete still succeeds.
-        match serde_json::from_value::<TelegramConfig>(channel.config.clone()) {
+    // Best effort, both branches. A channel whose credential was revoked must stay
+    // deletable, so a failure here is logged and the delete still succeeds.
+    match channel.provider.as_str() {
+        "telegram" => match serde_json::from_value::<TelegramConfig>(channel.config.clone()) {
             Ok(cfg) => {
                 if let Err(e) = crate::provider::telegram::delete_webhook(
                     &state.config.telegram_api_base,
@@ -508,115 +604,20 @@ pub async fn delete(
             Err(e) => {
                 tracing::warn!(%channel_id, "bad telegram config, skipping deleteWebhook: {e}")
             }
+        },
+        "instagram" => {
+            if let Err(e) =
+                crate::oauth::unsubscribe(ProviderKind::Instagram, &state.config, &channel.config)
+                    .await
+            {
+                tracing::warn!(%channel_id, "unsubscribe failed during delete: {e}");
+            }
         }
+        _ => {}
     }
 
     invalidate_everywhere(&state, channel_id).await;
     Ok(StatusCode::NO_CONTENT)
-}
-
-/// Telegram's view of a channel's webhook, plus the one fact an operator needs.
-#[derive(Debug, Serialize)]
-pub struct WebhookStatus {
-    pub registered_url: String,
-    pub expected_url: String,
-    /// Computed here rather than in the browser: URL comparison should not be
-    /// reimplemented in the frontend.
-    pub matches: bool,
-    pub pending_update_count: i64,
-    pub last_error_date: Option<i64>,
-    pub last_error_message: Option<String>,
-}
-
-impl WebhookStatus {
-    fn matches_url(registered: &str, expected: &str) -> bool {
-        !registered.is_empty() && registered == expected
-    }
-}
-
-/// Load a live telegram channel and its config, or explain why it is neither.
-async fn telegram_channel(
-    state: &AppState,
-    channel_id: Uuid,
-) -> Result<(Channel, TelegramConfig), AppError> {
-    let channel = db::find_live_channel_by_id(&state.db, channel_id)
-        .await?
-        .ok_or_else(|| AppError::NotFound("channel not found".into()))?;
-    if channel.provider != "telegram" {
-        return Err(AppError::BadRequest(format!(
-            "channel provider is '{}'; only telegram channels have a webhook",
-            channel.provider
-        )));
-    }
-    let config = serde_json::from_value(channel.config.clone())
-        .map_err(|e| AppError::Internal(format!("bad telegram config: {e}")))?;
-    Ok((channel, config))
-}
-
-async fn status_of(
-    state: &AppState,
-    channel: &Channel,
-    config: &TelegramConfig,
-) -> Result<WebhookStatus, AppError> {
-    let info = crate::provider::telegram::get_webhook_info(
-        &state.config.telegram_api_base,
-        &config.bot_token,
-    )
-    .await
-    .map_err(|e| AppError::BadGateway(format!("getWebhookInfo failed: {e}")))?;
-
-    let expected_url = endpoint_for(
-        &state.config.public_base_url,
-        "telegram",
-        channel.id,
-        &channel.external_key,
-    );
-    Ok(WebhookStatus {
-        matches: WebhookStatus::matches_url(&info.url, &expected_url),
-        registered_url: info.url,
-        expected_url,
-        pending_update_count: info.pending_update_count,
-        last_error_date: info.last_error_date,
-        last_error_message: info.last_error_message,
-    })
-}
-
-/// Not fetched automatically by the panel: N telegram channels would mean N
-/// Telegram round trips per page render, tying the settings page's load time to
-/// Telegram's availability and rate limits. The panel calls this per channel,
-/// on demand.
-pub async fn webhook_status(
-    State(state): State<Arc<AppState>>,
-    Path(channel_id): Path<Uuid>,
-) -> Result<Json<WebhookStatus>, AppError> {
-    let (channel, config) = telegram_channel(&state, channel_id).await?;
-    Ok(Json(status_of(&state, &channel, &config).await?))
-}
-
-/// Re-register and report the fresh status in the same response, so the panel
-/// updates in one round trip. Idempotent, and available even when the status
-/// already matches — it is what fixes a channel after a domain change.
-pub async fn webhook_register(
-    State(state): State<Arc<AppState>>,
-    Path(channel_id): Path<Uuid>,
-) -> Result<Json<WebhookStatus>, AppError> {
-    let (channel, config) = telegram_channel(&state, channel_id).await?;
-    let url = endpoint_for(
-        &state.config.public_base_url,
-        "telegram",
-        channel.id,
-        &channel.external_key,
-    );
-    crate::provider::telegram::set_webhook(
-        &state.config.telegram_api_base,
-        &config.bot_token,
-        &url,
-        &config.bot_secret,
-    )
-    .await
-    .map_err(|e| AppError::BadGateway(format!("setWebhook failed: {e}")))?;
-
-    Ok(Json(status_of(&state, &channel, &config).await?))
 }
 
 #[cfg(test)]
@@ -658,21 +659,6 @@ mod tests {
         assert_eq!(
             endpoint_for("https://example.com", "instagram", id, "17841400000000000"),
             "https://example.com/webhook/instagram"
-        );
-    }
-
-    #[test]
-    fn webhook_status_matches_only_on_an_exact_url() {
-        let expected = "https://example.com/webhook/telegram/abc";
-        assert!(WebhookStatus::matches_url(expected, expected));
-        assert!(!WebhookStatus::matches_url("", expected));
-        assert!(!WebhookStatus::matches_url(
-            "https://old.example.com/webhook/telegram/abc",
-            expected
-        ));
-        assert!(
-            !WebhookStatus::matches_url("https://example.com/webhook/telegram/abc/", expected),
-            "a trailing slash is a different URL to Telegram"
         );
     }
 

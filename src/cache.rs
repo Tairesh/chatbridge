@@ -73,7 +73,7 @@ impl ChannelCache {
         provider: ProviderKind,
         external_key: &str,
     ) -> Result<Option<Channel>, AppError> {
-        let key = (provider.clone(), external_key.to_owned());
+        let key = (provider, external_key.to_owned());
         if let Some(&uuid) = self.ext_index.read().unwrap().get(&key)
             && let Some(cached) = self.by_id.read().unwrap().get(&uuid)
         {
@@ -143,7 +143,7 @@ impl ClientCache {
         provider: ProviderKind,
         external_id: &str,
     ) -> Result<Option<Client>, sqlx::Error> {
-        let key = (provider.clone(), external_id.to_owned());
+        let key = (provider, external_id.to_owned());
         if let Some(&uuid) = self.ext_index.read().unwrap().get(&key)
             && let Some(cached) = self.by_uuid.read().unwrap().get(&uuid)
         {
