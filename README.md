@@ -125,7 +125,30 @@ EventKind::Reaction → log only
 EventKind::Unknown  → log only
 ```
 
-Only `Message` events create rows. `Edit` and `Read` mutate existing rows found by `(channel_id, external_message_id)`. Read receipts use watermark semantics: all messages in the same chat up to the referenced message are marked as read.
+Only `Message` events create rows. `Edit` and `Read` mutate existing rows found by
+`(channel_id, external_message_id)`.
+
+**Read receipts** are a watermark: the message the receipt names **and every older one**
+in that chat are marked read, excluding the reader's own. When the named message is not
+found — the receipt overtook the id adoption below, or the message was sent from the
+provider's own app — `db::mark_chat_read` falls back to everything the other side has
+unread in that customer's active chat.
+
+**External message ids** are built in `src/external_id.rs` and are unique *within a
+channel*, because `UNIQUE (channel_id, external_message_id)` spans the channel and a
+collision silently drops a message rather than raising. A Telegram `message_id` is unique
+only inside its chat, so the id carries the chat; a widget `mid` comes from the browser,
+so it carries the client.
+
+**Outbound messages** are stored under a local id (`operator:<mid>`) and adopt the
+provider's id once the send returns, keyed on the row's UUID
+(`db::adopt_external_message_id`). Without that, every receipt for an operator's reply
+would resolve to nothing.
+
+**Status** is a ladder: `new` → `delivered` → `read`, plus the dead end `failed`, held in
+a `MessageStatus` enum and enforced by `messages_status_check`. One tick in the panel
+means the provider took the message, two mean the customer read it, `✗` means it was
+refused. A widget message passes no provider and goes straight from `new` to `read`.
 
 Published to Redis as `IncomingEvent` with a `"type"` discriminator:
 ```json
@@ -164,7 +187,9 @@ src/
 ├── error.rs             # AppError → HTTP status mapping
 ├── jwt.rs               # HS256 JWT sign/verify for WebSocket identity (widget clients + operators)
 ├── registry.rs          # ClientRegistry (tracks active WS connections per client/operator UUID via mpsc channels)
-├── model.rs             # Sender, NewMessage, IncomingMessage/Edit/Read, ProviderKind, EventKind, WsInbound, OperatorInbound, WsOutbound
+├── model.rs             # Sender, NewMessage, Conversation, MessageStatus, IncomingMessage/Edit/Read, ProviderKind, EventKind, WsInbound, OperatorInbound, WsOutbound
+├── external_id.rs       # The one place that builds messages.external_message_id, per provider
+├── refresh.rs           # Hourly pass renewing Instagram long-lived tokens before they expire
 ├── pipeline.rs          # Shared message processing pipeline (persist_and_publish, resolve_sender, publish_event)
 ├── listener.rs          # Shared Redis listener (spawn_message_listener) — dispatches events to WS connections
 ├── handler/
@@ -173,11 +198,16 @@ src/
 │   ├── widget_ws.rs     # Widget WebSocket handler
 │   ├── operator_ws.rs   # Operator WebSocket handler (async Telegram delivery via Bot API)
 │   ├── api.rs           # REST API handlers (get_chats, get_chat_messages)
-│   └── channels.rs      # Channel CRUD for the settings panel (list/create/update/delete, webhook status)
+│   ├── channels.rs      # Channel CRUD for the settings panel (list/create/update/delete)
+│   ├── connection.rs    # GET|POST /api/channels/{id}/connection — provider-neutral "is this wired up"
+│   └── oauth.rs         # OAuth routes: provider list, start (307), popup callback
 ├── routes.rs            # Router assembly
+├── oauth/
+│   ├── mod.rs           # Provider-generic login core: descriptors, redirect URIs, state JWT
+│   └── instagram.rs     # Graph API calls: code exchange, long-lived token, profile, subscribe, send, mark_seen
 └── provider/
     ├── mod.rs           # WebhookProvider trait (verify + parse)
-    ├── instagram.rs     # HMAC-SHA256 verification, Meta payload parsing, client identity via Graph API
+    ├── instagram.rs     # HMAC-SHA256 verification, both webhook shapes, echoes, client identity via Graph API
     └── telegram.rs      # Secret token verification, Telegram Update parsing, client resolution, Bot API calls (sendMessage, getMe, setWebhook, deleteWebhook, getWebhookInfo)
 
 docker/
@@ -186,13 +216,20 @@ docker/
 
 frontend/
 ├── widget.html          # Chat widget test page (WebSocket client)
-└── operator.html        # Operator dashboard (WebSocket + REST API)
+├── operator.html        # Operator dashboard (WebSocket + REST API)
+├── settings.html        # Channel settings panel (CRUD, Instagram login popup, connection status)
+└── style.css            # Shared stylesheet for the panel pages
 
 migrations/              # SQL migrations (auto-run on startup)
 tests/
-├── common/mod.rs        # Shared test helpers (RAII cleanup guards, pool setup)
-├── integration.rs       # Integration tests (require Postgres + Redis)
-└── client_identity.rs   # Client identity upsert tests
+├── common/mod.rs        # Shared with both test binaries (RAII cleanup guards, pool setup)
+├── client_identity.rs   # Client identity upsert tests
+└── integration/         # One test binary, split by subject
+    ├── main.rs          # Module declarations
+    ├── support/         # State builders, fixtures, HTTP/WS helpers, Graph and Bot API mocks
+    ├── webhooks.rs      widget_ws.rs      operator_ws.rs    read_receipts.rs
+    ├── messages.rs      cache.rs          channels_db.rs    channels_api.rs
+    └── oauth.rs         instagram_flow.rs refresh.rs        connection.rs
 compose.yaml             # nginx + chatbridge + postgres + redis services
 ```
 
@@ -215,6 +252,7 @@ Requires Rust 1.88+, a running PostgreSQL instance, and Redis.
 
 ```bash
 # Set environment variables
+export INSTAGRAM_APP_ID=your_instagram_app_id
 export INSTAGRAM_VERIFY_TOKEN=your_token
 export INSTAGRAM_APP_SECRET=your_secret
 export DATABASE_URL=postgres://chatbridge:chatbridge@localhost:5432/chatbridge
@@ -233,13 +271,38 @@ Migrations run automatically on startup.
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
+| `INSTAGRAM_APP_ID` | yes | — | Public id of the **Instagram** app (App dashboard → Use cases → Manage messaging & content on Instagram). Not the Meta app id from Settings → Basic |
 | `INSTAGRAM_VERIFY_TOKEN` | yes | — | Token for Instagram webhook subscription handshake |
-| `INSTAGRAM_APP_SECRET` | yes | — | HMAC-SHA256 secret for Instagram signature validation |
+| `INSTAGRAM_APP_SECRET` | yes | — | HMAC-SHA256 secret for Instagram signature validation, and for the OAuth token exchanges |
 | `DATABASE_URL` | yes | — | Postgres connection string |
 | `REDIS_URL` | yes | — | Redis connection string |
 | `APP_JWT_SECRET` | yes | — | HMAC-SHA256 secret for WebSocket JWTs (widget clients + operators) |
 | `PUBLIC_BASE_URL` | yes | — | Public origin of this deployment, no trailing slash. Builds Telegram webhook URLs and the `endpoint` field of a channel |
 | `TELEGRAM_API_BASE` | no | `https://api.telegram.org` | Telegram Bot API origin. Point it at a fake Bot API for local work |
+| `RUST_LOG` | no | `info` | Log level. `chatbridge=debug` logs raw webhook payloads and every provider call |
+| `INSTAGRAM_API_BASE` | no | — | Overrides all three Meta hosts at once (`www.instagram.com`, `api.instagram.com`, `graph.instagram.com/v26.0`). For pointing a local run at a fake API |
+
+## Connecting an Instagram account
+
+Register `<PUBLIC_BASE_URL>/api/oauth/instagram/callback` as a redirect URI in the Meta
+dashboard (*Use cases → Manage messaging & content on Instagram → Set up Instagram business
+login → Business Login Settings*). Meta compares it byte for byte; the settings panel shows
+the exact string with a copy button.
+
+`PUBLIC_BASE_URL` must be **https** — Meta refuses a plain-http redirect URI — and the panel
+has to be opened at that same origin, because the popup lands there.
+
+Then press **Log in with Instagram** in the panel. The popup returns with the account
+connected, subscribed, and its 60-day token recorded. A background pass refreshes tokens
+hourly, starting three days before they expire.
+
+Until App Review grants advanced access to `instagram_business_basic` and
+`instagram_business_manage_messages`, the login works only for Instagram accounts that hold a
+role on the app.
+
+Outbound replies are text-only: no attachments, and no enforcement of Instagram's 24-hour
+customer-service window (Meta rejects a late reply and the operator is told why). See
+`docs/tech_debt.md`.
 
 ## Testing
 
@@ -277,10 +340,27 @@ Integration tests cover:
 - Channel CRUD (create widget/instagram/telegram, 409 on a live and on a deleted identity,
   `setWebhook` rollback, provider change rejected, token rotation vs different bot, soft delete
   idempotency, deleted channel invisible to the hot path and absent from the operator inbox)
-- Webhook status (match, hijacked URL, delivery errors, re-register, non-telegram and deleted
-  channels rejected)
+- Connection status (match, hijacked URL, delivery errors, re-register, widget and deleted
+  channels)
+- Instagram login (authorize redirect and signed state, callback creating/restoring/refusing a
+  channel, rollback when subscribing fails)
+- External message ids (two Telegram clients both reaching `message_id: 1`, two widget clients
+  sharing a `mid`)
+- Id adoption (plain, over an echo that arrived first, on a deleted row, on a row that already
+  has it)
+- Read receipts (anchor and everything older, never the reader's own, never another chat, the
+  chat-level fallback, an unknown mid end to end, `mark_seen` reaching Instagram and not
+  reaching a widget)
+- Echoes (a message sent from the Instagram app appears in history; an echo of our own reply
+  adds nothing)
+- Delivery outcomes (`delivered` status and notification, a refused reply marked `failed` under
+  its local id, a status outside the ladder refused by the database)
+- Token refresh (renewal, missing expiry, a rejected refresh leaving the token alone)
 
-Test data cleanup uses RAII drop guards (`TestChannel`, `TestClient`, `TestChat`, `TestMessage`, `TestOperator`) in `tests/common/` to ensure rows are deleted even if a test panics.
+Test data cleanup uses RAII drop guards (`TestChannel`, `TestChannelKey`, `TestClient`,
+`TestChat`, `TestMessage`, `TestOperator`) in `tests/common/` to ensure rows are deleted even if
+a test panics. `TestChannel` cascades: it deletes the channel's messages and chats and then every
+client they referenced.
 
 ### Linting
 

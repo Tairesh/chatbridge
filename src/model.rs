@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ProviderKind {
     Instagram,
     Telegram,
@@ -23,8 +23,15 @@ pub struct TelegramConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstagramConfig {
     pub access_token: String,
+    /// When the long-lived token dies, ~60 days after it was issued. Absent for a
+    /// manually pasted token, which the refresher then treats as due.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub refresh_time: Option<chrono::DateTime<chrono::Utc>>,
+    pub token_expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Kept separate from `channels.name`, which is operator-editable: rename a
+    /// channel to "Support" and the numeric `external_key` no longer says which
+    /// account it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
 }
 
 /// Stored contents of `channels.config` for a widget channel. A widget channel
@@ -46,8 +53,10 @@ pub enum ChannelSpec {
     Telegram {
         bot_token: String,
     },
+    /// Only the token. `GET /me` is the authority on which account it belongs to,
+    /// so asking the operator to type the id in is asking for a value that can
+    /// only be wrong.
     Instagram {
-        user_id: String,
         access_token: String,
     },
 }
@@ -71,6 +80,44 @@ pub enum EventKind {
     Unknown,
 }
 
+/// Where a message is on its way to being seen.
+///
+/// `New` → `Delivered` → `Read`, plus the dead end `Failed`. A widget message passes no
+/// provider and goes straight from `New` to `Read`. Stored as TEXT and constrained by
+/// `messages_status_check`, so an unexpected value fails on write; decoding one here
+/// fails on read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[serde(rename_all = "snake_case")]
+#[sqlx(type_name = "text", rename_all = "snake_case")]
+pub enum MessageStatus {
+    /// Stored, and nothing has happened to it yet.
+    New,
+    /// The provider took it. One tick.
+    Delivered,
+    /// The other side read it. Two ticks.
+    Read,
+    /// The provider refused it. It was never delivered and can never be read.
+    Failed,
+}
+
+impl MessageStatus {
+    /// For the SQL that still writes the value as a literal parameter.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MessageStatus::New => "new",
+            MessageStatus::Delivered => "delivered",
+            MessageStatus::Read => "read",
+            MessageStatus::Failed => "failed",
+        }
+    }
+}
+
+impl std::fmt::Display for MessageStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Sender {
     pub id: Uuid,
@@ -88,7 +135,7 @@ pub struct IncomingMessage {
     pub channel_id: Uuid,
     pub chat_id: Option<Uuid>,
     pub text: Option<String>,
-    pub status: String,
+    pub status: MessageStatus,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub sender: Sender,
 }
@@ -139,10 +186,29 @@ impl IncomingEvent {
     }
 }
 
+/// Which conversation a message belongs to — the one thing `persist_and_publish`
+/// cannot work out on its own, expressed the two ways it is ever known.
+///
+/// Separate from `sender_id`, which says *who wrote it*: the two coincide for an
+/// inbound client message and part company for everything the account sends. Deriving
+/// one from the other is what used to lose the chat of a message with no author.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub enum Conversation {
+    /// The panel named the chat: it already exists.
+    Chat(Uuid),
+    /// A provider named the customer. The chat is theirs, and the first message of a
+    /// conversation is the one that creates it.
+    Customer(Uuid),
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct NewMessage {
     pub external_message_id: String,
     pub channel_id: Uuid,
+    /// `None` when the customer could not be resolved at all — the row is still
+    /// stored, without a chat, rather than dropped.
+    pub conversation: Option<Conversation>,
+    /// Who wrote it. `None` for a message the account owner sent outside this app.
     pub sender_id: Option<Uuid>,
     pub sender_type: String,
     pub provider: ProviderKind,
@@ -222,7 +288,11 @@ pub enum WsOutbound {
         operator_id: Option<Uuid>,
     },
     Ack {
+        /// The mid the sender chose, echoed back.
         message_id: Uuid,
+        /// The row in `messages`. `None` when nothing was persisted.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<Uuid>,
     },
     /// Sent once on connect when the client already has a chat, so the frontend
     /// can fetch its history. `status` is the raw `chats.status` value; anything
@@ -232,6 +302,17 @@ pub enum WsOutbound {
         status: String,
     },
     Error {
+        reason: String,
+    },
+    /// A reply the provider accepted. The panel turns it into the first tick — the
+    /// one that means "handed off", as opposed to ✓✓ which means "read".
+    Delivered {
+        message_id: Uuid,
+    },
+    /// A reply the provider refused. Named separately from `Error` because it is
+    /// about a specific row, and `Error` is built in eight places that have none.
+    DeliveryFailed {
+        message_id: Uuid,
         reason: String,
     },
 }
@@ -341,9 +422,16 @@ mod tests {
     #[test]
     fn ws_outbound_ack_serializes_correctly() {
         let mid: Uuid = TEST_UUID.parse().unwrap();
-        let msg = WsOutbound::Ack { message_id: mid };
+        let msg = WsOutbound::Ack {
+            message_id: mid,
+            id: None,
+        };
         let json = serde_json::to_value(&msg).unwrap();
         assert_eq!(json["action"], "ack");
+        assert!(
+            json.get("id").is_none(),
+            "an ack with nothing persisted omits the row id"
+        );
         assert_eq!(json["message_id"], TEST_UUID);
     }
 
@@ -411,7 +499,7 @@ mod tests {
             channel_id: TEST_UUID.parse().unwrap(),
             chat_id: Some(TEST_UUID.parse().unwrap()),
             text: Some("hello".into()),
-            status: "new".into(),
+            status: MessageStatus::New,
             created_at: chrono::Utc::now(),
             sender: Sender {
                 id: TEST_UUID.parse().unwrap(),
@@ -459,7 +547,7 @@ mod tests {
         assert_eq!(telegram.provider(), ProviderKind::Telegram);
 
         let instagram: ChannelSpec = serde_json::from_value(serde_json::json!({
-            "provider": "instagram", "user_id": "17841", "access_token": "tok"
+            "provider": "instagram", "access_token": "tok"
         }))
         .unwrap();
         assert_eq!(instagram.provider(), ProviderKind::Instagram);
@@ -486,12 +574,11 @@ mod tests {
         );
 
         let instagram = ChannelSpec::Instagram {
-            user_id: "17841".into(),
             access_token: "tok".into(),
         };
         assert_eq!(
             serde_json::to_value(&instagram).unwrap(),
-            serde_json::json!({"provider": "instagram", "user_id": "17841", "access_token": "tok"})
+            serde_json::json!({"provider": "instagram", "access_token": "tok"})
         );
     }
 
@@ -508,10 +595,9 @@ mod tests {
                 .is_err()
         );
         assert!(
-            serde_json::from_value::<ChannelSpec>(
-                serde_json::json!({"provider": "instagram", "user_id": "1"})
-            )
-            .is_err()
+            serde_json::from_value::<ChannelSpec>(serde_json::json!({"provider": "instagram"}))
+                .is_err(),
+            "access_token is required"
         );
     }
 
@@ -534,21 +620,44 @@ mod tests {
     }
 
     #[test]
-    fn instagram_config_accepts_absent_refresh_time() {
-        let value = serde_json::json!({"access_token": "tok"});
-        let cfg: InstagramConfig = serde_json::from_value(value).unwrap();
-        assert_eq!(cfg.access_token, "tok");
-        assert!(cfg.refresh_time.is_none());
+    fn instagram_config_accepts_a_bare_access_token() {
+        // A manually pasted token has no known expiry and no username; the
+        // refresher fills the expiry in on its next pass.
+        let cfg: InstagramConfig =
+            serde_json::from_value(serde_json::json!({"access_token": "t"})).unwrap();
+        assert_eq!(cfg.access_token, "t");
+        assert!(cfg.token_expires_at.is_none());
+        assert!(cfg.username.is_none());
     }
 
     #[test]
-    fn instagram_config_parses_refresh_time() {
-        let value = serde_json::json!({
-            "access_token": "tok",
-            "refresh_time": "2026-03-14T00:00:00+00:00"
+    fn instagram_config_round_trips_the_expiry_and_username() {
+        let json = serde_json::json!({
+            "access_token": "t",
+            "token_expires_at": "2026-10-19T09:00:00Z",
+            "username": "yourbiz"
         });
-        let cfg: InstagramConfig = serde_json::from_value(value).unwrap();
-        assert!(cfg.refresh_time.is_some());
+        let cfg: InstagramConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(cfg.username.as_deref(), Some("yourbiz"));
+        assert_eq!(
+            cfg.token_expires_at.unwrap().to_rfc3339(),
+            "2026-10-19T09:00:00+00:00"
+        );
+    }
+
+    #[test]
+    fn instagram_config_omits_absent_optional_fields() {
+        // The blob is written back on every edit; a null-filled config would be
+        // noise in the panel, which renders config verbatim.
+        let cfg = InstagramConfig {
+            access_token: "t".into(),
+            token_expires_at: None,
+            username: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&cfg).unwrap(),
+            serde_json::json!({"access_token": "t"})
+        );
     }
 
     #[test]

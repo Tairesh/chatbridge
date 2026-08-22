@@ -73,7 +73,7 @@ impl ChannelCache {
         provider: ProviderKind,
         external_key: &str,
     ) -> Result<Option<Channel>, AppError> {
-        let key = (provider.clone(), external_key.to_owned());
+        let key = (provider, external_key.to_owned());
         if let Some(&uuid) = self.ext_index.read().unwrap().get(&key)
             && let Some(cached) = self.by_id.read().unwrap().get(&uuid)
         {
@@ -143,7 +143,7 @@ impl ClientCache {
         provider: ProviderKind,
         external_id: &str,
     ) -> Result<Option<Client>, sqlx::Error> {
-        let key = (provider.clone(), external_id.to_owned());
+        let key = (provider, external_id.to_owned());
         if let Some(&uuid) = self.ext_index.read().unwrap().get(&key)
             && let Some(cached) = self.by_uuid.read().unwrap().get(&uuid)
         {
@@ -188,7 +188,7 @@ impl ClientCache {
 #[derive(Debug, Clone)]
 pub struct CachedOperator {
     pub id: Uuid,
-    pub name: Option<String>,
+    pub name: String,
 }
 
 /// In-memory operator cache with read-through to Postgres.
@@ -409,7 +409,7 @@ mod tests {
             id,
             CachedOperator {
                 id,
-                name: Some("Alice".into()),
+                name: "Alice".into(),
             },
         );
         assert_eq!(cache.operators.read().unwrap().len(), 1);

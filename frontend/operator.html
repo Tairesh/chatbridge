@@ -24,11 +24,13 @@
     .msg { padding: 8px 12px; border-radius: 8px; max-width: 70%; font-size: 14px; line-height: 1.4; }
     .msg.inbound { background: #e5e7eb; color: #1f2937; align-self: flex-start; }
     .msg.outbound { background: #2563eb; color: #fff; align-self: flex-end; }
-    .msg-sender { font-size: 11px; font-weight: 600; color: #6b7280; margin-bottom: 2px; }
+    .msg-sender { font-size: 11px; font-weight: 600; font-style: italic; margin-bottom: 2px; }
     .msg-info { font-size: 11px; color: #9ca3af; margin-top: 4px; display: flex; gap: 8px; }
     .msg.outbound .msg-info { color: rgba(255,255,255,0.7); }
     .msg-edited-label { font-size: 10px; font-style: italic; }
-    .msg-read-label { font-size: 12px; color: rgba(255,255,255,0.8); }
+    .msg-sent-label { font-size: 12px; color: rgba(255,255,255,0.45); }
+    .msg-read-label { font-size: 12px; color: rgba(255,255,255,0.8); letter-spacing: -5px; }
+    .msg-failed-label { font-size: 12px; color: #fca5a5; margin-left: 6px; }
 
     #empty-state { flex: 1; display: flex; align-items: center; justify-content: center; color: #9ca3af; font-size: 16px; }
 
@@ -100,6 +102,19 @@
           return;
         }
         if (data.action === 'ack') {
+          // The optimistic bubble was rendered under the local mid. Swap in the row
+          // id, which is what read and edit events name.
+          const pending = messagesEl.querySelector(`[data-message-id="${data.message_id}"]`);
+          if (pending && data.id) pending.dataset.messageId = data.id;
+          return;
+        }
+        if (data.action === 'delivered') {
+          markDelivered(data.message_id);
+          return;
+        }
+        if (data.action === 'delivery_failed') {
+          markUndelivered(data.message_id);
+          console.error('Delivery failed:', data.reason);
           return;
         }
         if (data.action === 'error') {
@@ -216,14 +231,29 @@
       const isOperator = (msg.sender && msg.sender.type === 'operator') || msg.sender_type === 'operator';
       div.className = 'msg ' + (isOperator ? 'outbound' : 'inbound');
       div.dataset.messageId = msg.id;
-      div.dataset.externalId = msg.external_message_id;
 
       const text = msg.text || '';
       const time = formatTime(msg.created_at);
       const edited = msg.edited_at ? '<span class="msg-edited-label">edited</span>' : '';
+      // One tick means the provider took it, two mean the customer read it. A widget
+      // message never goes through a provider, so it has no delivered state.
       const read = msg.status === 'read' && isOperator ? '<span class="msg-read-label">✓✓</span>' : '';
-      const senderName = (!isOperator && msg.sender && msg.sender.name)
-        ? `<div class="msg-sender">${escapeHtml(msg.sender.name)}</div>` : '';
+      const sent = msg.status === 'delivered' && isOperator
+        ? '<span class="msg-sent-label">✓</span>' : '';
+      const failed = msg.status === 'failed'
+        ? '<span class="msg-failed-label">✗ not delivered</span>' : '';
+      // An operator message with no author at all is an echo: something the account
+      // owner sent from the provider's own app. Not the same as an operator whose
+      // name is unset — operators are created nameless, so the test is the *author*,
+      // which is NULL in history and the nil UUID in a live event.
+      const NIL_UUID = '00000000-0000-0000-0000-000000000000';
+      const authorless = isOperator
+        && !msg.sender_id
+        && (!msg.sender || !msg.sender.id || msg.sender.id === NIL_UUID);
+      // Live events carry `sender.name`; history rows carry the flat `sender_name`.
+      const rawName = (msg.sender && msg.sender.name) || msg.sender_name;
+      const name = rawName ? escapeHtml(rawName) : (authorless ? 'Sent from the app' : '');
+      const senderName = name ? `<div class="msg-sender">${name}</div>` : '';
 
       div.innerHTML = `
         ${senderName}
@@ -231,7 +261,9 @@
         <div class="msg-info">
           <span>${time}</span>
           ${edited}
+          ${sent}
           ${read}
+          ${failed}
         </div>
       `;
       messagesEl.appendChild(div);
@@ -248,7 +280,9 @@
     }
 
     function updateEditedMessage(event) {
-      const el = messagesEl.querySelector(`[data-external-id="${event.external_message_id}"]`);
+      // The row id, not the external one: a provider replaces the external id the
+      // moment it accepts the message, and the browser never learns the new value.
+      const el = messagesEl.querySelector(`[data-message-id="${event.id}"]`);
       if (!el) return;
       const textSpan = el.querySelector('.msg-text');
       if (textSpan) textSpan.textContent = event.text || '';
@@ -259,11 +293,35 @@
     }
 
     function updateReadMessage(event) {
-      const el = messagesEl.querySelector(`[data-external-id="${event.external_message_id}"]`);
+      const el = messagesEl.querySelector(`[data-message-id="${event.id}"]`);
       if (!el) return;
       const infoDiv = el.querySelector('.msg-info');
-      if (infoDiv && !infoDiv.querySelector('.msg-read-label')) {
-        infoDiv.insertAdjacentHTML('beforeend', '<span class="msg-read-label">✓✓</span>');
+      if (!infoDiv || infoDiv.querySelector('.msg-read-label')) return;
+      // ✓✓ replaces ✓ rather than sitting next to it.
+      const sent = infoDiv.querySelector('.msg-sent-label');
+      if (sent) sent.remove();
+      infoDiv.insertAdjacentHTML('beforeend', '<span class="msg-read-label">✓✓</span>');
+    }
+
+    function markDelivered(messageId) {
+      const el = messagesEl.querySelector(`[data-message-id="${messageId}"]`);
+      if (!el) return;
+      const infoDiv = el.querySelector('.msg-info');
+      if (!infoDiv) return;
+      // A receipt can beat the delivery notification when the customer has the thread
+      // open. ✓✓ is the stronger statement and must not be demoted to ✓.
+      if (infoDiv.querySelector('.msg-read-label') || infoDiv.querySelector('.msg-sent-label')) {
+        return;
+      }
+      infoDiv.insertAdjacentHTML('beforeend', '<span class="msg-sent-label">✓</span>');
+    }
+
+    function markUndelivered(messageId) {
+      const el = messagesEl.querySelector(`[data-message-id="${messageId}"]`);
+      if (!el) return;
+      const infoDiv = el.querySelector('.msg-info');
+      if (infoDiv && !infoDiv.querySelector('.msg-failed-label')) {
+        infoDiv.insertAdjacentHTML('beforeend', '<span class="msg-failed-label">✗ not delivered</span>');
       }
     }
 
@@ -285,7 +343,6 @@
       // Optimistic render
       appendMessage({
         id: mid,
-        external_message_id: 'operator:' + mid,
         text: text,
         created_at: new Date().toISOString(),
         sender: { id: operatorId, type: 'operator', name: 'You' },

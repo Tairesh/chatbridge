@@ -4,7 +4,7 @@ use axum::Router;
 use axum::routing::{get, patch, post};
 
 use crate::config::AppState;
-use crate::handler::{api, channels, operator_ws, webhook, widget_ws};
+use crate::handler::{api, channels, connection, oauth, operator_ws, webhook, widget_ws};
 
 pub fn build(state: Arc<AppState>) -> Router {
     Router::new()
@@ -20,9 +20,12 @@ pub fn build(state: Arc<AppState>) -> Router {
             patch(channels::update).delete(channels::delete),
         )
         .route(
-            "/api/channels/{id}/webhook",
-            get(channels::webhook_status).post(channels::webhook_register),
+            "/api/channels/{id}/connection",
+            get(connection::status).post(connection::register),
         )
+        .route("/api/oauth/providers", get(oauth::providers))
+        .route("/api/oauth/{provider}/start", get(oauth::start))
+        .route("/api/oauth/{provider}/callback", get(oauth::callback))
         .route("/api/chats", get(api::get_chats))
         .route("/api/chats/{chat_id}", get(api::get_chat_messages))
         .route("/ws/operator", get(operator_ws::operator_ws))

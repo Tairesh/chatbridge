@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::cache::{ChannelCache, ClientCache};
 use crate::error::AppError;
-use crate::model::{EventKind, NewMessage, ProviderKind};
+use crate::model::{Conversation, EventKind, NewMessage, ProviderKind};
 use crate::provider::WebhookProvider;
 
 static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
@@ -27,14 +27,23 @@ struct InstagramProfile {
 
 pub struct InstagramProvider {
     app_secret: String,
+    /// Same base the OAuth module uses. Held here so the profile lookup does not
+    /// hardcode a host that tests then cannot redirect.
+    graph_base: String,
     cache: Arc<ChannelCache>,
     client_cache: Arc<ClientCache>,
 }
 
 impl InstagramProvider {
-    pub fn new(app_secret: &str, cache: Arc<ChannelCache>, client_cache: Arc<ClientCache>) -> Self {
+    pub fn new(
+        app_secret: &str,
+        graph_base: &str,
+        cache: Arc<ChannelCache>,
+        client_cache: Arc<ClientCache>,
+    ) -> Self {
         Self {
             app_secret: app_secret.to_owned(),
+            graph_base: graph_base.to_owned(),
             cache,
             client_cache,
         }
@@ -81,24 +90,69 @@ impl WebhookProvider for InstagramProvider {
         let mut messages = Vec::new();
 
         for entry in &payload.entry {
-            let Some(ref messaging) = entry.messaging else {
-                continue;
-            };
+            // Both delivery shapes, in one list. Which one Meta uses depends on the
+            // Graph API version the app is pinned to, and an app can see the old
+            // shape for a while after the new one appears.
+            let mut events: Vec<&MessagingEvent> = Vec::new();
+            if let Some(ref messaging) = entry.messaging {
+                events.extend(messaging.iter());
+            }
+            if let Some(ref changes) = entry.changes {
+                for change in changes {
+                    // Gated on the *shape*, not on the field name: a change whose
+                    // value carries none of message / message_edit / read / reaction
+                    // is something else entirely (a comment, a dashboard test send),
+                    // and turning it into an Unknown message would invent an inbox
+                    // entry out of nothing.
+                    if matches!(classify_event(&change.value).0, EventKind::Unknown) {
+                        tracing::warn!(
+                            entry_id = %entry.id,
+                            field = %change.field,
+                            "ignoring an instagram change this app cannot interpret"
+                        );
+                        continue;
+                    }
+                    events.push(&change.value);
+                }
+            }
 
-            for event in messaging {
+            if events.is_empty() {
+                // Never silent. Key names only: the values carry message text.
+                let keys: Vec<&str> = entry.other.keys().map(String::as_str).collect();
+                tracing::warn!(
+                    entry_id = %entry.id,
+                    "instagram entry produced no events. Unrecognised keys: {:?}",
+                    keys
+                );
+                continue;
+            }
+
+            for event in events {
                 let (event_kind, mid) = classify_event(event);
 
-                let Some(recipient_id) = event.recipient.as_ref().map(|r| r.id.as_str()) else {
-                    tracing::warn!("no recipient in instagram event");
+                // An echo is the mirror of an inbound event: the account is the
+                // sender and the customer is the recipient. Routed the normal way it
+                // matches no channel, which is why it used to be dropped — and with
+                // it, every message the owner sent from the Instagram app, which is
+                // the only record of those we will ever have.
+                let is_echo = event.message.as_ref().is_some_and(|m| m.is_echo);
+                let (account, customer) = if is_echo {
+                    (event.sender.as_ref(), event.recipient.as_ref())
+                } else {
+                    (event.recipient.as_ref(), event.sender.as_ref())
+                };
+
+                let Some(account_id) = account.map(|p| p.id.as_str()) else {
+                    tracing::warn!(is_echo, "instagram event names no account");
                     continue;
                 };
 
                 let Some(channel) = self
                     .cache
-                    .get_channel_by_external_key(db, ProviderKind::Instagram, recipient_id)
+                    .get_channel_by_external_key(db, ProviderKind::Instagram, account_id)
                     .await?
                 else {
-                    tracing::warn!(?recipient_id, "no channel found for instagram event");
+                    tracing::warn!(?account_id, "no channel found for instagram event");
                     continue;
                 };
 
@@ -114,24 +168,34 @@ impl WebhookProvider for InstagramProvider {
                 let client_id = resolve_instagram_client(
                     db,
                     &self.client_cache,
-                    event.sender.as_ref(),
+                    customer,
                     &config.access_token,
+                    &self.graph_base,
                     redis.clone(),
                 )
                 .await;
 
                 let raw = serde_json::to_value(event).unwrap_or(serde_json::Value::Null);
-                let external_message_id = format!("instagram:{}", mid.unwrap_or(&entry.id));
+                let external_message_id = crate::external_id::instagram(mid.unwrap_or(&entry.id));
                 let text = match event_kind {
                     EventKind::Message => event.message.as_ref().and_then(|m| m.text.clone()),
                     EventKind::Edit => event.message_edit.as_ref().and_then(|e| e.text.clone()),
                     _ => None,
                 };
+                // Nobody in `operators` typed an echo, so it has no author — only a
+                // side.
+                let (sender_id, sender_type) = if is_echo {
+                    (None, "operator")
+                } else {
+                    (client_id, "client")
+                };
+
                 messages.push(NewMessage {
                     external_message_id,
                     channel_id: channel.id,
-                    sender_id: client_id,
-                    sender_type: "client".into(),
+                    conversation: client_id.map(Conversation::Customer),
+                    sender_id,
+                    sender_type: sender_type.into(),
                     provider: ProviderKind::Instagram,
                     event: event_kind,
                     text,
@@ -140,8 +204,37 @@ impl WebhookProvider for InstagramProvider {
             }
         }
 
+        if messages.is_empty() {
+            tracing::warn!(
+                entries = payload.entry.len(),
+                "instagram webhook produced no messages — nothing will reach the inbox"
+            );
+        }
+
         Ok(messages)
     }
+}
+
+/// Meta sends the event timestamp as an integer in one payload shape and as a
+/// decimal string in the other.
+fn deserialize_flexible_timestamp<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Flexible {
+        Int(i64),
+        Str(String),
+    }
+
+    Ok(match Option::<Flexible>::deserialize(deserializer)? {
+        None => None,
+        Some(Flexible::Int(n)) => Some(n),
+        // A timestamp we cannot parse is not worth failing the whole payload for:
+        // nothing routes on it, it only rides along in `raw`.
+        Some(Flexible::Str(s)) => s.parse().ok(),
+    })
 }
 
 fn classify_event(event: &MessagingEvent) -> (EventKind, Option<&String>) {
@@ -152,7 +245,7 @@ fn classify_event(event: &MessagingEvent) -> (EventKind, Option<&String>) {
         return (EventKind::Edit, Some(&edit.mid));
     }
     if let Some(ref read) = event.read {
-        return (EventKind::Read, Some(&read.mid));
+        return (EventKind::Read, read.mid.as_ref());
     }
     if let Some(ref reaction) = event.reaction {
         return (EventKind::Reaction, Some(&reaction.mid));
@@ -168,6 +261,7 @@ async fn resolve_instagram_client(
     client_cache: &ClientCache,
     sender: Option<&Participant>,
     access_token: &str,
+    graph_base: &str,
     redis: redis::aio::ConnectionManager,
 ) -> Option<Uuid> {
     let sid = sender?.id.as_str();
@@ -178,13 +272,38 @@ async fn resolve_instagram_client(
         Ok(Some(client)) => {
             let age = chrono::Utc::now() - client.updated_at;
             if age > chrono::TimeDelta::hours(24) {
-                spawn_instagram_upsert(db.clone(), client.id, sid, access_token, redis);
+                spawn_instagram_upsert(db.clone(), client.id, sid, access_token, graph_base, redis);
             }
             Some(client.id)
         }
         Ok(None) => {
-            let client_id = Uuid::new_v4();
-            spawn_instagram_upsert(db.clone(), client_id, sid, access_token, redis);
+            // Insert the row SYNCHRONOUSLY. The message is persisted immediately after
+            // this returns, and `persist_and_publish` refuses to set `sender_id` — and
+            // therefore cannot create the chat — unless the client already exists. So
+            // deferring this write to the spawned task loses the chat for the first
+            // message of every new conversation, which is the only message that
+            // matters for a conversation appearing in the inbox at all.
+            //
+            // Only the profile lookup stays asynchronous, because that one is a network
+            // call to Meta. `upsert_client` returns the effective id, so two messages
+            // racing on the same new sender converge on one row.
+            let client_id = match crate::db::upsert_client(
+                db,
+                Uuid::new_v4(),
+                ProviderKind::Instagram,
+                sid,
+                None,
+                None,
+            )
+            .await
+            {
+                Ok(id) => id,
+                Err(e) => {
+                    tracing::error!(%sid, "instagram client insert failed: {e}");
+                    return None;
+                }
+            };
+            spawn_instagram_upsert(db.clone(), client_id, sid, access_token, graph_base, redis);
             Some(client_id)
         }
         Err(e) => {
@@ -199,12 +318,14 @@ fn spawn_instagram_upsert(
     client_id: Uuid,
     sid: &str,
     access_token: &str,
+    graph_base: &str,
     redis: redis::aio::ConnectionManager,
 ) {
     let sid = sid.to_owned();
     let token = access_token.to_owned();
+    let graph_base = graph_base.to_owned();
     tokio::spawn(fetch_and_upsert_instagram_client(
-        db, client_id, sid, token, redis,
+        db, client_id, sid, token, graph_base, redis,
     ));
 }
 
@@ -215,11 +336,10 @@ async fn fetch_and_upsert_instagram_client(
     client_id: Uuid,
     sender_id: String,
     access_token: String,
+    graph_base: String,
     mut redis: redis::aio::ConnectionManager,
 ) {
-    let url = format!(
-        "https://graph.instagram.com/v25.0/{sender_id}?fields=username,name&access_token={access_token}"
-    );
+    let url = format!("{graph_base}/{sender_id}?fields=username,name&access_token={access_token}");
 
     let (name, username) = match HTTP_CLIENT.get(&url).send().await {
         Ok(resp) if resp.status().is_success() => match resp.json::<InstagramProfile>().await {
@@ -267,13 +387,35 @@ pub struct MetaWebhookPayload {
 pub struct Entry {
     pub id: String,
     pub time: i64,
+    /// Graph API v25.0 and earlier deliver messaging events here.
     pub messaging: Option<Vec<MessagingEvent>>,
+    /// v26.0 delivers the *same* event objects here instead, each wrapped in a
+    /// `{field, value}` change. Both are accepted: the sibling PHP integration runs
+    /// on v25.0 and still receives `messaging`, so this is not a migration.
+    pub changes: Option<Vec<Change>>,
+    /// Whatever else the entry carried. Captured so an unhandled payload shape can
+    /// be *named* in the log instead of vanishing — a bare `continue` on an
+    /// unrecognised shape is indistinguishable from Meta sending nothing at all.
+    #[serde(flatten)]
+    pub other: serde_json::Map<String, serde_json::Value>,
+}
+
+/// A v26.0 change. `field` names the subscribed field that produced it
+/// (`messages`, `message_edit`, …) and `value` is shaped exactly like an element
+/// of the older `messaging` array.
+#[derive(Debug, Deserialize, serde::Serialize)]
+pub struct Change {
+    pub field: String,
+    pub value: MessagingEvent,
 }
 
 #[derive(Debug, Deserialize, serde::Serialize)]
 pub struct MessagingEvent {
     pub sender: Option<Participant>,
     pub recipient: Option<Participant>,
+    /// A number under `messaging`, a string under `changes[].value`. Accept both:
+    /// rejecting one makes the whole payload fail to deserialize.
+    #[serde(default, deserialize_with = "deserialize_flexible_timestamp")]
     pub timestamp: Option<i64>,
     pub message: Option<Message>,
     pub message_edit: Option<MessageEdit>,
@@ -291,6 +433,12 @@ pub struct Message {
     pub mid: String,
     pub text: Option<String>,
     pub attachments: Option<Vec<serde_json::Value>>,
+    /// `true` when the event is a copy of a message this app itself sent. Routing
+    /// already drops these — an echo's `recipient` is the customer, so no channel
+    /// matches — but that path logs a warning, and an operator's own replies coming
+    /// back as "no channel found" is noise that hides real misroutes.
+    #[serde(default)]
+    pub is_echo: bool,
 }
 
 #[derive(Debug, Deserialize, serde::Serialize)]
@@ -300,9 +448,11 @@ pub struct MessageEdit {
     pub num_edit: Option<i32>,
 }
 
+/// Instagram sends `mid`; a receipt without one is not worth failing the whole
+/// payload for — the pipeline falls back to the chat.
 #[derive(Debug, Deserialize, serde::Serialize)]
 pub struct ReadReceipt {
-    pub mid: String,
+    pub mid: Option<String>,
 }
 
 #[derive(Debug, Deserialize, serde::Serialize)]
@@ -316,6 +466,24 @@ pub struct Reaction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_read_receipt_without_a_mid_is_still_a_read() {
+        // A required `mid` would fail `from_slice` for the *whole* payload, taking
+        // every event batched alongside it down with it.
+        let event: MessagingEvent = serde_json::from_value(serde_json::json!({
+            "sender": {"id": "customer"},
+            "recipient": {"id": "account"},
+            "read": {}
+        }))
+        .unwrap();
+        let (kind, mid) = classify_event(&event);
+        assert!(matches!(kind, EventKind::Read));
+        assert!(
+            mid.is_none(),
+            "no anchor — the pipeline falls back to the chat"
+        );
+    }
     use crate::cache::{ChannelCache, ClientCache};
     use crate::provider::WebhookProvider;
     use hmac::{Hmac, Mac};
@@ -326,6 +494,7 @@ mod tests {
     fn test_provider() -> InstagramProvider {
         InstagramProvider::new(
             TEST_SECRET,
+            "http://127.0.0.1:1",
             Arc::new(ChannelCache::new()),
             Arc::new(ClientCache::new()),
         )
@@ -401,6 +570,7 @@ mod tests {
                 mid: "mid_001".into(),
                 text: Some("hello".into()),
                 attachments: None,
+                is_echo: false,
             }),
             message_edit: None,
             read: None,
@@ -432,6 +602,33 @@ mod tests {
     }
 
     #[test]
+    fn an_echo_is_recognised_from_the_payload() {
+        let payload = r#"{
+            "object": "instagram",
+            "entry": [{
+                "id": "17841448717199999",
+                "time": 1,
+                "messaging": [{
+                    "sender": {"id": "17841448717199999"},
+                    "recipient": {"id": "836189122827510"},
+                    "message": {"mid": "m", "text": "our own reply", "is_echo": true}
+                }]
+            }]
+        }"#;
+        let parsed: MetaWebhookPayload = serde_json::from_str(payload).unwrap();
+        let event = &parsed.entry[0].messaging.as_ref().unwrap()[0];
+        assert!(event.message.as_ref().unwrap().is_echo);
+    }
+
+    #[test]
+    fn an_absent_is_echo_defaults_to_false() {
+        // Every real inbound message omits the field entirely.
+        let msg: Message =
+            serde_json::from_value(serde_json::json!({"mid": "m", "text": "hi"})).unwrap();
+        assert!(!msg.is_echo);
+    }
+
+    #[test]
     fn classify_read_event() {
         let event = MessagingEvent {
             sender: None,
@@ -440,7 +637,7 @@ mod tests {
             message: None,
             message_edit: None,
             read: Some(ReadReceipt {
-                mid: "mid_005".into(),
+                mid: Some("mid_005".into()),
             }),
             reaction: None,
         };
@@ -489,6 +686,79 @@ mod tests {
         let (kind, mid) = classify_event(&event);
         assert!(matches!(kind, EventKind::Reaction));
         assert_eq!(mid.unwrap(), "mid_004");
+    }
+
+    #[test]
+    fn a_v26_change_carries_the_same_event_object_as_messaging() {
+        // v26.0 stopped sending `messaging` and started sending the identical event
+        // under `changes[].value`, with `timestamp` as a *string*. Parsing only the
+        // old shape is why a real DM produced nothing at all.
+        let payload = r#"{
+            "object": "instagram",
+            "entry": [{
+                "id": "17841448717199999",
+                "time": 1773347860136,
+                "changes": [{
+                    "field": "messages",
+                    "value": {
+                        "sender": {"id": "12334"},
+                        "recipient": {"id": "23245"},
+                        "timestamp": "1527459824",
+                        "message": {"mid": "random_mid", "text": "random_text"}
+                    }
+                }]
+            }]
+        }"#;
+
+        let parsed: MetaWebhookPayload = serde_json::from_str(payload).unwrap();
+        let entry = &parsed.entry[0];
+        assert!(entry.messaging.is_none(), "v26 sends no messaging array");
+        let change = &entry.changes.as_ref().unwrap()[0];
+        assert_eq!(change.field, "messages");
+        assert_eq!(change.value.sender.as_ref().unwrap().id, "12334");
+        assert_eq!(change.value.recipient.as_ref().unwrap().id, "23245");
+        assert_eq!(
+            change.value.timestamp,
+            Some(1527459824),
+            "a string timestamp must not fail the payload"
+        );
+
+        let (kind, mid) = classify_event(&change.value);
+        assert!(matches!(kind, EventKind::Message));
+        assert_eq!(mid.unwrap(), "random_mid");
+    }
+
+    #[test]
+    fn a_numeric_timestamp_still_parses() {
+        let event: MessagingEvent = serde_json::from_value(serde_json::json!({
+            "sender": {"id": "1"}, "recipient": {"id": "2"}, "timestamp": 1527459824i64,
+            "message": {"mid": "m", "text": "t"}
+        }))
+        .unwrap();
+        assert_eq!(event.timestamp, Some(1527459824));
+    }
+
+    #[test]
+    fn an_uninterpretable_change_is_named_not_dropped_silently() {
+        // A comment, or the App Dashboard's Test button: the value carries none of
+        // message / message_edit / read / reaction, so it must not become an inbox
+        // entry — but the field name has to reach the log.
+        let payload = r#"{
+            "object": "instagram",
+            "entry": [{
+                "id": "17841448717199999",
+                "time": 1773347860136,
+                "changes": [{"field": "comments", "value": {"foo": "bar"}}]
+            }]
+        }"#;
+
+        let parsed: MetaWebhookPayload = serde_json::from_str(payload).unwrap();
+        let change = &parsed.entry[0].changes.as_ref().unwrap()[0];
+        assert_eq!(change.field, "comments");
+        assert!(
+            matches!(classify_event(&change.value).0, EventKind::Unknown),
+            "nothing classifiable, so the parser must skip it"
+        );
     }
 
     #[test]

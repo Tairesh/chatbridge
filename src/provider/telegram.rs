@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use crate::cache::{ChannelCache, ClientCache};
 use crate::error::AppError;
-use crate::model::{EventKind, NewMessage, ProviderKind};
+use crate::model::{Conversation, EventKind, NewMessage, ProviderKind};
 use crate::provider::WebhookProvider;
 
 pub struct TelegramProvider {
@@ -79,9 +79,9 @@ impl WebhookProvider for TelegramProvider {
             (EventKind::Unknown, None)
         };
 
-        let message_id = match msg_ref {
-            Some(msg) => msg.message_id,
-            None => update.update_id,
+        let external_message_id = match msg_ref {
+            Some(msg) => crate::external_id::telegram(msg.chat.id, msg.message_id),
+            None => crate::external_id::telegram_update(update.update_id),
         };
 
         let client_id = if let Some(from) = msg_ref.and_then(|m| m.from.as_ref()) {
@@ -97,8 +97,9 @@ impl WebhookProvider for TelegramProvider {
         let raw = serde_json::from_slice(body).unwrap_or(serde_json::Value::Null);
 
         Ok(vec![NewMessage {
-            external_message_id: format!("telegram:{message_id}"),
+            external_message_id,
             channel_id: self.channel_id,
+            conversation: client_id.map(Conversation::Customer),
             sender_id: client_id,
             sender_type: "client".into(),
             provider: ProviderKind::Telegram,
@@ -130,9 +131,18 @@ async fn resolve_telegram_client(
             Some(client.id)
         }
         Ok(None) => {
-            let client_id = Uuid::new_v4();
-            spawn_telegram_upsert(db.clone(), client_id, from, redis);
-            Some(client_id)
+            // Awaited, not spawned. Same reason as the instagram path: the message is
+            // persisted right after this returns, and `persist_and_publish` will not
+            // set `sender_id` or create the chat unless the client row already exists.
+            // Telegram needs no network call here at all — the display name is already
+            // in the update — so there was never anything to gain by deferring it.
+            match upsert_telegram_client(db, Uuid::new_v4(), from, redis).await {
+                Ok(id) => Some(id),
+                Err(e) => {
+                    tracing::error!("telegram client insert failed: {e}");
+                    None
+                }
+            }
         }
         Err(e) => {
             tracing::error!("telegram client lookup failed: {e}");
@@ -141,30 +151,40 @@ async fn resolve_telegram_client(
     }
 }
 
+/// Write the client row and tell the other replicas. Returns the effective id, so
+/// two updates racing on the same new sender converge on one row.
+async fn upsert_telegram_client(
+    db: &PgPool,
+    client_id: Uuid,
+    from: &TelegramUser,
+    mut redis: redis::aio::ConnectionManager,
+) -> Result<Uuid, sqlx::Error> {
+    let name = build_display_name(from);
+    let id = crate::db::upsert_client(
+        db,
+        client_id,
+        ProviderKind::Telegram,
+        &from.id.to_string(),
+        Some(name.as_str()),
+        from.username.as_deref(),
+    )
+    .await?;
+    crate::cache::publish_invalidation(&mut redis, "client", id).await;
+    Ok(id)
+}
+
+/// Refresh a known client's profile in the background. Only for the stale-cache
+/// path, where nothing is waiting on the result.
 fn spawn_telegram_upsert(
     db: PgPool,
     client_id: Uuid,
     from: &TelegramUser,
     redis: redis::aio::ConnectionManager,
 ) {
-    let name = build_display_name(from);
-    let external_id = from.id.to_string();
-    let username = from.username.clone();
+    let from = from.clone();
     tokio::spawn(async move {
-        let mut redis = redis;
-        if let Err(e) = crate::db::upsert_client(
-            &db,
-            client_id,
-            ProviderKind::Telegram,
-            &external_id,
-            Some(name.as_str()),
-            username.as_deref(),
-        )
-        .await
-        {
-            tracing::error!("telegram client upsert failed: {e}");
-        } else {
-            crate::cache::publish_invalidation(&mut redis, "client", client_id).await;
+        if let Err(e) = upsert_telegram_client(&db, client_id, &from, redis).await {
+            tracing::error!("telegram client refresh failed: {e}");
         }
     });
 }
@@ -182,12 +202,19 @@ pub struct TelegramUpdate {
 pub struct TelegramMessage {
     pub message_id: i64,
     pub date: i64,
+    pub chat: TelegramChat,
     pub from: Option<TelegramUser>,
-    pub chat: Option<serde_json::Value>,
     pub text: Option<String>,
 }
 
-#[derive(Debug, Deserialize, serde::Serialize)]
+/// Required inside a `Message`: the Bot API always sends it, and without it a
+/// `message_id` cannot be turned into an id that is unique on our side.
+#[derive(Debug, Deserialize)]
+pub struct TelegramChat {
+    pub id: i64,
+}
+
+#[derive(Debug, Deserialize, serde::Serialize, Clone)]
 pub struct TelegramUser {
     pub id: i64,
     pub first_name: String,
@@ -298,20 +325,30 @@ pub async fn get_webhook_info(base_url: &str, bot_token: &str) -> Result<Webhook
     serde_json::from_value(json).map_err(|e| format!("unexpected getWebhookInfo response: {e}"))
 }
 
+/// What the Bot API says it created.
+///
+/// `chat.id` is read back from the response rather than echoed from the argument:
+/// the response is the value a later update will agree with.
+#[derive(Debug, Deserialize)]
+pub struct SentMessage {
+    pub message_id: i64,
+    pub chat: TelegramChat,
+}
+
 pub async fn send(
     base_url: &str,
     bot_token: &str,
     chat_id: &str,
     message: &OutboundMessage,
-) -> Result<(), String> {
+) -> Result<SentMessage, String> {
     let (method, body) = match message {
         OutboundMessage::Text { text } => (
             "sendMessage",
             serde_json::json!({ "chat_id": chat_id, "text": text }),
         ),
     };
-    call(&format!("{base_url}/bot{bot_token}/{method}"), Some(body)).await?;
-    Ok(())
+    let json = call(&format!("{base_url}/bot{bot_token}/{method}"), Some(body)).await?;
+    serde_json::from_value(json).map_err(|e| format!("unexpected sendMessage response: {e}"))
 }
 
 #[cfg(test)]
@@ -377,6 +414,7 @@ mod tests {
             "message": {
                 "message_id": 42,
                 "date": 1700000000,
+                "chat": {"id": 123, "type": "private"},
                 "text": "hello"
             }
         });
@@ -395,6 +433,7 @@ mod tests {
             "edited_message": {
                 "message_id": 42,
                 "date": 1700000001,
+                "chat": {"id": 123, "type": "private"},
                 "text": "edited text"
             }
         });
@@ -403,6 +442,25 @@ mod tests {
         let msg = update.edited_message.unwrap();
         assert_eq!(msg.message_id, 42);
         assert_eq!(msg.text.as_deref(), Some("edited text"));
+    }
+
+    #[test]
+    fn a_message_id_is_scoped_to_its_chat() {
+        let update: TelegramUpdate = serde_json::from_value(serde_json::json!({
+            "update_id": 1,
+            "message": {
+                "message_id": 1,
+                "date": 1,
+                "chat": {"id": 777, "type": "private"},
+                "text": "hi"
+            }
+        }))
+        .unwrap();
+        let msg = update.message.unwrap();
+        assert_eq!(
+            crate::external_id::telegram(msg.chat.id, msg.message_id),
+            "telegram:777:1"
+        );
     }
 
     #[test]
@@ -488,13 +546,15 @@ mod tests {
     #[tokio::test]
     async fn send_text_message_success() {
         let base = mock_bot_api(serde_json::json!({
-            "sendMessage": {"ok": true, "result": {}}
+            "sendMessage": {"ok": true, "result": {"message_id": 7, "chat": {"id": 42}}}
         }))
         .await;
         let msg = OutboundMessage::Text {
             text: "hello".into(),
         };
-        assert!(send(&base, "fake_token", "12345", &msg).await.is_ok());
+        let sent = send(&base, "fake_token", "42", &msg).await.unwrap();
+        assert_eq!(sent.message_id, 7);
+        assert_eq!(sent.chat.id, 42);
     }
 
     #[tokio::test]

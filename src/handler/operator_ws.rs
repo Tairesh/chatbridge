@@ -9,7 +9,8 @@ use uuid::Uuid;
 use crate::config::AppState;
 use crate::error::AppError;
 use crate::model::{
-    EventKind, IncomingEvent, IncomingRead, NewMessage, OperatorInbound, ProviderKind, WsOutbound,
+    Conversation, EventKind, IncomingEvent, IncomingRead, NewMessage, OperatorInbound,
+    ProviderKind, WsOutbound,
 };
 use crate::pipeline::{persist_and_publish, publish_event, resolve_sender};
 
@@ -172,6 +173,17 @@ async fn process_operator_message(
         let mut redis = state.redis.clone();
         match crate::db::mark_messages_read_by_id(&state.db, message_id, "operator").await {
             Ok(reads) => {
+                // Only when something was actually unread. The panel sends one read
+                // per inbound message it renders, so an unconditional call would mean
+                // a Graph API request for every message in the visible history.
+                if !reads.is_empty() {
+                    spawn_seen_marker(
+                        Arc::clone(state),
+                        chat_info.channel_id,
+                        chat_info.client_id,
+                        operator_id,
+                    );
+                }
                 for db_read in &reads {
                     let sender = resolve_sender(
                         db_read.sender_id.unwrap_or(Uuid::nil()),
@@ -205,8 +217,9 @@ async fn process_operator_message(
     }
 
     let msg = NewMessage {
-        external_message_id: format!("operator:{}", inbound.mid),
+        external_message_id: crate::external_id::operator(&inbound.mid),
         channel_id: chat_info.channel_id,
+        conversation: Some(Conversation::Chat(inbound.chat_id)),
         sender_id: Some(operator_id),
         sender_type: "operator".into(),
         provider: ProviderKind::Widget,
@@ -216,38 +229,59 @@ async fn process_operator_message(
     };
 
     let mut redis = state.redis.clone();
-    persist_and_publish(&state.db, &mut redis, &msg, Some(inbound.chat_id), state).await;
+    let persisted = persist_and_publish(&state.db, &mut redis, &msg, state).await;
 
-    // Outbound delivery stub for non-widget channels
+    // Outbound delivery for non-widget channels
     if matches!(event_kind, EventKind::Message) {
-        let channel_provider =
-            crate::db::find_channel_provider(&state.db, chat_info.channel_id).await;
-        match channel_provider.as_ref().map(|o| o.as_deref()) {
-            Ok(Some("instagram")) => {
-                tracing::info!(
-                    channel_id = %chat_info.channel_id,
-                    mid = %inbound.mid,
-                    "TODO: deliver to Instagram API"
-                );
-            }
-            Ok(Some("telegram")) => {
-                if let Some(text) = inbound.text.clone().filter(|t| !t.is_empty()) {
-                    spawn_telegram_delivery(
-                        Arc::clone(state),
-                        chat_info.channel_id,
-                        chat_info.client_id,
-                        operator_id,
-                        text,
-                    );
+        match persisted {
+            Some(message_id) => {
+                let channel_provider =
+                    crate::db::find_channel_provider(&state.db, chat_info.channel_id).await;
+                match channel_provider.as_ref().map(|o| o.as_deref()) {
+                    Ok(Some("instagram")) => {
+                        if let Some(text) = inbound.text.clone().filter(|t| !t.is_empty()) {
+                            spawn_instagram_delivery(
+                                Arc::clone(state),
+                                chat_info.channel_id,
+                                chat_info.client_id,
+                                operator_id,
+                                text,
+                                message_id,
+                            );
+                        }
+                    }
+                    Ok(Some("telegram")) => {
+                        if let Some(text) = inbound.text.clone().filter(|t| !t.is_empty()) {
+                            spawn_telegram_delivery(
+                                Arc::clone(state),
+                                chat_info.channel_id,
+                                chat_info.client_id,
+                                operator_id,
+                                text,
+                                message_id,
+                            );
+                        }
+                    }
+                    _ => {} // widget — delivered via shared listener
                 }
             }
-            _ => {} // widget — delivered via shared listener
+            None => {
+                // The panel re-sent a mid we already stored. Delivering again would
+                // send the customer the same message twice.
+                tracing::warn!(
+                    %operator_id, mid = %inbound.mid,
+                    "operator message not persisted, skipping delivery"
+                );
+            }
         }
     }
 
     // Ack
     let ack_id = Uuid::parse_str(&inbound.mid).unwrap_or(Uuid::nil());
-    let ack = WsOutbound::Ack { message_id: ack_id };
+    let ack = WsOutbound::Ack {
+        message_id: ack_id,
+        id: persisted,
+    };
     send_outbound(socket, &ack).await
 }
 
@@ -258,12 +292,52 @@ fn notify_operator_error(state: &AppState, operator_id: Uuid, reason: String) {
     }
 }
 
+/// Tell the operator which of their messages the provider refused, so the panel can
+/// mark that bubble rather than only showing a banner.
+fn notify_delivery_failed(state: &AppState, operator_id: Uuid, message_id: Uuid, reason: String) {
+    let event = WsOutbound::DeliveryFailed { message_id, reason };
+    if let Ok(json) = serde_json::to_string(&event) {
+        state.registry.send_to(operator_id, &json);
+    }
+}
+
+/// Record that the provider took the message, and tell the operator so the bubble can
+/// show its first tick without waiting for a reload.
+async fn mark_delivered(state: &AppState, operator_id: Uuid, message_id: Uuid) {
+    match crate::db::mark_message_delivered(&state.db, message_id).await {
+        // Already read: the customer had the thread open and beat us here. The ✓✓ the
+        // panel drew is the stronger statement, so nothing to announce.
+        Ok(false) => return,
+        Ok(true) => {}
+        Err(e) => {
+            tracing::error!(%message_id, "could not mark the message delivered: {e}");
+            return;
+        }
+    }
+    let event = WsOutbound::Delivered { message_id };
+    if let Ok(json) = serde_json::to_string(&event) {
+        state.registry.send_to(operator_id, &json);
+    }
+}
+
+/// Record that the provider refused a message, so history stops showing it as sent.
+async fn mark_undelivered(state: &AppState, message_id: Uuid) {
+    match crate::db::mark_message_failed(&state.db, message_id).await {
+        Ok(true) => {}
+        Ok(false) => tracing::warn!(
+            %message_id,
+            "delivery failed, but the row is gone or already read"
+        ),
+        Err(e) => tracing::error!(%message_id, "could not mark the message undelivered: {e}"),
+    }
+}
+
 async fn deliver_to_telegram(
     state: &AppState,
     channel_id: Uuid,
     client_id: Uuid,
     text: &str,
-) -> Result<(), String> {
+) -> Result<crate::provider::telegram::SentMessage, String> {
     let channel = state
         .cache
         .get_channel_by_id(&state.db, channel_id)
@@ -297,21 +371,237 @@ async fn deliver_to_telegram(
     .await
 }
 
+/// The channel's config and the customer's IGSID — everything an outbound Instagram
+/// call needs. Shared so the send path and the seen path resolve it identically.
+///
+/// The IGSID is the client's `external_id`: the same value that arrived as
+/// `sender.id` on the inbound webhook. There is no PSID lookup on this flow.
+async fn instagram_recipient(
+    state: &AppState,
+    channel_id: Uuid,
+    client_id: Uuid,
+) -> Result<(crate::model::InstagramConfig, String), String> {
+    let channel = state
+        .cache
+        .get_channel_by_id(&state.db, channel_id)
+        .await
+        .map_err(|e| format!("channel lookup failed: {e}"))?
+        .ok_or_else(|| "instagram channel not found".to_owned())?;
+
+    let config: crate::model::InstagramConfig =
+        serde_json::from_value(channel.config).map_err(|e| format!("bad instagram config: {e}"))?;
+
+    let client = state
+        .client_cache
+        .get_client_by_uuid(&state.db, client_id)
+        .await
+        .map_err(|e| format!("client lookup failed: {e}"))?
+        .ok_or_else(|| "client not found".to_owned())?;
+
+    let igsid = client
+        .external_id
+        .ok_or_else(|| "client has no external_id".to_owned())?;
+
+    Ok((config, igsid))
+}
+
+async fn deliver_to_instagram(
+    state: &AppState,
+    channel_id: Uuid,
+    client_id: Uuid,
+    text: &str,
+) -> Result<crate::oauth::instagram::SentMessage, String> {
+    let (config, igsid) = instagram_recipient(state, channel_id, client_id).await?;
+    crate::oauth::instagram::send_message(
+        &state.config.instagram,
+        &config.access_token,
+        &igsid,
+        text,
+    )
+    .await
+}
+
+/// Tell the provider the operator has seen the customer's messages.
+///
+/// Instagram only: the Bot API has no read receipts in either direction, and a widget
+/// customer is told over their own socket.
+fn spawn_seen_marker(state: Arc<AppState>, channel_id: Uuid, client_id: Uuid, operator_id: Uuid) {
+    tokio::spawn(async move {
+        match crate::db::find_channel_provider(&state.db, channel_id).await {
+            Ok(Some(provider)) if provider == "instagram" => {}
+            Ok(_) => return,
+            Err(e) => {
+                tracing::error!(%channel_id, "provider lookup failed: {e}");
+                return;
+            }
+        }
+
+        let sent = async {
+            let (config, igsid) = instagram_recipient(&state, channel_id, client_id).await?;
+            crate::oauth::instagram::mark_seen(
+                &state.config.instagram,
+                &config.access_token,
+                &igsid,
+            )
+            .await
+        }
+        .await;
+
+        if let Err(reason) = sent {
+            // The local read stands regardless: our bookkeeping is not Meta's.
+            tracing::warn!(%channel_id, "instagram mark_seen failed: {reason}");
+            notify_operator_error(&state, operator_id, describe_instagram_failure(&reason));
+        }
+    });
+}
+
+fn spawn_instagram_delivery(
+    state: Arc<AppState>,
+    channel_id: Uuid,
+    client_id: Uuid,
+    operator_id: Uuid,
+    text: String,
+    message_id: Uuid,
+) {
+    tokio::spawn(async move {
+        match deliver_to_instagram(&state, channel_id, client_id, &text).await {
+            Ok(sent) => {
+                // Adopt Meta's id for the row we already stored under a local one.
+                // Read receipts and edits arrive keyed by *their* id, so until this
+                // happens every receipt for an operator's reply resolves to nothing.
+                mark_delivered(&state, operator_id, message_id).await;
+                match crate::db::adopt_external_message_id(
+                    &state.db,
+                    message_id,
+                    &crate::external_id::instagram(&sent.message_id),
+                )
+                .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => tracing::warn!(
+                        %channel_id,
+                        %message_id,
+                        "delivered, but the local row is gone — nothing to attach the provider id to"
+                    ),
+                    Err(e) => tracing::error!(
+                        %channel_id,
+                        "delivered, but storing the provider message id failed: {e}"
+                    ),
+                }
+            }
+            Err(reason) => {
+                tracing::error!(%channel_id, %operator_id, "instagram delivery failed: {reason}");
+                mark_undelivered(&state, message_id).await;
+                notify_delivery_failed(
+                    &state,
+                    operator_id,
+                    message_id,
+                    describe_instagram_failure(&reason),
+                );
+            }
+        }
+    });
+}
+
+/// Turn Meta's error text into something an operator can act on.
+///
+/// The subcodes matter more than the codes here: `10` alone is just "permission
+/// denied", and `190` alone is "bad token" — neither tells the operator whether to
+/// wait, reconnect, or give up.
+fn describe_instagram_failure(reason: &str) -> String {
+    if reason.contains("2534022") {
+        "Instagram refused the reply: the 24-hour window since the customer's last \
+         message has closed. Only a tagged message is allowed now, which this app \
+         does not send yet."
+            .to_owned()
+    } else if reason.contains("(subcode 2534014)") {
+        "Instagram does not recognise this recipient. It only knows customers who \
+         have messaged this account through this app."
+            .to_owned()
+    } else if reason.contains("Error validating access token") || reason.contains("OAuthException")
+    {
+        format!("Instagram rejected the channel's token — reconnect the account. ({reason})")
+    } else {
+        format!("Instagram delivery failed: {reason}")
+    }
+}
+
 fn spawn_telegram_delivery(
     state: Arc<AppState>,
     channel_id: Uuid,
     client_id: Uuid,
     operator_id: Uuid,
     text: String,
+    message_id: Uuid,
 ) {
     tokio::spawn(async move {
-        if let Err(reason) = deliver_to_telegram(&state, channel_id, client_id, &text).await {
-            tracing::error!(%channel_id, %operator_id, "telegram delivery failed: {reason}");
-            notify_operator_error(
-                &state,
-                operator_id,
-                format!("Telegram delivery failed: {reason}"),
-            );
+        match deliver_to_telegram(&state, channel_id, client_id, &text).await {
+            Ok(sent) => {
+                // Same reason as the Instagram path: a Bot API `message_id` is what a
+                // later event names, and it is unique only within its chat.
+                mark_delivered(&state, operator_id, message_id).await;
+                let provider_id = crate::external_id::telegram(sent.chat.id, sent.message_id);
+                match crate::db::adopt_external_message_id(&state.db, message_id, &provider_id)
+                    .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => tracing::warn!(
+                        %channel_id, %message_id,
+                        "delivered, but the local row is gone — nothing to attach the provider id to"
+                    ),
+                    Err(e) => tracing::error!(
+                        %channel_id,
+                        "delivered, but storing the provider message id failed: {e}"
+                    ),
+                }
+            }
+            Err(reason) => {
+                tracing::error!(%channel_id, %operator_id, "telegram delivery failed: {reason}");
+                mark_undelivered(&state, message_id).await;
+                notify_delivery_failed(
+                    &state,
+                    operator_id,
+                    message_id,
+                    format!("Telegram delivery failed: {reason}"),
+                );
+            }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_closed_window_is_explained_rather_than_echoed() {
+        // Meta's own text is "This message is sent outside of allowed window", which
+        // does not tell the operator that waiting will not help. The subcode does.
+        let msg = describe_instagram_failure(
+            "This message is sent outside of allowed window (subcode 2534022)",
+        );
+        assert!(msg.contains("24-hour window"), "{msg}");
+    }
+
+    #[test]
+    fn an_unknown_recipient_says_why_it_is_unknown() {
+        let msg = describe_instagram_failure("Requested user not found (subcode 2534014)");
+        assert!(
+            msg.contains("messaged this account through this app"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn a_dead_token_tells_the_operator_to_reconnect() {
+        let msg = describe_instagram_failure("Error validating access token: session expired");
+        assert!(msg.contains("reconnect"), "{msg}");
+    }
+
+    #[test]
+    fn anything_else_is_passed_through_verbatim() {
+        // Never swallow an error we do not recognise: the raw text is the only clue.
+        let msg = describe_instagram_failure("HTTP 502 with no error envelope");
+        assert!(msg.contains("HTTP 502 with no error envelope"), "{msg}");
+    }
 }

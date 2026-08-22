@@ -8,7 +8,13 @@ use tokio_util::sync::CancellationToken;
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt::init();
+    // Honours RUST_LOG, e.g. `RUST_LOG=chatbridge=debug` to see raw webhook payloads.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
 
     let config = AppConfig::from_env();
 
@@ -48,6 +54,7 @@ async fn main() {
         shutdown,
     });
     chatbridge::listener::spawn_message_listener(state.clone()).await;
+    chatbridge::refresh::spawn_token_refresher(state.clone());
     let app = routes::build(state.clone());
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3800").await.unwrap();
