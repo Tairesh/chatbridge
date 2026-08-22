@@ -5,27 +5,19 @@
 use sqlx::PgPool;
 use uuid::Uuid;
 
-/// Run a DELETE query in a fresh runtime (safe to call from Drop).
-fn drop_delete(table: &str, id: Uuid) {
-    drop_delete_by_column(table, "id", id);
-}
-
-/// Run a DELETE query matching a specific column value.
-fn drop_delete_by_column(table: &str, column: &str, id: Uuid) {
-    drop_query(&format!("DELETE FROM {} WHERE {} = $1", table, column), id);
-}
-
-/// Run an arbitrary query with a single UUID bind parameter.
-fn drop_query(query: &str, id: Uuid) {
+/// Run a statement with a single UUID bind parameter in a fresh runtime (safe to
+/// call from Drop). The statement is a `&'static str` so the table and column can
+/// only ever come from a literal at the call site — sqlx 0.9 rejects SQL built at
+/// runtime, and there is nothing here worth an `AssertSqlSafe` escape hatch.
+fn drop_query(query: &'static str, id: Uuid) {
     let db_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
-    let query = query.to_owned();
     // Fresh pool on a fresh runtime — the original pool's connections are
     // pinned to the test runtime's I/O driver and can't be reused here.
     std::thread::scope(|s| {
         s.spawn(|| {
             tokio::runtime::Runtime::new().unwrap().block_on(async {
                 let pool = PgPool::connect(&db_url).await.unwrap();
-                let _ = sqlx::query(&query).bind(id).execute(&pool).await;
+                let _ = sqlx::query(query).bind(id).execute(&pool).await;
             });
         });
     });
@@ -115,7 +107,7 @@ pub struct TestClient {
 
 impl Drop for TestClient {
     fn drop(&mut self) {
-        drop_delete("clients", self.id);
+        drop_query("DELETE FROM clients WHERE id = $1", self.id);
     }
 }
 
@@ -126,7 +118,7 @@ pub struct TestChat {
 
 impl Drop for TestChat {
     fn drop(&mut self) {
-        drop_delete("chats", self.id);
+        drop_query("DELETE FROM chats WHERE id = $1", self.id);
     }
 }
 
@@ -137,7 +129,7 @@ pub struct TestMessage {
 
 impl Drop for TestMessage {
     fn drop(&mut self) {
-        drop_delete("messages", self.id);
+        drop_query("DELETE FROM messages WHERE id = $1", self.id);
     }
 }
 
@@ -148,7 +140,7 @@ pub struct TestOperator {
 
 impl Drop for TestOperator {
     fn drop(&mut self) {
-        drop_delete("operators", self.id);
+        drop_query("DELETE FROM operators WHERE id = $1", self.id);
     }
 }
 

@@ -65,6 +65,11 @@ Use the `justfile` — `just test` starts the Postgres and Redis containers and 
 - A reply the provider refuses is marked `status = 'failed'` and keeps its local
   `operator:<mid>` — there is no provider id to adopt. `messages.status` has no CHECK
   constraint, so neither value needed a migration
+- **Every SQL statement must be a `&'static str`.** sqlx 0.9's `SqlSafeStr` bound rejects
+  a `String`, so `sqlx::query(&format!(...))` no longer compiles. The shared `channels`
+  column list is therefore the `channel_columns!()` macro in `src/db.rs`, spliced in with
+  `concat!` — a `const` cannot be. Reach for `QueryBuilder` if a statement ever genuinely
+  needs runtime shape; `AssertSqlSafe` is the escape hatch and nothing in this repo uses it
 - `reqwest::Client` is a `LazyLock` static in `provider/instagram.rs` and `provider/telegram.rs` — don't create new clients per-request
 - Integration tests use RAII drop guards (`TestChannel`, `TestClient`, `TestChat`, `TestMessage`) in `tests/common/mod.rs` for DB cleanup — always use these instead of manual DELETE queries
 - Channels live in ONE table. `channels.external_key` is the provider's non-secret identity

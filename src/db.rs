@@ -35,15 +35,25 @@ pub struct Channel {
     pub created_at: DateTime<Utc>,
 }
 
-const CHANNEL_COLUMNS: &str = "id, provider, name, external_key, config, deleted_at, created_at";
+/// The `channels` columns, in `Channel`'s field order. A macro rather than a
+/// `const` so it can be spliced into a statement with `concat!`: sqlx 0.9 takes
+/// only `&'static str`, so every query here stays a compile-time literal and no
+/// SQL is ever built at runtime.
+macro_rules! channel_columns {
+    () => {
+        "id, provider, name, external_key, config, deleted_at, created_at"
+    };
+}
 
 /// Hot path: a channel that is not deleted. Used by the webhook and WS handlers.
 pub async fn find_live_channel_by_id(
     pool: &PgPool,
     channel_id: Uuid,
 ) -> Result<Option<Channel>, sqlx::Error> {
-    sqlx::query_as::<_, Channel>(&format!(
-        "SELECT {CHANNEL_COLUMNS} FROM channels WHERE id = $1 AND deleted_at IS NULL"
+    sqlx::query_as::<_, Channel>(concat!(
+        "SELECT ",
+        channel_columns!(),
+        " FROM channels WHERE id = $1 AND deleted_at IS NULL"
     ))
     .bind(channel_id)
     .fetch_optional(pool)
@@ -56,8 +66,10 @@ pub async fn find_live_channel_by_external_key(
     provider: ProviderKind,
     external_key: &str,
 ) -> Result<Option<Channel>, sqlx::Error> {
-    sqlx::query_as::<_, Channel>(&format!(
-        "SELECT {CHANNEL_COLUMNS} FROM channels
+    sqlx::query_as::<_, Channel>(concat!(
+        "SELECT ",
+        channel_columns!(),
+        " FROM channels
          WHERE provider = $1 AND external_key = $2 AND deleted_at IS NULL"
     ))
     .bind(provider.to_string())
@@ -71,8 +83,10 @@ pub async fn find_channel_by_id(
     pool: &PgPool,
     channel_id: Uuid,
 ) -> Result<Option<Channel>, sqlx::Error> {
-    sqlx::query_as::<_, Channel>(&format!(
-        "SELECT {CHANNEL_COLUMNS} FROM channels WHERE id = $1"
+    sqlx::query_as::<_, Channel>(concat!(
+        "SELECT ",
+        channel_columns!(),
+        " FROM channels WHERE id = $1"
     ))
     .bind(channel_id)
     .fetch_optional(pool)
@@ -86,8 +100,10 @@ pub async fn find_channel_by_external_key(
     provider: ProviderKind,
     external_key: &str,
 ) -> Result<Option<Channel>, sqlx::Error> {
-    sqlx::query_as::<_, Channel>(&format!(
-        "SELECT {CHANNEL_COLUMNS} FROM channels WHERE provider = $1 AND external_key = $2"
+    sqlx::query_as::<_, Channel>(concat!(
+        "SELECT ",
+        channel_columns!(),
+        " FROM channels WHERE provider = $1 AND external_key = $2"
     ))
     .bind(provider.to_string())
     .bind(external_key)
@@ -98,8 +114,10 @@ pub async fn find_channel_by_external_key(
 /// Every channel, live ones first. Deleted channels are listed too — the
 /// settings panel shows them dimmed rather than pretending they are gone.
 pub async fn list_channels(pool: &PgPool) -> Result<Vec<Channel>, sqlx::Error> {
-    sqlx::query_as::<_, Channel>(&format!(
-        "SELECT {CHANNEL_COLUMNS} FROM channels
+    sqlx::query_as::<_, Channel>(concat!(
+        "SELECT ",
+        channel_columns!(),
+        " FROM channels
          ORDER BY deleted_at NULLS FIRST, created_at DESC"
     ))
     .fetch_all(pool)
@@ -112,8 +130,10 @@ pub async fn list_live_channels_by_provider(
     pool: &PgPool,
     provider: ProviderKind,
 ) -> Result<Vec<Channel>, sqlx::Error> {
-    sqlx::query_as::<_, Channel>(&format!(
-        "SELECT {CHANNEL_COLUMNS} FROM channels
+    sqlx::query_as::<_, Channel>(concat!(
+        "SELECT ",
+        channel_columns!(),
+        " FROM channels
          WHERE provider = $1 AND deleted_at IS NULL"
     ))
     .bind(provider.to_string())
@@ -131,10 +151,11 @@ pub async fn insert_channel(
     external_key: &str,
     config: &serde_json::Value,
 ) -> Result<Channel, sqlx::Error> {
-    sqlx::query_as::<_, Channel>(&format!(
+    sqlx::query_as::<_, Channel>(concat!(
         "INSERT INTO channels (id, provider, name, external_key, config)
          VALUES ($1, $2, $3, $4, $5)
-         RETURNING {CHANNEL_COLUMNS}"
+         RETURNING ",
+        channel_columns!()
     ))
     .bind(id)
     .bind(provider.to_string())
@@ -171,12 +192,14 @@ pub async fn upsert_channel_by_external_key(
 ) -> Result<(Channel, bool), sqlx::Error> {
     use sqlx::{FromRow, Row};
 
-    let row = sqlx::query(&format!(
+    let row = sqlx::query(concat!(
         "INSERT INTO channels (id, provider, name, external_key, config)
          VALUES ($1, $2, $3, $4, $5)
          ON CONFLICT (provider, external_key) DO UPDATE
              SET config = EXCLUDED.config, deleted_at = NULL
-         RETURNING {CHANNEL_COLUMNS}, (xmax = 0) AS inserted"
+         RETURNING ",
+        channel_columns!(),
+        ", (xmax = 0) AS inserted"
     ))
     .bind(id)
     .bind(provider.to_string())
@@ -199,14 +222,15 @@ pub async fn update_channel(
     config: Option<&serde_json::Value>,
     restore: bool,
 ) -> Result<Option<Channel>, sqlx::Error> {
-    sqlx::query_as::<_, Channel>(&format!(
+    sqlx::query_as::<_, Channel>(concat!(
         "UPDATE channels SET
              name         = COALESCE($2, name),
              external_key = COALESCE($3, external_key),
              config       = COALESCE($4, config),
              deleted_at   = CASE WHEN $5 THEN NULL ELSE deleted_at END
          WHERE id = $1
-         RETURNING {CHANNEL_COLUMNS}"
+         RETURNING ",
+        channel_columns!()
     ))
     .bind(id)
     .bind(name)
@@ -218,10 +242,11 @@ pub async fn update_channel(
 }
 
 pub async fn soft_delete_channel(pool: &PgPool, id: Uuid) -> Result<Option<Channel>, sqlx::Error> {
-    sqlx::query_as::<_, Channel>(&format!(
+    sqlx::query_as::<_, Channel>(concat!(
         "UPDATE channels SET deleted_at = COALESCE(deleted_at, now())
          WHERE id = $1
-         RETURNING {CHANNEL_COLUMNS}"
+         RETURNING ",
+        channel_columns!()
     ))
     .bind(id)
     .fetch_optional(pool)
