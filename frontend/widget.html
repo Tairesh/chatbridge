@@ -67,7 +67,7 @@
     let historyLoaded = false; // first load prepends, later loads append
 
     function connect() {
-      let url = `ws://localhost/ws/${WIDGET_ID}`;
+      let url = `ws://${location.host}/ws/${WIDGET_ID}`;
       const token = localStorage.getItem(TOKEN_KEY);
       if (token) {
         url += `?token=${encodeURIComponent(token)}`;
